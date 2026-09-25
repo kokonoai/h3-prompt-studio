@@ -6,6 +6,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .dialogue_audio import audible_speech_lock, clarify_unanswered_wait
+from .identity_stability import visible_identity_lock
 from .scene_contract import contract_texts, map_contract_texts, render_scene_contract, validate_scene_contract
 
 MODES = {"ref2va", "fl2va", "i2va", "l2va", "t2va"}
@@ -13,7 +15,7 @@ PROFILES = {"official", "director", "concise", "custom"}
 REFERENCE_ROLES = {"reference_image": "image", "reference_video": "video", "reference_audio": "audio"}
 SEMANTICS = {"face", "character", "background", "object", "palette", "style", "wardrobe", "pose", "other"}
 LANGUAGES = {"Arabic", "Chinese", "English", "French", "German", "Italian", "Japanese", "Korean", "Portuguese", "Russian", "Spanish"}
-FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
+FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "integrated_multimodal_description", "asset_roles", "visual_style_and_continuity", "dialogue_and_audio", "stability_constraints", "overall_soundscape", "non_diegetic_music")
 FORGED_HEADER = re.compile(r"(?:^|\n)\s*(?:" + "|".join(FIELDS) + r")\s*:", re.I)
 RESERVED_TAG = re.compile(r"</?d>|<\|?cutoff\|?>|<scenetrans>|<Speaker\s+\d+>", re.I)
 EXPLICIT_BINDING = re.compile(r"<(Picture|Video|Audio|Subject)\s+(\d+)>")
@@ -40,6 +42,26 @@ def _text(value: Any) -> str:
 def _sentence(value: str) -> str:
     value = value.strip()
     return value if not value or value[-1] in '.!?"' else value + "."
+
+
+_CAMERA_SUMMARY_LEAD = re.compile(
+    r"^\s*(?:(?:shot|camera)(?:\s+\d+)?|镜头|鏡頭|分镜|分鏡|景别|景別|カメラ|ショット)\s*[:：]\s*"
+    r"[^\r\n.!?。！？]*(?:[.!?。！？]|\r?\n|$)\s*",
+    re.IGNORECASE,
+)
+
+
+def _story_summary(value: str) -> str:
+    """Remove a labelled camera preamble from narrative summary prose.
+
+    Camera and transition choices belong to the structured shot. Keeping a
+    legacy `Shot: ... reverse shot ...` sentence in summary while the approved
+    shot is continuous/static gives H3 two incompatible compositions and can
+    encourage duplicated cast. Story facts after that sentence remain intact.
+    """
+    value = value.strip()
+    cleaned = _CAMERA_SUMMARY_LEAD.sub("", value, count=1).strip()
+    return cleaned or value
 
 
 def _stamp(value: Decimal) -> str:
@@ -101,6 +123,10 @@ def compile_project(project: dict) -> dict:
         issue("error", "schema_version", "schema_version", "Only Project schema version 1 is supported.")
     mode = project.get("mode")
     profile = project.get("profile", "director")
+    prompt_version = project.get("prompt_version", "classic")
+    if prompt_version not in ("classic", "continuity_director", "storyboard_narrative"):
+        issue("error", "invalid_prompt_version", "prompt_version", "Choose a supported video prompt version.")
+    director_continuity = prompt_version == "continuity_director"
     if not isinstance(mode, str) or mode not in MODES:
         issue("error", "invalid_mode", "mode", "Choose ref2va, fl2va, i2va, l2va or t2va.")
         mode = ""
@@ -128,6 +154,17 @@ def compile_project(project: dict) -> dict:
     shots = collection(project.get("shots", []), "shots")
     asset_map, subject_map = ids(assets, "assets"), ids(subjects, "subjects")
     ids(shots, "shots")
+    for index, subject in enumerate(subjects):
+        members = subject.get("collective_member_ids") if isinstance(subject, dict) else None
+        if members is None:
+            continue
+        path = f"subjects[{index}].collective_member_ids"
+        if (not isinstance(members, list) or not members or any(not isinstance(member, str) for member in members)
+                or len(set(members)) != len(members) or subject.get("id") in members
+                or any(member not in subject_map for member in members)
+                or any(subject_map.get(member, {}).get("collective_member_ids") is not None for member in members)):
+            issue("error", "invalid_collective_speaker", path,
+                  "A collective dialogue cue must contain distinct existing character IDs and cannot include itself.")
     if any(i["severity"] == "error" for i in issues):
         return result()
     if not shots:
@@ -308,7 +345,12 @@ def compile_project(project: dict) -> dict:
                     # Exact spoken words, language, and speaker ownership are
                     # protected. A delivery direction may reference a photo.
                     resolve_fields(line, ("delivery",), f"shots[{i}].dialogue[{j}]")
-    story_text = story.get("text", "")
+    story_text = clarify_unanswered_wait(story.get("text", ""), shots)
+    story["text"] = story_text
+    for scene in shots:
+        for key in ("action", "performance", "final_state"):
+            if isinstance(scene.get(key), str):
+                scene[key] = clarify_unanswered_wait(scene[key], shots)
     soundscape, music, custom = (project.get(key, "") for key in ("soundscape", "music", "custom_instructions"))
 
     active_ids = {a.get("id") for a in active}
@@ -386,7 +428,11 @@ def compile_project(project: dict) -> dict:
                 issue("error", "unknown_speaker", dp + ".speaker_id", "Bind dialogue to an existing subject, including an off-screen narrator if needed.")
             else:
                 speaker_ids.setdefault(sid, f"(S{len(speaker_ids) + 1})")
-                if sid not in roster["visible_subject_ids"] + roster["offscreen_subject_ids"]:
+                members = subject_map[sid].get("collective_member_ids", [])
+                if members and any(member not in roster["visible_subject_ids"] for member in members):
+                    issue("error", "collective_speaker_not_visible", dp + ".speaker_id",
+                          "Every member of a collective spoken line must be visible in this shot.")
+                elif not members and sid not in roster["visible_subject_ids"] + roster["offscreen_subject_ids"]:
                     issue("warning", "speaker_not_in_roster", dp + ".speaker_id", "Set whether this speaker is visible or off-screen in this shot.")
             text = string(line.get("text", ""), dp + ".text", required=True, dialogue=True)
             language = string(line.get("language", ""), dp + ".language")
@@ -434,6 +480,36 @@ def compile_project(project: dict) -> dict:
     def semantic(asset):
         return {"face": "facial identity", "character": "character identity", "background": "environment", "object": "object", "palette": "color palette", "style": "visual style", "wardrobe": "wardrobe", "pose": "pose", "other": "visible content"}.get(asset.get("semantic_role", "other"), "visible content")
 
+    def overview_binding(asset, subject_id):
+        """Describe one subject's declared region in a shared overview image.
+
+        These rows are produced by the long-form card library. Treat them as
+        authored identity bindings while the assigned pixels lead directly
+        visible appearance; automated observations remain supplementary.
+        Imported projects may contain arbitrary extension data, so malformed
+        rows are ignored rather than trusted or allowed to crash compilation.
+        """
+        rows = asset.get("reference_card_bindings", [])
+        if not isinstance(rows, list):
+            return ""
+        row = next((item for item in rows if isinstance(item, dict) and item.get("subject_id") == subject_id), None)
+        if row is None:
+            return ""
+        region = _text(row.get("region"))
+        card_name = _text(row.get("name"))
+        parts = [f"use {region}" if region else "use the explicitly assigned region"]
+        if card_name:
+            parts.append(f"assigned to {card_name}")
+        canonical = _text(row.get("canonical_description"))
+        # Character facts already live on the bound Subject. Repeating the full
+        # card here, again in the Subject description and again in the shot made
+        # six-person overview prompts several thousand tokens longer. Wardrobe
+        # facts are not part of the character Subject, so retain those once.
+        if canonical and asset.get("semantic_role") != "character":
+            parts.append(f"named-card facts: {canonical}")
+        parts.append("assigned image pixels lead directly visible appearance; the Character Bible and named card control identity, relationships, non-visible facts and region binding")
+        return " (" + "; ".join(parts) + ")"
+
     def visual_retention(label, aids):
         # Select retention from the explicit role enum. Captions remain intact;
         # their approved content is never filtered through keyword/NLP guesses.
@@ -466,15 +542,32 @@ def compile_project(project: dict) -> dict:
         return f"{label}: {level} - " + "; ".join(parts) + ". Each source contributes only its assigned role."
 
     if mode == "ref2va":
-        for subject in subjects:
+        # Number Subjects in their first on/off-screen appearance order. This
+        # keeps a shared overview map readable and deterministic even when the
+        # source Studio project's subject array was created in another order.
+        ordered_ids = []
+        for shot in shots:
+            ordered_ids.extend(shot.get("visible_subject_ids", []))
+            ordered_ids.extend(shot.get("offscreen_subject_ids", []))
+        ordered_ids.extend(subject["id"] for subject in subjects)
+        order = {subject_id: index for index, subject_id in enumerate(dict.fromkeys(ordered_ids))}
+        ordered_subjects = sorted(subjects, key=lambda subject: order.get(subject["id"], len(order)))
+        for subject in ordered_subjects:
             aids = [a for a in bound[subject["id"]] if asset_map[a].get("media_type") in visual_kinds]
             if not aids:
                 continue
             label = f"<Subject {len(subject_tokens) + 1}>"
             subject_tokens[subject["id"]] = label
-            source = "; ".join(f"{primary_ref[a]['token']} supplies {semantic(asset_map[a])}" for a in aids)
+            source = "; ".join(
+                f"{primary_ref[a]['token']} supplies {semantic(asset_map[a])}{overview_binding(asset_map[a], subject['id'])}"
+                for a in aids)
             desc = _text(subject.get("description"))
-            observed = " ".join(details(asset_map[a]) for a in aids if details(asset_map[a]))
+            # An overview's generic library instructions apply to the Picture as
+            # a whole, not once per mapped Subject. The structured region binding
+            # above plus the Subject's named card are the concise authority pair.
+            observed = " ".join(details(asset_map[a]) for a in aids
+                                if asset_map[a].get("reference_overview") is not True
+                                and details(asset_map[a]))
             definitions.append(_sentence(f"{label} is {subject['name']}. {source}. {desc} {observed}"))
             retention.append(visual_retention(label, aids))
             used_assets.update(aids)
@@ -482,6 +575,20 @@ def compile_project(project: dict) -> dict:
         for asset in active:
             aid = asset["id"]
             if asset.get("media_type") == "image" and aid not in used_assets:
+                if asset.get("reference_overview") is True:
+                    token = primary_ref[aid]["token"]
+                    rows = asset.get("reference_card_bindings", [])
+                    mapping = "; ".join(
+                        f"{_text(row.get('region')) or 'assigned region'} = {_text(row.get('name'))}"
+                        for row in rows if isinstance(row, dict) and _text(row.get("name"))) if isinstance(rows, list) else ""
+                    definitions.append(_sentence(
+                        f"{token} is a compact {semantic(asset)} overview named {asset.get('name') or 'overview'}. "
+                        + (f"Declared map: {mapping}. " if mapping else "")
+                        + details(asset)))
+                    retention.append(
+                        f"{token}: composite_reference - keep every declared entry separate and use only its assigned role; assigned image pixels lead directly visible appearance, while the written card and Character Bible control identity, non-visible facts and region binding.")
+                    used_assets.add(aid)
+                    continue
                 label = f"<Subject {next_subject}>"
                 next_subject += 1
                 definitions.append(_sentence(f"{label} is the {semantic(asset)} reference named {asset.get('name') or 'reference'}, supplied by {primary_ref[aid]['token']}. {details(asset)}"))
@@ -503,9 +610,9 @@ def compile_project(project: dict) -> dict:
                             visual_label = subject_tokens.get(sid, "")
                             assigned_speakers.append(" ".join(v for v in (visual_label, subject["name"], speaker_ids[sid]) if v))
                     if assigned_speakers:
-                        definition += " Voice reference assignment: " + "; ".join(assigned_speakers) + ". Use the supplied voice characteristics as a reference; do not add or replace the scripted words."
+                        definition += " Voice reference assignment: " + "; ".join(assigned_speakers) + ". The supplied audio is the primary authority for that speaker's audible identity, including timbre, pitch, accent, apparent age, cadence, pace and vocal texture. Written voice direction supplements acting intent and exclusions. Do not copy the sample transcript or add, remove or replace the scripted words."
                 definitions.append(_sentence(ref["token"] + " is an audio reference. " + definition))
-                retention.append(f"{ref['token']}: reference - use only the described audible characteristics; exact signal copying is not guaranteed by a prompt.")
+                retention.append(f"{ref['token']}: primary_voice_reference - preserve the supplied audible identity as the leading voice authority while speaking only the scripted words; exact signal copying is not guaranteed by a prompt.")
             elif ref["token"].startswith("<Video"):
                 asset = asset_map[ref["asset_id"]]
                 definitions.append(_sentence(f"{ref['token']} is the reference video named {asset.get('name') or 'video'}, supplying only the described content or temporal guidance. {details(asset)}"))
@@ -544,6 +651,9 @@ def compile_project(project: dict) -> dict:
 
     def name(sid):
         s = subject_map[sid]
+        members = s.get("collective_member_ids", [])
+        if members:
+            return "the visible ensemble (" + "; ".join(name(member) for member in members) + ")"
         return (subject_tokens[sid] + " " if sid in subject_tokens else "") + s["name"]
 
     viewpoint = project.get('game_viewpoint', 'auto')
@@ -560,6 +670,10 @@ def compile_project(project: dict) -> dict:
             style_parts.append(_sentence(lead + _text(style[key])))
     if custom.strip():
         style_parts.append(_sentence(custom))
+    if director_continuity:
+        style_parts.append("Continuity: each named Subject is one physical instance; reference portraits and multi-character overview sheets are identity maps, not extra on-screen people. Keep one coherent rendering style and stable camera geography across all beats. A style reference supplies only visual treatment, never its pictured cast or props.")
+    else:
+        style_parts.append("Keep one visual style across the clip. A character reference or overview is an identity guide, not another on-screen copy; each named character appears at most once in the scene.")
     style_text = " ".join(style_parts)
     rendered_shots = []
     for i, shot in enumerate(shots):
@@ -567,7 +681,7 @@ def compile_project(project: dict) -> dict:
         if i == 0 and mode != "ref2va":
             paragraphs.append(style_text)
             if story_text.strip() != _text(shot.get('action')):
-                paragraphs.append(_sentence(story_text))
+                paragraphs.append(_sentence(_story_summary(story_text)))
         if i == 0:
             for asset in active:
                 owner = asset.get("simple_owner_id")
@@ -584,13 +698,28 @@ def compile_project(project: dict) -> dict:
             paragraphs.append(_sentence("A " + camera["framing"] + " shot"))
         if _text(shot.get("setting")):
             paragraphs.append(_sentence(shot["setting"]))
+        cast_ids = [sid for sid in shot.get("visible_subject_ids", [])
+                    if not (viewpoint == 'pov' and sid == project.get('game_player_id'))]
+        if cast_ids:
+            paragraphs.append(_sentence(
+                "Exact named visible roster: " + "; ".join(name(sid) for sid in cast_ids)
+                + ". Show one physical instance of each listed identity, never an additional copy from its reference image or overview sheet; no unlisted principal character"))
+        else:
+            paragraphs.append("No named character is visible in this shot; do not turn a reference portrait into a background extra.")
         for sid in shot.get("visible_subject_ids", []):
             if viewpoint == 'pov' and sid == project.get('game_player_id'):
                 continue  # A POV identity/hand reference is not a visible body.
-            desc = _text(subject_map[sid].get("description"))
+            # A referenced Subject is fully defined in subject_definitions. The
+            # shot roster only needs to place that token on screen; repeating its
+            # entire identity card here inflated ensemble prompts and obscured
+            # the actual staging. Unreferenced subjects still need inline detail.
+            desc = "" if sid in subject_tokens else _text(subject_map[sid].get("description"))
             paragraphs.append(_sentence(name(sid) + " is visible" + (": " + desc if desc else "")))
         for sid in shot.get("offscreen_subject_ids", []):
             paragraphs.append(_sentence(name(sid) + " remains off-screen"))
+        identity_lock = visible_identity_lock(subjects, cast_ids, name)
+        if identity_lock:
+            paragraphs.append(identity_lock)
         paragraphs.extend(render_scene_contract(project, shot, name))
         movement = _text(camera.get("movement"))
         moving = {"static": "holds a static shot", "push_in": "pushes in", "pull_out": "pulls out", "pan_left": "pans left", "pan_right": "pans right", "truck_left": "trucks left", "truck_right": "trucks right", "tilt_up": "tilts up", "tilt_down": "tilts down", "arc": "arcs around the subject", "tracking": "tracks the subject", "zoom_in": "zooms in", "zoom_out": "zooms out"}
@@ -604,8 +733,21 @@ def compile_project(project: dict) -> dict:
             if _text(camera.get("height")):
                 parts.append("at " + camera["height"] + " height")
             paragraphs.append(_sentence(" ".join(parts)))
-        if _text(camera.get("focus")):
-            paragraphs.append(_sentence("Focus on " + camera["focus"]))
+        if i == 0 and len(shots) == 1:
+            paragraphs.append(
+                "Use one continuous camera setup for the complete clip. Do not create a reverse shot, cutaway, "
+                "split screen, inset, montage, contact sheet or repeated view of the cast. Camera movement, when "
+                "assigned above, occurs inside this same continuous take.")
+        focus = _text(camera.get("focus"))
+        if focus:
+            # Values such as `deep focus` already name the camera treatment;
+            # `Focus on deep focus` is both awkward and ambiguous. Keep the
+            # treatment attached to the approved continuous take instead.
+            if re.search(r"\bfocus\b", focus, re.IGNORECASE):
+                suffix = " throughout the continuous shot" if len(shots) == 1 else ""
+                paragraphs.append(_sentence("Use " + focus + suffix))
+            else:
+                paragraphs.append(_sentence("Focus on " + focus))
         action, performance, ending = (_text(shot.get(key)) for key in ('action', 'performance', 'final_state'))
         paragraphs.append(_sentence(action))
         # Generated direction used to repeat the complete approved action and
@@ -617,7 +759,10 @@ def compile_project(project: dict) -> dict:
             delivery = _text(line.get("delivery"))
             voiceover = line.get("voiceover") is True
             offscreen = sid in shot.get("offscreen_subject_ids", [])
-            verb = "says in an off-screen voiceover" if voiceover else ("speaks off-screen" if offscreen else "says")
+            collective = bool(subject_map[sid].get("collective_member_ids"))
+            verb = ("say together in exact unison" if collective else
+                    "says in an off-screen voiceover" if voiceover else
+                    "speaks off-screen" if offscreen else "says")
             utterance = f"{name(sid)} {speaker_ids[sid]} {verb}"
             if delivery:
                 utterance += ", " + delivery
@@ -645,11 +790,32 @@ def compile_project(project: dict) -> dict:
                 body = "the camera cuts to the following composition. " + body
             rendered_shots.append(f"[Shot {len(rendered_shots) + 1}] At {timestamp}, " + body)
     body = "\n".join(rendered_shots)
-    sound = soundscape.strip() or "No additional soundscape direction is specified."
+    body += "\n" + audible_speech_lock(shots, {sid: name(sid) for sid in subject_map})
+    body += ("\nContinuity safeguards: no duplicate instance of a named subject, face swap, merged cast, "
+             "costume or prop exchange, style change, unexplained teleportation, reversed screen direction, "
+             "extra limbs, random background people, subtitles, logos or watermarks. Keep voice identity "
+             "and exact spoken words assigned only to their scripted speaker; off-screen voices remain off-screen. "
+             "End on the declared final visible state.")
+    sound_parts = []
+    for value in [soundscape, *(shot.get("sound", "") for shot in shots)]:
+        value = _text(value)
+        if value and value.casefold() not in {item.casefold() for item in sound_parts}:
+            sound_parts.append(value)
+    sound = " ".join(_sentence(value) for value in sound_parts)
+    if not sound:
+        sound = "No additional soundscape direction is specified."
     score = music.strip() or "N/A"
-    if mode == "ref2va":
+    if prompt_version in ("continuity_director", "storyboard_narrative"):
+        from .narrative_prompt import render_narrative_prompt
+        prompt = render_narrative_prompt(
+            project=project, references=references, active=active, bound=bound,
+            speaker_ids=speaker_ids, shots=shots, story_text=story_text,
+            style=style, custom=custom, duration=duration,
+            soundscape=soundscape, music=music,
+        )
+    elif mode == "ref2va":
         summary = "[reference generation" + (" + audio reference" if any(r["token"].startswith("<Audio") for r in references) else "") + "] "
-        summary += story_text.strip() or "Generate the target sequence from the defined references and shot timeline."
+        summary += _story_summary(story_text) or "Generate the target sequence from the defined references and shot timeline."
         prompt = "\n\n".join(("subject_definitions:\n" + "\n".join(definitions), "summary:\n" + summary, "retention_analysis:\n" + "\n".join(retention), "detailed_description:\n" + (style_text + "\n" if style_text else "") + body, "overall_soundscape:\n" + sound, "non_diegetic_music:\n" + score))
     else:
         preface = ""
@@ -662,6 +828,16 @@ def compile_project(project: dict) -> dict:
         prompt = "\n\n".join(("integrated_multimodal_description: " + body, "overall_soundscape: " + sound, "non_diegetic_music: " + score))
         if preface:
             prompt = preface + "\n\n" + prompt
+    # AI planning data remains editable in the project's language.  A saved,
+    # source-bound delivery prompt may replace this raw multilingual rendering
+    # only after the final language pass has verified English direction and the
+    # project's selected spoken language.
+    from .prompt_language import saved_delivery_prompt
+    delivery_prompt, language_error = saved_delivery_prompt(project, prompt)
+    if language_error:
+        issue("error", "stale_prompt_translation", "h3_prompt_translation", language_error)
+    elif delivery_prompt is not None:
+        prompt = delivery_prompt
     return result(prompt)
 
 

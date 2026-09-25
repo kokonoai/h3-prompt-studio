@@ -29,10 +29,16 @@ class AssetRunError(ValueError):
 
 MODELS = ('z_image_turbo_bf16.safetensors', 'z_image_turbo_fp8_e4m3fn.safetensors')
 H3_FRAME_MODEL = 'h3-frame-fl2va-5f'
+KREA_MODEL = 'krea2_turbo_bf16.safetensors'
+KREA_ENCODER, KREA_VAE = 'qwen3vl_4b_bf16.safetensors', 'qwen_image_vae.safetensors'
 ENCODER, VAE = 'qwen_3_4b.safetensors', 'ae.safetensors'
 NODES = ('UNETLoader', 'CLIPLoader', 'VAELoader', 'CLIPTextEncode',
          'ConditioningZeroOut', 'ModelSamplingAuraFlow', 'EmptySD3LatentImage',
          'KSampler', 'VAEDecode', 'SaveImage')
+INVENTORY_NODES = tuple(dict.fromkeys((*NODES,
+    'LoraLoaderModelOnly', 'MiniMaxH3SigmaShift', 'MiniMaxH3ImageToVideo',
+    'BasicGuider', 'RandomNoise', 'KSamplerSelect', 'BasicScheduler',
+    'SamplerCustomAdvanced', 'ImageFromBatch', 'EmptyLatentImage')))
 ROLES = frozenset({'face', 'character', 'background', 'object', 'palette', 'style',
                    'wardrobe', 'pose', 'other'})
 ACTIVE = frozenset({'preparing', 'queued', 'running', 'uncertain', 'cancelling'})
@@ -78,8 +84,8 @@ def _spec(value):
         raise AssetRunError('Use a short reference tag such as arin-face or cafe-background.')
     result['person_id'] = _id(result['person_id']) if result.get('person_id') is not None else None
     result.setdefault('model', MODELS[0])
-    if result['model'] not in (*MODELS, H3_FRAME_MODEL):
-        raise AssetRunError('Select an installed Z-Image-Turbo or experimental H3 frame generator.')
+    if result['model'] not in (*MODELS, H3_FRAME_MODEL, KREA_MODEL):
+        raise AssetRunError('Select an installed Z-Image-Turbo, Krea 2 or experimental H3 frame generator.')
     for key in ('width', 'height'):
         result.setdefault(key, 512)
         if type(result[key]) is not int or not 128 <= result[key] <= 1024 or result[key] % 16:
@@ -143,6 +149,44 @@ def _h3_catalog(info):
     return ([] if missing else [H3_FRAME_MODEL]), missing
 
 
+def _krea_catalog(info):
+    """Check the supplied Krea canvas's base nodes and weights on one server."""
+    required_nodes = ('UNETLoader', 'CLIPLoader', 'VAELoader', 'CLIPTextEncode',
+                      'EmptyLatentImage', 'KSampler', 'VAEDecode', 'SaveImage')
+    missing = [node for node in required_nodes if not isinstance(info.get(node), dict)]
+    requirements = [('UNETLoader', 'unet_name', KREA_MODEL),
+                    ('CLIPLoader', 'clip_name', KREA_ENCODER),
+                    ('CLIPLoader', 'type', 'krea2'),
+                    ('VAELoader', 'vae_name', KREA_VAE),
+                    ('KSampler', 'sampler_name', 'er_sde'),
+                    ('KSampler', 'scheduler', 'simple')]
+    missing += [f'{node}: {option}' for node, field, option in requirements
+                if option not in _choices(info, node, field)]
+    return ([] if missing else [KREA_MODEL]), missing
+
+
+def _targeted_inventory(client, origin):
+    """Read only the node definitions needed by the bundled image recipes.
+
+    A large ComfyUI installation can return tens of megabytes from
+    ``/object_info``.  On Windows that regularly exceeds the old 15 second
+    request timeout even though ComfyUI is healthy.  Current ComfyUI versions
+    expose the same schema per node, which is much faster and avoids making the
+    Settings page look unavailable while unrelated custom nodes are scanned.
+    """
+    info = {}
+    for node_name in INVENTORY_NODES:
+        response = client.get(f'{origin}/object_info/{node_name}', timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError('ComfyUI returned an invalid targeted node inventory.')
+        entry = payload.get(node_name)
+        if isinstance(entry, dict):
+            info[node_name] = entry
+    return info
+
+
 def _h3_frame_graph(request_id, spec):
     from .comfy_transfer import HERETIC, FL_LORA
     def node(kind, **inputs):
@@ -174,6 +218,22 @@ def build_graph(request_id, spec):
         return _h3_frame_graph(request_id, spec)
     def node(kind, **inputs):
         return {'class_type': kind, 'inputs': inputs}
+    if spec['model'] == KREA_MODEL:
+        # The source JSON says "no LoRA" but contains three style LoRAs and only
+        # PreviewImage. This safe base variant omits those LoRAs and adds SaveImage.
+        return {
+            '1': node('UNETLoader', unet_name=KREA_MODEL, weight_dtype='default'),
+            '2': node('CLIPLoader', clip_name=KREA_ENCODER, type='krea2', device='default'),
+            '3': node('VAELoader', vae_name=KREA_VAE),
+            '4': node('CLIPTextEncode', clip=['2', 0], text=spec['prompt']),
+            '5': node('CLIPTextEncode', clip=['2', 0], text='text, watermark, logo, duplicate characters, extra limbs, distorted anatomy, blurry'),
+            '6': node('EmptyLatentImage', width=spec['width'], height=spec['height'], batch_size=1),
+            '7': node('KSampler', model=['1', 0], positive=['4', 0], negative=['5', 0],
+                      latent_image=['6', 0], seed=spec['seed'], steps=8, cfg=1.0,
+                      sampler_name='er_sde', scheduler='simple', denoise=1.0),
+            '8': node('VAEDecode', samples=['7', 0], vae=['3', 0]),
+            '9': node('SaveImage', images=['8', 0], filename_prefix=f'h3_prompt_studio/assets/{request_id}/image'),
+        }
     return {
         '1': node('UNETLoader', unet_name=spec['model'], weight_dtype='default'),
         '2': node('CLIPLoader', clip_name=ENCODER, type='lumina2', device='default'),
@@ -227,31 +287,70 @@ class AssetRunManager:
         return list(dict.fromkeys(_origin(value) for value in values))
 
     def options(self):
-        servers, errors = [], []
+        servers, errors, unavailable = [], [], []
         for origin in self._origins():
             try:
                 with self.client_factory() as client:
-                    response = client.get(origin + '/object_info')
-                    response.raise_for_status()
-                    info = response.json()
+                    try:
+                        info = _targeted_inventory(client, origin)
+                    except httpx.HTTPStatusError as exc:
+                        # Compatibility fallback for older ComfyUI builds that
+                        # do not provide /object_info/{node_name}.
+                        if exc.response.status_code not in (404, 405):
+                            raise
+                        response = client.get(origin + '/object_info', timeout=60)
+                        response.raise_for_status()
+                        info = response.json()
                     models, missing = _catalog(info)
                     h3_models, h3_missing = _h3_catalog(info)
-                available_models = ([] if missing else models) + h3_models
+                    krea_models, krea_missing = _krea_catalog(info)
+                available_models = ([] if missing else models) + h3_models + krea_models
+                model_missing = {model: list(missing) +
+                                 ([] if model in models else [f'UNETLoader: {model}']) for model in MODELS}
+                model_missing[H3_FRAME_MODEL] = h3_missing
+                model_missing[KREA_MODEL] = krea_missing
                 servers.append({'comfy_url': origin, 'models': available_models, 'missing': missing,
-                                'h3_missing': h3_missing, 'ready': bool(available_models)})
+                                'h3_missing': h3_missing, 'krea_missing': krea_missing,
+                                'model_missing': model_missing,
+                                'ready': bool(available_models)})
+            except httpx.ConnectError:
+                message = f'Cannot connect to ComfyUI at {origin}. Start that ComfyUI server and refresh availability.'
+                errors.append(message)
+                unavailable.append({'comfy_url': origin, 'reason': 'connection_failed', 'message': message})
             except (httpx.HTTPError, ValueError):
-                errors.append(f'ComfyUI node inventory is unavailable at {origin}.')
-        available = [model for model in (*MODELS, H3_FRAME_MODEL) if any(s['ready'] and model in s['models'] for s in servers)]
+                message = f'Cannot read ComfyUI node inventory at {origin}. Check that server and refresh availability; installed models could not be verified.'
+                errors.append(message)
+                unavailable.append({'comfy_url': origin, 'reason': 'inventory_unavailable', 'message': message})
+        available = [model for model in (*MODELS, H3_FRAME_MODEL, KREA_MODEL) if any(s['ready'] and model in s['models'] for s in servers)]
         return {'ready': bool(available), 'models': available, 'default_model': available[0] if available else None,
                 'encoder': ENCODER, 'vae': VAE, 'width': 512, 'height': 512, 'max_dimension': 1024,
                 'steps': 8, 'cfg': 1, 'sampler': 'res_multistep', 'scheduler': 'simple', 'shift': 3,
                 'generators': [{'id': model, 'model': model, 'available': True, 'compatible': True,
-                                'name': 'H3 frame · experimental' if model == H3_FRAME_MODEL else model,
-                                'label': 'H3 frame · experimental, 5 frames /4 steps' if model == H3_FRAME_MODEL else model,
-                                'experimental': model == H3_FRAME_MODEL, 'kind': 'h3_frame' if model == H3_FRAME_MODEL else 'z_image_turbo',
+                                'name': 'H3 frame · experimental' if model == H3_FRAME_MODEL else 'Krea 2 · 8 steps (no LoRA)' if model == KREA_MODEL else model,
+                                'label': 'H3 frame · experimental, 5 frames /4 steps' if model == H3_FRAME_MODEL else 'Krea 2 · 8 steps (no LoRA)' if model == KREA_MODEL else model,
+                                'experimental': model == H3_FRAME_MODEL, 'kind': 'h3_frame' if model == H3_FRAME_MODEL else 'krea2' if model == KREA_MODEL else 'z_image_turbo',
                                 'steps': 4 if model == H3_FRAME_MODEL else 8,
-                                'note': 'Extracts one frame below the trained video duration. Speed and quality require local testing.' if model == H3_FRAME_MODEL else 'Native eight-step Z-Image-Turbo recipe.'}
-                               for model in available], 'servers': servers, 'errors': errors}
+                                'note': 'Extracts one frame below the trained video duration. Speed and quality require local testing.' if model == H3_FRAME_MODEL else 'Adapted from the supplied Krea workflow; its three style LoRAs are intentionally omitted.' if model == KREA_MODEL else 'Native eight-step Z-Image-Turbo recipe.'}
+                               for model in available], 'servers': servers, 'errors': errors,
+                'inventory_available': bool(servers), 'unavailable_servers': unavailable}
+
+    @staticmethod
+    def _unavailable_message(options, model):
+        servers = options['servers']
+        if not servers:
+            return ('ComfyUI is unavailable; installed image models could not be checked. '
+                    'Start your configured ComfyUI server and retry. ' + ' '.join(options.get('errors', [])))
+        details = []
+        for server in servers:
+            missing = server.get('model_missing', {}).get(model)
+            if missing is None:
+                missing = server.get('h3_missing' if model == H3_FRAME_MODEL else 'missing', [])
+            details.append(f"{server['comfy_url']}: " + (', '.join(missing) if missing else f'{model} is not available'))
+        alternative = (' Available alternatives: ' + ', '.join(options['models']) +
+                       '. Choose one explicitly in image settings.') if options['models'] else ''
+        return (f'The selected image generator ({model}) is unavailable on the checked ComfyUI servers. '
+                'Missing requirements on each server: ' + '; '.join(details) + '.' + alternative +
+                (' Other configured servers could not be checked. ' + ' '.join(options['errors']) if options.get('errors') else ''))
 
     def _record(self, ident):
         ident = _id(ident)
@@ -269,7 +368,7 @@ class AssetRunManager:
         with self.lock:
             result = {key: copy.deepcopy(record.get(key)) for key in
                       ('id', 'request_id', 'status', 'stage', 'error', 'warning', 'created_at', 'updated_at',
-                       'started_at', 'finished_at', 'asset', 'asset_id', 'cancel_requested', 'prompt_id')}
+                       'started_at', 'finished_at', 'asset', 'asset_id', 'cancel_requested', 'prompt_id', 'submission_intent')}
             result.update(copy.deepcopy(record['spec']))
             result['elapsed_seconds'] = round(max(0, (record.get('finished_at') or time.time()) -
                                                 (record.get('started_at') or record['created_at'])), 3)
@@ -355,7 +454,7 @@ class AssetRunManager:
                 options = self.options()
                 server = next((s for s in options['servers'] if s['ready'] and record['spec']['model'] in s['models']), None)
                 if not server:
-                    raise AssetRunError('The selected generator’s models, encoder, VAE and native nodes must be installed together in ComfyUI. Check Image generator availability.')
+                    raise AssetRunError(self._unavailable_message(options, record['spec']['model']))
                 origin = server['comfy_url']
                 if origin not in record['origins']:
                     raise AssetRunError('ComfyUI settings changed during image preparation. Submit a new request.')
@@ -487,7 +586,7 @@ class AssetRunManager:
             _id(asset['id'])
             asset = {**asset, 'semantic_role': spec['semantic_role'], 'prompt_tag': spec['prompt_tag'],
                      'description': spec['prompt'], 'person_id': spec['person_id'],
-                     'generated_by': {'kind': 'h3_frame' if spec['model'] == H3_FRAME_MODEL else 'z_image_turbo',
+                      'generated_by': {'kind': 'h3_frame' if spec['model'] == H3_FRAME_MODEL else 'krea2' if spec['model'] == KREA_MODEL else 'z_image_turbo',
                                       'run_id': record['id'], 'model': spec['model'], 'seed': spec['seed'],
                                       'steps': 4 if spec['model'] == H3_FRAME_MODEL else 8, 'cfg': 1,
                                       **({'experimental': True, 'generated_frames': 5, 'selected_frame': 2} if spec['model'] == H3_FRAME_MODEL else {})}}

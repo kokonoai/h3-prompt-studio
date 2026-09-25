@@ -20,6 +20,7 @@ import httpx
 from PIL import Image, UnidentifiedImageError
 
 from .resources import local_url
+from .video_workflows import REF8_LORA
 
 
 class TransferError(ValueError):
@@ -47,6 +48,7 @@ def transfer_options():
         'qualities': [
             {'value': 'fast', 'label': 'Fast tested recipe', 'ref_steps': 8, 'frame_steps': 4},
             {'value': 'detailed', 'label': 'Double steps to compare', 'ref_steps': 16, 'frame_steps': 8},
+            {'value': 'lora8', 'label': '8-step LoRA acceleration', 'ref_steps': 8, 'frame_steps': None},
         ],
         'steps': [4, 8, 16], 'aspect_ratios': ['16:9', '9:16', '1:1', '4:3', '3:4'],
         'modes': [{'value': key, 'label': label} for key, label in MODE_LABELS.items()],
@@ -88,14 +90,18 @@ def _settings(project, settings):
         width = max(32, round(math.sqrt(pixels * ratio) / 32) * 32)
         height = max(32, round(math.sqrt(pixels / ratio) / 32) * 32)
     quality = settings.get('quality', 'fast')
-    if quality not in ('fast', 'detailed'):
-        raise TransferError('Choose Fast tested recipe or Double steps to compare.')
+    if quality not in ('fast', 'detailed', 'lora8'):
+        raise TransferError('Choose a supported H3 quality recipe.')
+    if quality == 'lora8' and mode != 'ref2va':
+        raise TransferError('The 8-step LoRA recipe requires Reference-to-Video mode.')
     defaults = (8, 16) if mode == 'ref2va' else (4, 8)
     steps = settings.get('steps')
     if steps is None or steps == 'auto':
         steps = defaults[quality == 'detailed']
     if type(steps) is not int or steps not in (4, 8, 16):
         raise TransferError('Choose 4, 8 or 16 sampling steps, or use the recipe default.')
+    if quality == 'lora8' and steps != 8:
+        raise TransferError('The 8-step LoRA recipe uses exactly 8 sampling steps.')
     seed = settings.get('seed', 9072026)
     if type(seed) is not int or not 0 <= seed <= 2**53 - 1:
         raise TransferError('The seed must be a whole number from 0 through 9007199254740991.')
@@ -109,10 +115,14 @@ def _settings(project, settings):
             'width': width, 'height': height, 'megapixels': width * height / 1_000_000,
             'frames': frames, 'fps': 24, 'actual_duration': frames / 24,
             'quality': quality, 'steps': steps, 'seed': seed,
-            'lora': REF_LORA if mode == 'ref2va' else FL_LORA,
-            'lora_training_steps': 8 if mode == 'ref2va' else 4,
-            'shift_video': 12.0 if mode == 'ref2va' else 6.0, 'shift_audio': 3.0,
-            'attention': 'H3 SLA · Kitchen · 85% sparsity', 'reference_image_size': 'match',
+            'lora': REF8_LORA if quality == 'lora8' else REF_LORA if mode == 'ref2va' else FL_LORA,
+            'lora_strength': 0.5 if quality == 'lora8' else 1.0,
+            'lora_training_steps': 4 if quality == 'lora8' else 8 if mode == 'ref2va' else 4,
+            'shift_video': 12.0 if mode == 'ref2va' else 6.0,
+            'shift_audio': 6.0 if quality == 'lora8' else 3.0,
+            'attention': 'PatchSageAttentionKJ disabled' if quality == 'lora8' else 'H3 SLA · Kitchen · 85% sparsity',
+            'text_encoder': 'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors' if quality == 'lora8' else HERETIC,
+            'reference_image_size': 'match',
             'experimental_preview': resolution in EXPERIMENTAL_RESOLUTIONS or duration < 4}
 
 
@@ -147,14 +157,16 @@ def _active_images(project, mode):
 def _lora_compatibility(name):
     # Availability in the global LoRA loader is not evidence of H3 compatibility.
     # Only the two exact measured adapters can be certified by this app.
-    modes = ['ref2va'] if name == REF_LORA else ['fl2va', 'i2va', 'l2va', 't2va'] if name == FL_LORA else []
-    return {'compatibility': 'tested' if modes else 'unverified', 'compatible_modes': modes}
+    modes = ['ref2va'] if name in (REF_LORA, REF8_LORA) else ['fl2va', 'i2va', 'l2va', 't2va'] if name == FL_LORA else []
+    status = 'attachment recipe' if name == REF8_LORA else 'tested' if modes else 'unverified'
+    return {'compatibility': status, 'compatible_modes': modes}
 
 
-def _lora_selections(settings, mode):
+def _lora_selections(settings, mode, quality='fast'):
     selected = settings.get('loras')
     if selected is None:
-        selected = transfer_options()['default_loras'][mode]
+        selected = ([{'name': REF8_LORA, 'strength': 0.5, 'enabled': True}]
+                    if quality == 'lora8' else transfer_options()['default_loras'][mode])
     if not isinstance(selected, list) or not 1 <= len(selected) <= 8:
         raise TransferError('Choose 1–8 LoRAs for this workflow. Start with the tested speed LoRA, then add any extras.')
     active = []
@@ -235,8 +247,12 @@ def _read_reference(asset, resolver):
         raise TransferError(str(exc)) from exc
 
 
-def _template(mode, template_dir=None):
+def _template(mode, template_dir=None, template_graph=None, template_name=None):
     """Read the measured templates when present; keep the same recipe portable."""
+    if template_graph is not None:
+        if not isinstance(template_graph, dict) or not template_graph:
+            raise TransferError('The selected ComfyUI workflow profile is empty.')
+        return copy.deepcopy(template_graph), template_name or 'Imported H3 API workflow'
     stem = '01_Ref2VA_Balanced_0p3_to_0p7' if mode == 'ref2va' else '03_FL2VA_Balanced_0p3_to_0p7'
     folder = Path(template_dir) if template_dir else Path(__file__).resolve().parents[1] / 'workflows'
     path = folder / (stem + '.api.json')
@@ -511,7 +527,8 @@ def _connect(settings, client):
         endpoints.append(base)
     for base in endpoints:
         try:
-            response = client.get(base + '/object_info', timeout=20)
+            # Large ComfyUI installations may need longer to build the node schema.
+            response = client.get(base + '/object_info', timeout=60)
             response.raise_for_status()
             schema = response.json()
             if not isinstance(schema, dict) or not isinstance(schema.get('LoadImage'), dict):
@@ -548,7 +565,8 @@ def installed_transfer_options(settings, *, client=None):
             client.close()
 
 
-def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, client=None, template_dir=None):
+def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, client=None, template_dir=None,
+                   template_graph=None, template_name=None):
     """Return {id, workflow, prompt, manifest, comfy_url}; never submit /prompt.
 
     The caller compiles and validates the complete project first. For portability,
@@ -558,7 +576,7 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
     if not isinstance(compiled_prompt, str) or not compiled_prompt.strip() or len(compiled_prompt) > 100_000:
         raise TransferError('Build a valid prompt before sending this project to ComfyUI.')
     config = _settings(project, settings)
-    loras = _lora_selections(settings, config['mode'])
+    loras = _lora_selections(settings, config['mode'], config['quality'])
     assets = _active_images(project, config['mode'])
     images = [_read_reference(asset, asset_path_resolver) for asset in assets]
     for role in ('reference_video', 'reference_audio'):
@@ -569,7 +587,7 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
     for index, image in enumerate(images, 1):
         image['filename'] = f'{image["asset"]["media_type"]}-{index:02d}-{image["sha256"][:12]}' + image['extension']
         image['input_name'] = subfolder + '/' + image['filename']
-    graph, template_name = _template(config['mode'], template_dir)
+    graph, template_name = _template(config['mode'], template_dir, template_graph, template_name)
     graph = copy.deepcopy(graph)
     # No template/demo photos survive this transfer, including unused loaders.
     for ident in [i for i, n in graph.items() if n['class_type'] in ('LoadImage', 'LoadAudio', 'LoadVideo', 'GetVideoComponents')]:
@@ -582,7 +600,7 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
         if key in ('first_frame', 'last_frame') or key.startswith(('ref_images.', 'ref_videos.', 'ref_video_audios.', 'ref_audios.')):
             del cond['inputs'][key]
     cond['inputs'].update(prompt=compiled_prompt, width=config['width'], height=config['height'], length=config['frames'])
-    cond['_meta']['title'] = f'{MODE_LABELS[config["mode"]]} · {config["width"]}×{config["height"]} · {config["actual_duration"]:.3f}s'
+    cond.setdefault('_meta', {})['title'] = f'{MODE_LABELS[config["mode"]]} · {config["width"]}×{config["height"]} · {config["actual_duration"]:.3f}s'
     if config['mode'] == 'ref2va':
         cond['inputs']['ref_image_size'] = 'match'
     next_id = max(int(i) for i in graph) + 1
@@ -624,7 +642,10 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
                               'bytes': len(image['data']), 'dimensions': image['dimensions'],
                               **{key: image[key] for key in ('duration', 'clip_start_seconds', 'clip_end_seconds', 'fps', 'audio_enabled') if key in image},
                               **({'soundtrack_token': f'<Audio {audio_ordinal}>'} if kind == 'video' and image.get('audio_enabled') else {})})
-    title_slug = re.sub(r'[^a-zA-Z0-9_-]+', '_', project.get('title', 'film')).strip('_')[:60] or 'film'
+    link = project.get('production_link') if isinstance(project.get('production_link'), dict) else {}
+    title_slug = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', '_',
+                        str(link.get('production_title') or project.get('title', 'film')))
+    title_slug = re.sub(r'\s+', '_', title_slug).strip(' ._')[:60] or 'film'
     prefix = f'h3_prompt_studio/{title_slug}/{transfer_id[:8]}'
     for node in graph.values():
         kind, inputs = node['class_type'], node['inputs']
@@ -636,7 +657,7 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
             inputs['steps'] = config['steps']
         elif kind == 'SaveVideo':
             inputs['filename_prefix'] = prefix
-            node['_meta']['title'] = 'Save video · output/' + prefix
+            node.setdefault('_meta', {})['title'] = 'Save video · output/' + prefix
     _apply_loras(graph, loras)
     own_client = client is None
     if own_client:
@@ -698,18 +719,18 @@ def build_transfer(project, compiled_prompt, settings, asset_path_resolver, *, c
     manifest = {**{key: value for key, value in config.items() if not key.startswith('_')}, 'transfer_id': transfer_id, 'project_id': project.get('id'),
                 'template': template_name, 'comfy_url': base, 'conditioning_node_id': cond_id,
                 'conditioning_input_node_id': image_target_id,
-                'text_encoder': HERETIC, 'images': [r for r in reference_map if r['media_type'] == 'image'],
+                'text_encoder': config['text_encoder'], 'images': [r for r in reference_map if r['media_type'] == 'image'],
                 'references': reference_map, 'media_bytes_verified': True, 'output_prefix': prefix,
                 'prompt_sha256': hashlib.sha256(compiled_prompt.encode('utf-8')).hexdigest(),
                 'image_bytes_verified': True, 'queued': False,
                 'duration_note': f'{config["duration"]}s requested → {config["frames"]} frames / {config["actual_duration"]:.3f}s at 24 fps on the H3 frame grid.',
                 'quality_note': transfer_options()['note'], 'loras': loras,
                 'lora': loras[0]['name'],
-                'recipe_modified': len(loras) != 1 or loras[0]['name'] != config['lora'] or loras[0]['strength'] != 1.0,
+                'recipe_modified': len(loras) != 1 or loras[0]['name'] != config['lora'] or loras[0]['strength'] != config['lora_strength'],
                 'lora_warnings': [f'{item["name"]}: installed, but H3 compatibility and its effect with this stack have not been verified.'
                                   for item in loras if item['compatibility'] == 'unverified'],
                 **media_metadata}
     if not any(item['name'] == config['lora'] and item['strength'] != 0 for item in loras):
-        manifest['lora_warnings'].append('The tested speed adapter is absent or has zero strength. These low sampling-step settings are no longer the measured speed recipe.')
+        manifest['lora_warnings'].append('The recipe speed adapter is absent or has zero strength. These low sampling-step settings no longer match the selected recipe.')
     workflow['extra']['h3_prompt_studio'] = copy.deepcopy(manifest)
     return {'id': transfer_id, 'workflow': workflow, 'prompt': graph, 'manifest': manifest, 'comfy_url': base}

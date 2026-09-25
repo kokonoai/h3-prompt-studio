@@ -34,6 +34,19 @@ MAX_SEED = 2**53 - 1
 MAX_VIDEO_BYTES = 2 * 1024**3
 
 
+def _output_component(value, fallback):
+    value = str(value or fallback)
+    value = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', '_', value)
+    value = re.sub(r'\s+', '_', value).strip(' ._')[:60]
+    # Windows reserves these names even when they have an extension.
+    if value.split('.', 1)[0].upper() in {
+            'CON', 'PRN', 'AUX', 'NUL',
+            *(f'COM{number}' for number in range(1, 10)),
+            *(f'LPT{number}' for number in range(1, 10))}:
+        value = '_' + value
+    return value or fallback
+
+
 def _id(value):
     try:
         if not isinstance(value, str):
@@ -208,7 +221,7 @@ class VideoRunManager:
     def _public(self, record):
         fields = ('id', 'request_id', 'project_id', 'status', 'stage', 'error', 'warning', 'seed', 'duration',
                   'width', 'height', 'resolution', 'steps', 'frames', 'created_at', 'parent_run_id', 'continuation_source',
-                  'has_snapshot', 'server_execution_seconds', 'overlap_frames', 'new_seconds')
+                  'has_snapshot', 'server_execution_seconds', 'overlap_frames', 'new_seconds', 'output_folder')
         public = {key: copy.deepcopy(record.get(key)) for key in fields}
         public['title'] = record.get('title', '')
         public['favorite'] = record.get('favorite', False)
@@ -332,6 +345,14 @@ class VideoRunManager:
                       'duration': project.get('duration'), 'width': None, 'height': None,
                       'continuation_source': None, 'client_id': 'h3studio-video-' + ident,
                       'submission_intent': False, 'prompt_id': None}
+            link = project.get('production_link') if isinstance(project.get('production_link'), dict) else {}
+            project_name = _output_component(link.get('production_title') or project.get('title'), 'project')
+            segment_index = link.get('segment_index')
+            if type(segment_index) is int and 1 <= segment_index <= 999:
+                clip = f"{segment_index:02d}_{_output_component(link.get('segment_title'), 'clip')}"
+                record['output_folder'] = f'h3_prompt_studio/{project_name}/{clip}/{ident[:8]}'
+            else:
+                record['output_folder'] = f'h3_prompt_studio/{project_name}/{ident[:8]}'
             folder = self._folder(ident)
             folder.mkdir(parents=True, exist_ok=False)
             atomic_json(folder / 'project.json', project)
@@ -643,7 +664,8 @@ class VideoRunManager:
     def _own_output_paths(self, transfer, record):
         transfer = copy.deepcopy(transfer)
         graph, manifest, workflow = transfer['prompt'], transfer['manifest'], transfer['workflow']
-        prefix = 'h3_prompt_studio/runs/' + record['id'] + '/video'
+        output_folder = record.get('output_folder') or ('h3_prompt_studio/project/' + record['id'][:8])
+        prefix = output_folder + '/video'
         video_nodes = [key for key, node in graph.items() if node['class_type'] == 'SaveVideo']
         state_nodes = [key for key, node in graph.items() if node['class_type'] == 'MMH3Save']
         if len(video_nodes) != 1 or len(state_nodes) > 1:

@@ -69,6 +69,7 @@ export type Project = {
   aspect_ratio: string;
   profile: string;
   authoring_mode: string;
+  production_language?: "zh-CN" | "zh-TW" | "en" | "ja";
   story: { text: string; locked: boolean };
   style: Record<string, string>;
   assets: Asset[];

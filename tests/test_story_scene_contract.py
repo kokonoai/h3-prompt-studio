@@ -6,6 +6,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from backend.compiler import compile_project
+from backend.scene_contract import render_scene_contract
 from backend.ending_observation import observation_request, validate_observation
 from backend.projects import new_project, shot
 from backend.stories import _stage_scene_contracts
@@ -49,6 +50,25 @@ def stage(project, world, value, *, game=True):
     compiled = compile_project(project)
     assert compiled['valid'], compiled['issues']
     return compiled['prompt']
+
+
+def test_inline_background_activity_is_rendered_once_and_merged_with_dedicated_field():
+    project = {'subjects': [{'id': 'keeper', 'name': 'The Clockwork Keeper'}]}
+    shot_value = {
+        'visible_subject_ids': ['keeper'],
+        'scene_contract': {
+            'actors': [],
+            'objects': [],
+            'environment': 'A brass clock hall. Background activity: distant clockwork mechanisms moving.',
+            'background_activity': 'Distant clock pendulums swinging.',
+        },
+    }
+
+    text = ' '.join(render_scene_contract(project, shot_value, lambda _sid: 'The Clockwork Keeper'))
+
+    assert 'Scene layout and appearance: A brass clock hall.' in text
+    assert text.count('Background activity:') == 1
+    assert 'distant clockwork mechanisms moving. Distant clock pendulums swinging.' in text
 
 
 def test_text_only_counts_colors_ground_door_and_passive_bench_reach_prompt():

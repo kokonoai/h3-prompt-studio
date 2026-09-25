@@ -27,7 +27,7 @@ from .resources import ResourceManager, ResourceError, local_url, gpu_snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get('H3_STUDIO_DATA', ROOT / 'data')).resolve()
-for folder in ('projects', 'assets', 'history', 'exports', 'library/templates', 'library/versions'):
+for folder in ('projects', 'assets', 'history', 'exports', 'productions', 'production_archive', 'production_films', 'video_library_films', 'series', 'series_archive', 'series_films', 'card_collections', 'card_collection_archive', 'video_workflows', 'library/templates', 'library/versions'):
     (DATA / folder).mkdir(parents=True, exist_ok=True)
 Image.MAX_IMAGE_PIXELS = 40_000_000
 TOKEN, BRIDGE_TOKEN = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
@@ -38,8 +38,11 @@ VIDEO_RUNS = None
 STORIES = None
 ASSET_RUNS = None
 MOTION_LAB = None
+PRODUCTIONS = None
+SERIES = None
+VIDEO_WORKFLOWS = None
 VIDEO_FILE_LOCKS = {}
-DEFAULT_SETTINGS = {'lm_url': 'http://127.0.0.1:1234/v1', 'model': '', 'context_length': 8192,
+DEFAULT_SETTINGS = {'lm_url': 'http://127.0.0.1:11434/v1', 'model': '', 'context_length': 8192,
                     'comfy_urls': ['http://127.0.0.1:8188', 'http://127.0.0.1:8000', 'http://127.0.0.1:8010'], 'persona': 'universal', 'last_project': '',
                     'ai_memory_mode': 'exclusive'}
 SETTINGS = {**DEFAULT_SETTINGS}
@@ -58,10 +61,38 @@ def client():
     return _assistant_client(SETTINGS['lm_url'])
 
 RESOURCES = ResourceManager(lambda: copy.deepcopy(SETTINGS), client, state_path=DATA / 'resource_state.json')
-app = FastAPI(title='H3 Prompt Studio', version='1.3.0', docs_url='/api/docs')
+app = FastAPI(title='H3 Prompt Studio', version='1.23.1', docs_url='/api/docs')
 BRIDGE_PORTS = ('8188', '8000', '8010')
 LOCAL_ORIGINS = [f'http://{host}:{port}' for host in ('127.0.0.1', 'localhost') for port in (8766, 8188, 8010, 8000)]
-app.add_middleware(CORSMiddleware, allow_origins=LOCAL_ORIGINS, allow_methods=['GET', 'POST', 'PUT', 'PATCH'], allow_headers=['Content-Type', 'X-H3-Bridge', 'X-H3-Token'])
+app.add_middleware(CORSMiddleware, allow_origins=LOCAL_ORIGINS, allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], allow_headers=['Content-Type', 'X-H3-Bridge', 'X-H3-Token'])
+
+
+def _localise_candidate_for_h3(lm, model, candidate):
+    """Attach a source-bound English-direction/target-dialogue prompt."""
+    from .compiler import compile_project
+    from .prompt_language import localise_h3_prompt
+
+    raw_candidate = copy.deepcopy(candidate)
+    raw_candidate.pop('h3_prompt_translation', None)
+    raw = compile_project(raw_candidate)
+    if not raw['valid']:
+        errors = [item['message'] for item in raw['issues'] if item['severity'] == 'error']
+        raise ValueError('\n'.join(errors) or 'This scene could not produce a valid H3 prompt.')
+    RESOURCES.stage = 'Finalising English direction and project-language dialogue'
+    language_options = {}
+    if candidate.get('h3_verbatim_blocks'):
+        language_options['verbatim_blocks'] = candidate['h3_verbatim_blocks']
+    record = localise_h3_prompt(
+        lm, model, raw['prompt'], candidate.get('production_language') or 'zh-CN',
+        **language_options,
+    )
+    result = copy.deepcopy(candidate)
+    result['h3_prompt_translation'] = record
+    compiled = compile_project(result)
+    if not compiled['valid'] or compiled['prompt'] != record['prompt']:
+        errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
+        raise ValueError('\n'.join(errors) or 'The final H3 language pass could not be verified.')
+    return result, compiled
 
 @app.middleware('http')
 async def local_boundary(request: Request, call_next):
@@ -159,6 +190,10 @@ def output_locations():
                      'Your edits save automatically here. Open projects in Studio with the Projects button; use Export with images for a portable backup.'),
         'exports': ('Project export copies', DATA / 'exports',
                     'Export with images keeps a ZIP copy here and sends a download to your browser. Prompt text downloads go to your browser’s download location.'),
+        'production-films': ('Long-form production films', DATA / 'production_films',
+                              'Final films assembled in storyboard order from each production clip’s adopted take.'),
+        'series-films': ('Script and episode films', DATA / 'series_films',
+                         'Saved episode, selected-episode and full-script films. Use Script management to open an exact result folder.'),
     }
     # A local environment setting enables Explorer shortcuts without assuming a
     # particular Desktop, portable, or source-checkout ComfyUI installation.
@@ -172,6 +207,23 @@ def output_locations():
                              'MMH3 working files for continuing generated clips. Keep these with the original videos.'),
         })
     return locations
+
+
+def _open_generated_folder(path):
+    """Open only a server-derived film directory, never a browser-provided path."""
+    path = path.resolve()
+    allowed_roots = ((DATA / 'production_films').resolve(), (DATA / 'series_films').resolve())
+    if not any(path == root or path.is_relative_to(root) for root in allowed_roots):
+        raise HTTPException(400, 'Only application-owned film folders may be opened.')
+    if not path.is_dir():
+        raise HTTPException(404, 'This film folder is not available yet.')
+    if not hasattr(os, 'startfile'):
+        raise HTTPException(409, 'Automatic folder opening is supported on Windows. Use the displayed path instead.')
+    try:
+        os.startfile(str(path))
+    except OSError as exc:
+        raise HTTPException(409, 'Windows could not open this film folder. Use the displayed path instead.') from exc
+    return {'opened': True, 'path': str(path)}
 
 @app.get('/api/files')
 def files_index():
@@ -303,7 +355,7 @@ def save_settings(body: dict):
     if allowed.get('context_length', 8192) not in (4096, 8192, 12288, 16384):
         raise ValueError('Choose a supported context length.')
     if 'model' in allowed and (not isinstance(allowed['model'], str) or len(allowed['model']) > 500 or (allowed['model'] and not allowed['model'].strip())):
-        raise ValueError('Choose a valid installed LM Studio model.')
+        raise ValueError('Choose a valid installed local model.')
     if allowed.get('ai_memory_mode', 'exclusive') not in ('exclusive', 'resident_small'):
         raise ValueError('Choose automatic model switching or the resident 0.8B assistant.')
     proposed = {**SETTINGS, **allowed}
@@ -326,6 +378,16 @@ def connections():
         result['lm'] = {'online': False, 'models': [], 'loaded': [], 'error': str(exc)[:400]}
     try:
         result['comfy'] = RESOURCES.queues()
+        if (not result['busy'] and RESOURCES.last_error and
+                RESOURCES.last_error.startswith('Cannot confirm ComfyUI is idle at ') and
+                all(not item['running'] and not item['pending'] for item in result['comfy'])):
+            # A fresh successful /queue response supersedes an earlier transient
+            # read timeout. Do not leave the connection panel showing a stale
+            # failure after ComfyUI has demonstrably recovered.
+            RESOURCES.last_error = None
+            RESOURCES.stage = 'idle'
+            result['error'] = None
+            result['stage'] = 'idle'
     except Exception as exc:
         result['comfy'] = []
         result['comfy_error'] = str(exc)
@@ -380,7 +442,15 @@ def build_studio_transfer(project, prompt):
         if not path.is_relative_to(folder) or meta.get('media_type') != 'image':
             raise ValueError('This photo is not available in the Studio library.')
         return path
-    return build_transfer(project, compiled['prompt'], config, resolve_asset)
+    profile_id = render.get('workflow_profile_id', 'builtin')
+    profile = video_workflow_manager().get(profile_id)
+    if project.get('mode') not in profile['modes']:
+        raise ValueError('The selected ComfyUI workflow does not support this H3 input mode.')
+    from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
+    if profile_id == REF8_WORKFLOW_ID:
+        config.update(ref8_recipe_settings())
+    return build_transfer(project, compiled['prompt'], config, resolve_asset,
+                          template_graph=profile.get('graph'), template_name=profile['name'])
 
 @app.get('/api/comfy/transfers/{ticket}')
 def comfy_transfer_get(ticket: str, request: Request):
@@ -398,14 +468,14 @@ def comfy_transfer_get(ticket: str, request: Request):
         return record
 
 @app.get('/api/system-prompt')
-def system_prompt(persona: str = 'universal', mode: str = 'ref2va'):
+def system_prompt(persona: str = 'universal', mode: str = 'ref2va', version: str = 'classic'):
     from .prompts import export_system_prompt
     if mode not in ('ref2va', 'fl2va', 'i2va', 'l2va', 't2va'):
         raise ValueError('Choose a supported H3 mode.')
     from .prompts import PERSONAS
     if persona not in {item['id'] for item in PERSONAS}:
         raise ValueError('Choose a listed system prompt persona.')
-    return {'prompt': export_system_prompt(persona, mode)}
+    return {'prompt': export_system_prompt(persona, mode, version)}
 
 def video_manager():
     global VIDEO_RUNS
@@ -423,6 +493,15 @@ def video_runs_list(project_id: str | None = None):
 def video_run_create(body: dict):
     from .compiler import compile_project
     project = copy.deepcopy(check_project(body.get('project')))
+    link = project.get('production_link')
+    if isinstance(link, dict) and link.get('production_id'):
+        manager = production_manager()
+        try:
+            production = manager.get(link['production_id'])
+        except ValueError:
+            production = None  # A detached Studio copy may outlive its production.
+        if production and manager.has_inherited_clip_directions(production, project):
+            raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
     compiled = compile_project(project)
     if not compiled['valid'] or body.get('prompt') != compiled['prompt']:
         raise ValueError('Make a current valid prompt before generating this video.')
@@ -585,6 +664,63 @@ def asset_manager():
             ASSET_RUNS = AssetRunManager(DATA, RESOURCES, lambda: copy.deepcopy(SETTINGS), store_asset)
         return ASSET_RUNS
 
+def production_manager():
+    global PRODUCTIONS
+    with STATE_LOCK:
+        if PRODUCTIONS is None:
+            from .productions import ProductionManager
+            PRODUCTIONS = ProductionManager(DATA, load_project, save_project, asset_meta, store_asset)
+        return PRODUCTIONS
+
+
+def series_manager():
+    global SERIES
+    with STATE_LOCK:
+        if SERIES is None:
+            from .series import SeriesManager
+            SERIES = SeriesManager(DATA, lambda ident: production_manager().get(ident))
+        return SERIES
+
+
+def video_workflow_manager():
+    global VIDEO_WORKFLOWS
+    with STATE_LOCK:
+        if VIDEO_WORKFLOWS is None:
+            from .video_workflows import VideoWorkflowManager
+            VIDEO_WORKFLOWS = VideoWorkflowManager(DATA)
+        return VIDEO_WORKFLOWS
+
+
+@app.get('/api/video-workflows')
+def video_workflows_index():
+    return video_workflow_manager().list()
+
+
+@app.post('/api/video-workflows')
+def video_workflow_create(body: dict):
+    return video_workflow_manager().create(body)
+
+
+@app.delete('/api/video-workflows/{workflow_id}')
+def video_workflow_delete(workflow_id: str):
+    workflow_id = safe_id(workflow_id)
+    usages = []
+    manager = production_manager()
+    for summary in manager.list():
+        production = manager.get(summary['id'])
+        for segment in production.get('segments', []):
+            if segment.get('workflow_profile_id', 'builtin') == workflow_id:
+                usages.append(f"{production['title']} / {segment['index']:02d} {segment['title']}")
+                if len(usages) >= 5:
+                    break
+        if len(usages) >= 5:
+            break
+    if usages:
+        raise ValueError(
+            'This workflow is still assigned to production clips. Switch those clips to another '
+            'workflow before deleting it: ' + '; '.join(usages))
+    return video_workflow_manager().delete(workflow_id)
+
 def story_manager():
     global STORIES
     with STATE_LOCK:
@@ -621,6 +757,1152 @@ def asset_run_resume(run_id: str):
 def asset_run_retry(run_id: str, body: dict):
     return asset_manager().retry(safe_id(run_id), safe_id(body.get('request_id')))
 
+@app.get('/api/series')
+def series_index():
+    return series_manager().list()
+
+
+@app.post('/api/series')
+def series_create(body: dict):
+    collection_id = body.get('card_collection_id')
+    if collection_id:
+        production_manager().get_card_collection(safe_id(collection_id))
+    return series_manager().create(body)
+
+
+@app.get('/api/series/{series_id}')
+def series_get(series_id: str):
+    return series_manager().get(series_id)
+
+
+@app.patch('/api/series/{series_id}')
+def series_update(series_id: str, body: dict):
+    collection_id = body.get('card_collection_id')
+    if collection_id:
+        production_manager().get_card_collection(safe_id(collection_id))
+    return series_manager().update(series_id, body)
+
+
+@app.delete('/api/series/{series_id}')
+def series_delete(series_id: str):
+    return series_manager().delete(series_id)
+
+
+@app.get('/api/productions')
+def productions_index():
+    return production_manager().list()
+
+@app.post('/api/productions')
+def production_create(body: dict):
+    return production_manager().create(body)
+
+@app.get('/api/productions/{production_id}')
+def production_get(production_id: str):
+    return production_manager().get(production_id)
+
+@app.get('/api/card-collections')
+def card_collections_index():
+    return production_manager().list_card_collections()
+
+@app.get('/api/card-collections/{collection_id}')
+def card_collection_get(collection_id: str):
+    return production_manager().get_card_collection(collection_id)
+
+@app.patch('/api/card-collections/{collection_id}')
+def card_collection_rename(collection_id: str, body: dict):
+    return production_manager().rename_card_collection(collection_id, body.get('name'))
+
+@app.post('/api/card-collections/{collection_id}/duplicate')
+def card_collection_duplicate(collection_id: str, body: dict):
+    return production_manager().duplicate_card_collection(collection_id, body.get('name'))
+
+@app.delete('/api/card-collections/{collection_id}')
+def card_collection_delete(collection_id: str):
+    return production_manager().delete_card_collection(collection_id)
+
+@app.post('/api/productions/{production_id}/card-collection')
+def card_collection_save(production_id: str, body: dict):
+    return production_manager().save_card_collection(production_id, body.get('name'))
+
+@app.post('/api/productions/{production_id}/card-collection/{collection_id}/apply')
+def card_collection_apply(production_id: str, collection_id: str):
+    return production_manager().apply_card_collection(production_id, collection_id)
+
+@app.patch('/api/productions/{production_id}')
+def production_update(production_id: str, body: dict):
+    return production_manager().update(production_id, body)
+
+
+@app.delete('/api/productions/{production_id}')
+def production_delete(production_id: str):
+    return production_manager().delete(production_id)
+
+@app.post('/api/productions/{production_id}/cards/{kind}/{card_id}/assets')
+async def production_card_asset(production_id: str, kind: str, card_id: str,
+                                file: UploadFile = File(...)):
+    data = await file.read(64 * 1024 * 1024 + 1)
+    asset = store_asset(data, file.filename or 'reference', file.content_type or '')
+    return production_manager().attach_card_asset(production_id, kind, card_id, asset)
+
+
+@app.post('/api/productions/{production_id}/cards/{kind}/{card_id}/image/attach')
+def production_card_generated_image_attach(production_id: str, kind: str, card_id: str, body: dict):
+    """Bind only a completed image job explicitly made for this card."""
+    production = production_manager().assert_active(production_id)
+    if kind not in ('characters', 'wardrobe', 'props', 'environments'):
+        raise ValueError('Only visual production cards can receive generated images.')
+    card_id = safe_id(card_id)
+    if not any(card['id'] == card_id for card in production['cards'][kind]):
+        raise ValueError('Production card not found.')
+    run = asset_manager().refresh(safe_id(body.get('run_id')))
+    expected_tag = f'card-{production_id[:8]}-{card_id[:8]}'
+    if run.get('prompt_tag') != expected_tag or run.get('status') != 'succeeded' or not run.get('asset'):
+        raise ValueError('The selected image job is not a completed result for this card.')
+    return production_manager().attach_generated_card_asset(production_id, kind, card_id, run['asset'])
+
+
+@app.post('/api/productions/{production_id}/overviews/{kind}/asset')
+async def production_overview_asset(production_id: str, kind: str,
+                                    file: UploadFile = File(...)):
+    data = await file.read(64 * 1024 * 1024 + 1)
+    asset = store_asset(data, file.filename or 'category-overview', file.content_type or '')
+    return production_manager().attach_overview_asset(production_id, kind, asset)
+
+
+def _generate_production_text_cards(production_id, force=False):
+    from .productions import (CARD_KINDS, CARD_PLANNER_SCHEMA, CARD_PLANNER_SYSTEM,
+                              card_plan_source_hash, card_planning_payload,
+                              planning_chunks)
+    manager = production_manager()
+    production = manager.assert_active(production_id)
+    if not force and production.get('card_plan_source_hash') == card_plan_source_hash(production):
+        return production
+    # AI completion is additive: apply_card_plan fills blanks and adds missing
+    # text cards, but never rewrites a user's cards or removes their media. This
+    # lets a character-only library gain story props/environments before the
+    # storyboard while keeping every authored identity untouched.
+
+    def generate(model):
+        pieces = planning_chunks(production['brief'], limit=5000)
+        combined = {'series_voice_style': '', **{kind: [] for kind in CARD_KINDS}}
+        seen = {kind: set() for kind in CARD_KINDS}
+        limits = {**{kind: 64 for kind in CARD_KINDS}, 'styles': 8}
+        for index, piece in enumerate(pieces):
+            RESOURCES.stage = f'Building text asset cards {index + 1} of {len(pieces)}'
+            answer = client().complete_json(
+                model, CARD_PLANNER_SYSTEM,
+                card_planning_payload(production, piece, index + 1, len(pieces)),
+                CARD_PLANNER_SCHEMA, max_tokens=4096, temperature=0.2)
+            if not combined['series_voice_style'] and answer.get('series_voice_style'):
+                combined['series_voice_style'] = answer['series_voice_style']
+            for kind in CARD_KINDS:
+                for card in answer.get(kind, []):
+                    if not isinstance(card, dict):
+                        continue
+                    identity = card.get('character_name') if kind == 'voices' else card.get('name')
+                    key = identity.strip().casefold() if isinstance(identity, str) else ''
+                    if not key or key in seen[kind] or len(combined[kind]) >= limits[kind]:
+                        continue
+                    seen[kind].add(key)
+                    combined[kind].append(card)
+        return combined
+
+    try:
+        planned = RESOURCES.run_ai(SETTINGS['model'], generate)
+        return manager.apply_card_plan(production_id, planned, 'local_ai')
+    except Exception as exc:
+        production = manager.get(production_id)
+        production['card_planner_warning'] = (
+            'Local AI could not finish the text card library. Existing cards were preserved and planning can continue: '
+            + str(exc)[:360])
+        return manager.save(production)
+
+
+@app.post('/api/productions/{production_id}/cards/plan')
+def production_cards_plan(production_id: str, body: dict):
+    force = body.get('force', True)
+    if type(force) is not bool:
+        raise ValueError('force must be true or false.')
+    return _generate_production_text_cards(production_id, force)
+
+@app.post('/api/productions/{production_id}/plan')
+def production_plan(production_id: str, body: dict):
+    from .productions import (PLANNER_SYSTEM, current_episode_story,
+                              episode_timing_targets, fallback_segments, fit_planned_durations,
+                              planning_chunks, planning_payload, production_schema_for_story,
+                              timed_clip_groups)
+    started = time.monotonic()
+    production = production_manager().assert_active(production_id)
+    story = current_episode_story(production)
+    use_ai = body.get('use_ai', True)
+    if type(use_ai) is not bool:
+        raise ValueError('use_ai must be true or false.')
+    if use_ai:
+        production = _generate_production_text_cards(production_id, False)
+        story = current_episode_story(production)
+    planned, planner, warning = None, 'local_heuristic', None
+    if use_ai:
+        try:
+            def generate(model):
+                # Explicit source timecodes are clip-boundary authority. Plan
+                # each merged 5-15 second group independently so a local model
+                # cannot pull dialogue or action across an authored boundary.
+                source_groups = timed_clip_groups(story)
+                pieces = ([group['text'] for group in source_groups]
+                          if source_groups else planning_chunks(story))
+                segments, previous_ending = [], ''
+                for index, piece in enumerate(pieces):
+                    RESOURCES.stage = f'Planning story part {index + 1} of {len(pieces)}'
+                    answer = client().complete_json(
+                        model, PLANNER_SYSTEM,
+                        planning_payload(production, piece, index + 1, len(pieces), previous_ending),
+                        production_schema_for_story(piece), max_tokens=4096, temperature=0.25)
+                    segments.extend(answer['segments'])
+                    if len(segments) > 64:
+                        raise ValueError('This story needs more than 64 H3 clips. Split it into episodes before planning.')
+                    previous_ending = segments[-1]['ending'] if segments else previous_ending
+                target = episode_timing_targets(production, story=story)['episode_target_seconds']
+                return fit_planned_durations(segments, target, production['language'], story)
+            planned = RESOURCES.run_ai(SETTINGS['model'], generate)
+            planner = 'local_ai'
+        except Exception as exc:
+            warning = f'Local AI planning was unavailable, so safe dynamic timing was used instead: {str(exc)[:360]}'
+    if planned is None:
+        target = episode_timing_targets(production, story=story)['episode_target_seconds']
+        planned = fallback_segments(story, target, production['language'])
+    production_manager().apply_plan(production_id, planned, planner, warning)
+    return production_manager().record_timing(production_id, 'storyboard_plan_seconds', time.monotonic() - started)
+
+@app.post('/api/productions/{production_id}/episodes/plan')
+def production_episode_plan(production_id: str, body: dict):
+    from .productions import EPISODE_PLANNER_SYSTEM, EPISODE_SCHEMA, episode_planning_payload, fallback_episodes
+    started = time.monotonic()
+    production = production_manager().assert_active(production_id)
+    use_ai = body.get('use_ai', True)
+    if type(use_ai) is not bool:
+        raise ValueError('use_ai must be true or false.')
+    if use_ai:
+        production = _generate_production_text_cards(production_id, False)
+    planned, planner, warning = None, 'local_heuristic', None
+    if use_ai:
+        try:
+            def generate(model):
+                episodes, batch_size, previous_ending = [], 4, ''
+                while len(episodes) < production['episode_count']:
+                    count = min(batch_size, production['episode_count'] - len(episodes))
+                    RESOURCES.stage = f"Planning episodes {len(episodes) + 1}-{len(episodes) + count}"
+                    answer = client().complete_json(
+                        model, EPISODE_PLANNER_SYSTEM,
+                        episode_planning_payload(production, len(episodes), count, previous_ending),
+                        EPISODE_SCHEMA, max_tokens=4096, temperature=0.2)
+                    batch = answer['episodes']
+                    if len(batch) != count:
+                        raise ValueError('The local model returned an incomplete episode batch.')
+                    episodes.extend(batch)
+                    previous_ending = batch[-1].get('continuity_notes') or batch[-1].get('logline', '')
+                return episodes
+            planned = RESOURCES.run_ai(SETTINGS['model'], generate)
+            planner = 'local_ai'
+        except Exception as exc:
+            warning = f'Local AI episode planning was unavailable, so a safe ordered outline was used instead: {str(exc)[:360]}'
+    if planned is None:
+        planned = fallback_episodes(production)
+    production_manager().apply_episode_plan(production_id, planned, planner, warning)
+    return production_manager().record_timing(production_id, 'episode_plan_seconds', time.monotonic() - started)
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/materialize')
+def production_materialize(production_id: str, segment_id: str):
+    production_manager().assert_active(production_id)
+    result = production_manager().materialise(production_id, segment_id)
+    from .compiler import compile_project
+    result['compiled'] = compile_project(result['project'])
+    return result
+
+@app.post('/api/productions/{production_id}/materialize')
+def production_materialize_all(production_id: str, body: dict):
+    only_missing = body.get('only_missing', True)
+    if type(only_missing) is not bool:
+        raise ValueError('only_missing must be true or false.')
+    production = production_manager().assert_active(production_id)
+    prepared, skipped = [], []
+    for segment in production['segments']:
+        if only_missing and segment.get('status') == 'ready' and segment.get('project_id'):
+            skipped.append(segment['id'])
+            continue
+        result = production_manager().materialise(production_id, segment['id'])
+        prepared.append({'segment_id': segment['id'], 'project_id': result['project']['id']})
+    return {'production': production_manager().get(production_id),
+            'prepared': prepared, 'skipped': skipped}
+
+
+def production_outputs(production_id, runs=None):
+    """Join production clips to their local video runs without trusting client file paths."""
+    production = production_manager().get(safe_id(production_id))
+    runs = video_manager().list() if runs is None else runs
+    by_project = {}
+    for run in runs:
+        if run.get('operation') == 'combine':
+            continue
+        by_project.setdefault(run.get('project_id'), []).append(run)
+    segments, selected_ids = [], []
+    for segment in production['segments']:
+        candidates = by_project.get(segment.get('project_id'), [])
+        ready = [run for run in candidates if run.get('status') == 'succeeded' and run.get('video_url')]
+        manual_id = segment.get('selected_video_run_id')
+        selected = next((run for run in ready if run['id'] == manual_id), None)
+        selection = 'manual' if selected else 'latest'
+        if selected is None and ready:
+            selected = ready[0]
+        if selected:
+            selected_ids.append(selected['id'])
+        segments.append({
+            'segment_id': segment['id'], 'index': segment['index'], 'title': segment['title'],
+            'project_id': segment.get('project_id'), 'project_status': segment['status'],
+            'candidates': candidates[:24], 'selected': selected, 'selection': selection,
+        })
+    all_ready = bool(segments) and len(selected_ids) == len(segments)
+    signature = hashlib.sha256(json.dumps(selected_ids, separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
+    output = DATA / 'production_films' / production['id'] / (signature + '.mp4') if signature else None
+    final_ready = bool(output and output.is_file() and output.stat().st_size)
+    adopted_video_seconds = round(sum(float((row['selected'] or {}).get('elapsed_seconds') or 0)
+                                      for row in segments), 3)
+    active_jobs = sum(run.get('status') in ('preparing', 'queued', 'running', 'uncertain')
+                      for row in segments for run in row['candidates'])
+    return {
+        'production_id': production['id'], 'auto_merge': production.get('auto_merge', True),
+        'segments': segments, 'selected_run_ids': selected_ids, 'all_ready': all_ready,
+        'ready_count': len(selected_ids), 'segment_count': len(segments), 'signature': signature,
+        'estimated_seconds': round(sum(float((row['selected'] or {}).get('new_seconds') or
+                                              (row['selected'] or {}).get('duration') or 0)
+                                       for row in segments), 3),
+        'active_jobs': active_jobs,
+        'timings': {
+            'episode_plan_seconds': production.get('timings', {}).get('episode_plan_seconds'),
+            'storyboard_plan_seconds': production.get('timings', {}).get('storyboard_plan_seconds'),
+            'prompt_generation_seconds': round(sum(float(row.get('prompt_seconds') or 0)
+                                                    for row in production['segments']), 3),
+            'video_generation_seconds': adopted_video_seconds,
+            'merge_seconds': production.get('timings', {}).get('merge_seconds'),
+        },
+        'final_ready': final_ready,
+        'final_url': f"/api/productions/{production['id']}/film?signature={signature}" if final_ready else None,
+        'download_url': f"/api/productions/{production['id']}/film?signature={signature}&download=1" if final_ready else None,
+        'file_path': str(output.resolve()) if final_ready else None,
+        'folder_path': str(output.parent.resolve()) if final_ready else None,
+    }
+
+
+@app.get('/api/productions/{production_id}/outputs')
+def production_outputs_get(production_id: str):
+    return production_outputs(production_id)
+
+
+@app.patch('/api/productions/{production_id}/segments/{segment_id}/video')
+def production_select_video(production_id: str, segment_id: str, body: dict):
+    production = production_manager().get(safe_id(production_id))
+    segment = next((item for item in production['segments'] if item['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    run_id = body.get('run_id')
+    if run_id in (None, ''):
+        segment['selected_video_run_id'] = None
+    else:
+        run = video_manager().get(safe_id(run_id))
+        if (run.get('project_id') != segment.get('project_id') or run.get('operation') == 'combine' or
+                run.get('status') != 'succeeded' or not run.get('video_url')):
+            raise ValueError('Choose a completed take generated by this exact production clip.')
+        segment['selected_video_run_id'] = run['id']
+    production_manager().save(production)
+    return production_outputs(production_id)
+
+
+def build_production_film(production_id):
+    overview = production_outputs(production_id)
+    if overview['active_jobs']:
+        raise ValueError('Wait for the current ComfyUI video task to finish or stop it before assembling the final film.')
+    if not overview['all_ready']:
+        raise ValueError('Every storyboard clip needs a completed adopted take before the final film can be assembled.')
+    if len(overview['segments']) > 100:
+        raise ValueError('Assemble at most 100 clips in one production film.')
+    folder = DATA / 'production_films' / safe_id(production_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    output = folder / (overview['signature'] + '.mp4')
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('production-film:' + safe_id(production_id), threading.Lock())
+    with lock:
+        if output.is_file() and output.stat().st_size:
+            return output
+        first = overview['segments'][0]['selected']
+        width, height = first.get('width'), first.get('height')
+        if type(width) is not int or type(height) is not int or not 64 <= width <= 8192 or not 64 <= height <= 8192:
+            width, height = 1344, 768
+        width, height = width - width % 2, height - height % 2
+        normalized = []
+        for row in overview['segments']:
+            run = row['selected']
+            path = folder / (run['id'] + f'-{width}x{height}-a1.mp4')
+            normalized.append(_normalize_series_file(scene_video_path(run['id']), path, width, height))
+        listing = folder / (overview['signature'] + '.txt')
+        listing.write_text('\n'.join("file '" + path.name + "'" for path in normalized), encoding='utf-8')
+        temporary = output.with_name(output.stem + '-building.mp4')
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '1',
+            '-i', str(listing), '-c', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', str(temporary)],
+            capture_output=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
+            temporary.unlink(missing_ok=True)
+            raise ValueError('The final production film could not be assembled. Individual videos remain available.')
+        temporary.replace(output)
+    return output
+
+
+@app.post('/api/productions/{production_id}/film')
+def production_film_build(production_id: str):
+    production_manager().assert_active(production_id)
+    existing = production_outputs(production_id)
+    if existing['final_ready']:
+        return existing
+    started = time.monotonic()
+    build_production_film(production_id)
+    production_manager().record_timing(production_id, 'merge_seconds', time.monotonic() - started)
+    return production_outputs(production_id)
+
+
+@app.get('/api/productions/{production_id}/film')
+def production_film_get(production_id: str, signature: str, download: bool = False):
+    overview = production_outputs(production_id)
+    if not overview['all_ready'] or signature != overview['signature']:
+        raise HTTPException(409, 'The adopted takes changed. Assemble the current production again.')
+    path = DATA / 'production_films' / safe_id(production_id) / (signature + '.mp4')
+    if not path.is_file() or not path.stat().st_size:
+        raise HTTPException(404, 'Assemble the final production film first.')
+    return FileResponse(path, media_type='video/mp4',
+                        filename=f'H3-Production-{safe_id(production_id)}.mp4' if download else None)
+
+
+@app.post('/api/productions/{production_id}/film/open')
+def production_film_open(production_id: str):
+    overview = production_outputs(production_id)
+    if not overview['final_ready']:
+        raise HTTPException(404, 'Assemble this project film first.')
+    return _open_generated_folder(DATA / 'production_films' / safe_id(production_id))
+
+
+def video_library_overview():
+    """Read-only adopted-video catalogue with explicit script/episode membership."""
+    scripts, memberships = [], {}
+    for summary in series_manager().list():
+        try:
+            series = series_manager().get(summary['id'])
+        except (ValueError, OSError, KeyError, TypeError):
+            continue
+        episodes = []
+        for episode in series['episodes']:
+            episodes.append({'index': episode['index'], 'title': episode['title'],
+                             'production_ids': list(episode['production_ids'])})
+            for part_index, production_id in enumerate(episode['production_ids'], 1):
+                memberships.setdefault(production_id, []).append({
+                    'series_id': series['id'], 'series_title': series['title'],
+                    'episode_index': episode['index'], 'episode_title': episode['title'],
+                    'part_index': part_index,
+                })
+        scripts.append({'id': series['id'], 'title': series['title'], 'episodes': episodes})
+
+    runs = video_manager().list()
+    videos, productions = [], []
+    for summary in production_manager().list():
+        try:
+            production = production_manager().get(summary['id'])
+            output = production_outputs(summary['id'], runs)
+        except (ValueError, OSError, KeyError, TypeError):
+            continue
+        productions.append({'id': production['id'], 'title': production['title'],
+                            'current_episode': production['current_episode']})
+        for row in output['segments']:
+            selected = row.get('selected')
+            job = None
+            if selected:
+                job = {key: selected.get(key) for key in (
+                    'id', 'status', 'seed', 'duration', 'new_seconds', 'created_at',
+                    'elapsed_seconds', 'width', 'height', 'video_url', 'scene_video_url',
+                    'download_url', 'output_folder')}
+            videos.append({
+                'production_id': production['id'], 'production_title': production['title'],
+                'production_episode': production['current_episode'],
+                'segment_id': row['segment_id'], 'segment_index': row['index'],
+                'segment_title': row['title'], 'project_id': row.get('project_id'),
+                'project_status': row['project_status'], 'selected': job,
+                'ready': bool(job), 'memberships': copy.deepcopy(memberships.get(production['id'], [])),
+            })
+    return {'scripts': scripts, 'productions': productions, 'videos': videos,
+            'ready_count': sum(row['ready'] for row in videos), 'video_count': len(videos)}
+
+
+@app.get('/api/video-library')
+def video_library_get():
+    return video_library_overview()
+
+
+def series_outputs(series_id):
+    """Read-only readiness view; projects are never silently substituted."""
+    series = series_manager().get(series_id)
+    episodes, signatures = [], []
+    for episode in series['episodes']:
+        parts = []
+        for production_id in episode['production_ids']:
+            try:
+                production = production_manager().get(production_id)
+                output = production_outputs(production_id)
+                parts.append({'production_id': production_id, 'title': production['title'],
+                              'ready_count': output['ready_count'], 'segment_count': output['segment_count'],
+                              'all_ready': output['all_ready'], 'final_ready': output['final_ready'],
+                              'signature': output['signature'], 'final_url': output['final_url'],
+                              'active_jobs': output['active_jobs']})
+            except (ValueError, OSError, KeyError):
+                parts.append({'production_id': production_id, 'title': 'Missing project',
+                              'ready_count': 0, 'segment_count': 0, 'all_ready': False,
+                              'final_ready': False, 'signature': None, 'final_url': None,
+                              'active_jobs': 0, 'missing': True})
+        ready = bool(parts) and all(part['all_ready'] and not part['active_jobs'] for part in parts)
+        signature_parts = [episode['index'], [part['production_id'] for part in parts],
+                           [part['signature'] for part in parts]]
+        signatures.append(signature_parts)
+        episode_signature = (hashlib.sha256(json.dumps(signature_parts, separators=(',', ':')).encode()).hexdigest()[:20]
+                             if ready else None)
+        episodes.append({'index': episode['index'], 'title': episode['title'],
+                          'parts': parts, 'part_count': len(parts), 'ready_count': sum(part['all_ready'] for part in parts),
+                          'all_ready': ready, 'signature': episode_signature})
+    all_ready = bool(episodes) and all(episode['all_ready'] for episode in episodes)
+    signature = hashlib.sha256(json.dumps(signatures, separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
+    root = DATA / 'series_films' / series['id']
+    folder = root / signature if signature else None
+    for episode in episodes:
+        path = (_series_episode_folder(series['id'], episode['index'], episode['signature']) /
+                f"episode-{episode['index']:02d}.mp4") if episode['signature'] else None
+        legacy = folder / f"episode-{episode['index']:02d}.mp4" if folder else None
+        if path and (not path.is_file() or not path.stat().st_size) and legacy and legacy.is_file() and legacy.stat().st_size:
+            path = legacy
+        episode['film_ready'] = bool(path and path.is_file() and path.stat().st_size)
+        episode['film_url'] = (f"/api/series/{series['id']}/film/episode/{episode['index']}?signature={signature}"
+                               if episode['film_ready'] and path == legacy else
+                               f"/api/series/{series['id']}/film/episode/{episode['index']}?signature={episode['signature']}"
+                               if episode['film_ready'] else None)
+        episode['file_path'] = str(path.resolve()) if episode['film_ready'] else None
+        episode['folder_path'] = str(path.parent.resolve()) if episode['film_ready'] else None
+    final = folder / 'complete.mp4' if folder else None
+    final_ready = bool(final and final.is_file() and final.stat().st_size)
+    return {'series_id': series['id'], 'title': series['title'], 'episodes': episodes,
+             'all_ready': all_ready, 'signature': signature, 'final_ready': final_ready,
+             'final_url': f"/api/series/{series['id']}/film?signature={signature}" if final_ready else None,
+             'download_url': f"/api/series/{series['id']}/film?signature={signature}&download=1" if final_ready else None,
+             'file_path': str(final.resolve()) if final_ready else None,
+             'folder_path': str(final.parent.resolve()) if final_ready else None}
+
+
+def _series_episode_folder(series_id, index, signature):
+    return DATA / 'series_films' / safe_id(series_id) / 'episodes' / f'episode-{index:02d}-{signature}'
+
+
+def series_selection_outputs(series_id, indices):
+    overview = series_outputs(series_id)
+    if (not isinstance(indices, list) or not 1 <= len(indices) <= 100 or
+            any(type(index) is not int or not 1 <= index <= 100 for index in indices) or
+            len(set(indices)) != len(indices)):
+        raise ValueError('Choose distinct episode numbers between 1 and 100.')
+    wanted = set(indices)
+    selected = [episode for episode in overview['episodes'] if episode['index'] in wanted]
+    if len(selected) != len(indices):
+        raise ValueError('A selected episode is not in this script.')
+    ordered = [episode['index'] for episode in selected]
+    ready = all(episode['all_ready'] for episode in selected)
+    signature = (hashlib.sha256(json.dumps([[episode['index'], episode['signature']]
+             for episode in selected], separators=(',', ':')).encode()).hexdigest()[:20] if ready else None)
+    path = DATA / 'series_films' / safe_id(series_id) / 'selections' / signature / 'selection.mp4' if signature else None
+    film_ready = bool(path and path.is_file() and path.stat().st_size)
+    url = (f"/api/series/{safe_id(series_id)}/film/selection/video?signature={signature}&episodes={','.join(map(str, ordered))}"
+           if film_ready else None)
+    return {'series_id': safe_id(series_id), 'episode_indices': ordered, 'episodes': selected,
+            'all_ready': ready, 'signature': signature, 'final_ready': film_ready,
+            'final_url': url, 'download_url': url + '&download=1' if url else None,
+            'file_path': str(path.resolve()) if film_ready else None,
+            'folder_path': str(path.parent.resolve()) if film_ready else None}
+
+
+def _parse_series_indices(value):
+    if not isinstance(value, str) or not value or len(value) > 400:
+        raise ValueError('Choose episode numbers to assemble.')
+    try:
+        return [int(piece) for piece in value.split(',')]
+    except ValueError as exc:
+        raise ValueError('Episode numbers must be comma-separated integers.') from exc
+
+
+def _concat_series_files(files, destination):
+    """Concat only generated files with internal UUID-derived paths."""
+    listing = destination.with_suffix('.txt')
+    listing.write_text('\n'.join("file '" + path.name + "'" for path in files), encoding='utf-8')
+    temporary = destination.with_name(destination.stem + '-building.mp4')
+    result = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '1',
+        '-i', str(listing), '-c', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', str(temporary)],
+        capture_output=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
+        temporary.unlink(missing_ok=True)
+        raise ValueError('A series film could not be assembled. Every source project video remains available.')
+    temporary.replace(destination)
+
+
+def _series_dimensions(first_production_id):
+    first_run = production_outputs(first_production_id)['segments'][0]['selected']
+    width, height = first_run.get('width'), first_run.get('height')
+    if type(width) is not int or type(height) is not int or not 64 <= width <= 8192 or not 64 <= height <= 8192:
+        width, height = 1344, 768
+    return width - width % 2, height - height % 2
+
+
+def _normalize_series_file(source, target, width, height):
+    if target.is_file() and target.stat().st_size:
+        return target
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=index',
+                            '-of', 'csv=p=0', str(source)], capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if probe.returncode:
+        raise ValueError('A source video could not be inspected. Original videos remain available.')
+    has_audio = bool(probe.stdout.strip())
+    temporary = target.with_name(target.stem + '-building.mp4')
+    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(source)]
+    if not has_audio:
+        command += ['-f', 'lavfi', '-i', 'anullsrc=r=32000:cl=stereo']
+    command += ['-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1',
+        '-map', '0:v:0', '-map', '0:a:0' if has_audio else '1:a:0', '-map_metadata', '-1',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-threads', '4',
+        '-c:a', 'aac', '-ar', '32000', '-ac', '2', '-af', 'apad', '-shortest',
+        '-movflags', '+faststart', str(temporary)]
+    result = subprocess.run(command, capture_output=True, timeout=600,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
+        temporary.unlink(missing_ok=True)
+        raise ValueError('A script video could not be normalized. Original project films remain available.')
+    temporary.replace(target)
+    return target
+
+
+def _video_library_runs(run_ids):
+    if (not isinstance(run_ids, list) or not 2 <= len(run_ids) <= 100 or
+            any(not isinstance(ident, str) for ident in run_ids)):
+        raise ValueError('Select 2–100 completed videos to assemble.')
+    clean = [safe_id(ident) for ident in run_ids]
+    if len(set(clean)) != len(clean):
+        raise ValueError('Select each video only once.')
+    records = []
+    for ident in clean:
+        run = video_manager().get(ident)
+        if (run.get('operation') == 'combine' or run.get('status') != 'succeeded' or
+                not run.get('video_url')):
+            raise ValueError('Every selected item must be a completed original video take.')
+        records.append(run)
+    return clean, records
+
+
+def _video_library_signature(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{20}', value):
+        raise ValueError('Invalid selected-film signature.')
+    return value
+
+
+def build_video_library_film(run_ids):
+    clean, records = _video_library_runs(run_ids)
+    signature = hashlib.sha256(json.dumps(clean, separators=(',', ':')).encode()).hexdigest()[:20]
+    folder = DATA / 'video_library_films' / signature
+    folder.mkdir(parents=True, exist_ok=True)
+    output = folder / 'selection.mp4'
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('video-library:' + signature, threading.Lock())
+    with lock:
+        if not output.is_file() or not output.stat().st_size:
+            width, height = records[0].get('width'), records[0].get('height')
+            if type(width) is not int or type(height) is not int or not 64 <= width <= 8192 or not 64 <= height <= 8192:
+                width, height = 1344, 768
+            width, height = width - width % 2, height - height % 2
+            normalized = []
+            for position, record in enumerate(records, 1):
+                target = folder / f"clip-{position:03d}-{record['id']}-{width}x{height}.mp4"
+                normalized.append(_normalize_series_file(scene_video_path(record['id']), target, width, height))
+            _concat_series_files(normalized, output)
+    return signature, output
+
+
+def video_library_film_result(signature, output, run_ids):
+    ready = output.is_file() and bool(output.stat().st_size)
+    url = f'/api/video-library/film/{signature}' if ready else None
+    return {'signature': signature, 'run_ids': list(run_ids), 'final_ready': ready,
+            'final_url': url, 'download_url': url + '?download=1' if url else None,
+            'file_path': str(output.resolve()) if ready else None,
+            'folder_path': str(output.parent.resolve()) if ready else None}
+
+
+@app.post('/api/video-library/film')
+def video_library_film_build(body: dict):
+    if not isinstance(body, dict) or set(body) - {'run_ids'}:
+        raise ValueError('Choose completed videos from the video overview.')
+    run_ids = body.get('run_ids')
+    signature, output = build_video_library_film(run_ids)
+    return video_library_film_result(signature, output, run_ids)
+
+
+@app.get('/api/video-library/film/{signature}')
+def video_library_film_get(signature: str, download: bool = False):
+    signature = _video_library_signature(signature)
+    path = DATA / 'video_library_films' / signature / 'selection.mp4'
+    if not path.is_file() or not path.stat().st_size:
+        raise HTTPException(404, 'Assemble the selected videos first.')
+    return FileResponse(path, media_type='video/mp4',
+                        filename=f'H3-Video-Selection-{signature}.mp4' if download else None)
+
+
+@app.post('/api/video-library/film/{signature}/open')
+def video_library_film_open(signature: str):
+    signature = _video_library_signature(signature)
+    folder = DATA / 'video_library_films' / signature
+    path = folder / 'selection.mp4'
+    if not path.is_file() or not path.stat().st_size:
+        raise HTTPException(404, 'Assemble the selected videos first.')
+    return _open_generated_folder(folder)
+
+
+def build_series_episode(series_id, index):
+    overview = series_outputs(series_id)
+    episode = next((item for item in overview['episodes'] if item['index'] == index), None)
+    if not episode:
+        raise ValueError('This episode is not in the script.')
+    if not episode['all_ready']:
+        raise ValueError('Complete every ordered part of this episode before assembling it.')
+    folder = _series_episode_folder(series_id, index, episode['signature'])
+    folder.mkdir(parents=True, exist_ok=True)
+    output = folder / f'episode-{index:02d}.mp4'
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('series-episode:' + safe_id(series_id) + ':' + str(index), threading.Lock())
+    with lock:
+        if output.is_file() and output.stat().st_size:
+            return output
+        width, height = _series_dimensions(episode['parts'][0]['production_id'])
+        normalized = []
+        for part in episode['parts']:
+            source = build_production_film(part['production_id'])
+            target = folder / f"part-{part['production_id']}-{width}x{height}.mp4"
+            normalized.append(_normalize_series_file(source, target, width, height))
+        _concat_series_files(normalized, output)
+        return output
+
+
+def build_series_film(series_id):
+    overview = series_outputs(series_id)
+    if not overview['all_ready']:
+        raise ValueError('Every episode needs ordered projects with completed adopted takes before series assembly.')
+    folder = DATA / 'series_films' / safe_id(series_id) / overview['signature']
+    folder.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('series-film:' + safe_id(series_id), threading.Lock())
+    with lock:
+        full = folder / 'complete.mp4'
+        if full.is_file() and full.stat().st_size:
+            return full
+        width, height = _series_dimensions(overview['episodes'][0]['parts'][0]['production_id'])
+        episode_files = []
+        for episode in overview['episodes']:
+            source = build_series_episode(series_id, episode['index'])
+            episode_path = folder / f"episode-{episode['index']:02d}.mp4"
+            episode_files.append(_normalize_series_file(source, episode_path, width, height))
+        _concat_series_files(episode_files, full)
+        return full
+
+
+def build_series_selection(series_id, indices):
+    selection = series_selection_outputs(series_id, indices)
+    if not selection['all_ready']:
+        raise ValueError('Every selected episode needs completed ordered parts before assembly.')
+    folder = DATA / 'series_films' / safe_id(series_id) / 'selections' / selection['signature']
+    folder.mkdir(parents=True, exist_ok=True)
+    output = folder / 'selection.mp4'
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('series-selection:' + safe_id(series_id) + ':' + selection['signature'], threading.Lock())
+    with lock:
+        if output.is_file() and output.stat().st_size:
+            return output
+        width, height = _series_dimensions(selection['episodes'][0]['parts'][0]['production_id'])
+        normalized = []
+        for episode in selection['episodes']:
+            source = build_series_episode(series_id, episode['index'])
+            target = folder / f"episode-{episode['index']:02d}.mp4"
+            normalized.append(_normalize_series_file(source, target, width, height))
+        _concat_series_files(normalized, output)
+        return output
+
+
+@app.get('/api/series/{series_id}/outputs')
+def series_outputs_get(series_id: str):
+    return series_outputs(series_id)
+
+
+@app.post('/api/series/{series_id}/film')
+def series_film_build(series_id: str):
+    build_series_film(series_id)
+    return series_outputs(series_id)
+
+
+@app.post('/api/series/{series_id}/film/open')
+def series_film_open(series_id: str):
+    overview = series_outputs(series_id)
+    if not overview['final_ready']:
+        raise HTTPException(404, 'Assemble the complete script film first.')
+    return _open_generated_folder(Path(overview['folder_path']))
+
+
+@app.get('/api/series/{series_id}/film')
+def series_film_get(series_id: str, signature: str, download: bool = False):
+    overview = series_outputs(series_id)
+    if not overview['final_ready'] or overview['signature'] != signature:
+        raise HTTPException(409, 'The project order or adopted takes changed. Assemble this series again.')
+    path = DATA / 'series_films' / safe_id(series_id) / signature / 'complete.mp4'
+    return FileResponse(path, media_type='video/mp4', filename=f'H3-Series-{safe_id(series_id)}.mp4' if download else None)
+
+
+@app.post('/api/series/{series_id}/film/episode/{index}')
+def series_episode_film_build(series_id: str, index: int):
+    build_series_episode(series_id, index)
+    return series_outputs(series_id)
+
+
+@app.post('/api/series/{series_id}/film/episode/{index}/open')
+def series_episode_film_open(series_id: str, index: int):
+    overview = series_outputs(series_id)
+    episode = next((item for item in overview['episodes'] if item['index'] == index), None)
+    if not episode or not episode['film_ready']:
+        raise HTTPException(404, 'Assemble this episode first.')
+    return _open_generated_folder(Path(episode['folder_path']))
+
+
+@app.get('/api/series/{series_id}/film/episode/{index}')
+def series_episode_film_get(series_id: str, index: int, signature: str, download: bool = False):
+    overview = series_outputs(series_id)
+    episode = next((item for item in overview['episodes'] if item['index'] == index), None)
+    if not episode or not episode['film_ready'] or signature not in (episode['signature'], overview['signature']):
+        raise HTTPException(409, 'This episode film is not assembled for the current project order.')
+    path = Path(episode['file_path'])
+    return FileResponse(path, media_type='video/mp4', filename=f'H3-Series-Episode-{index:02d}.mp4' if download else None)
+
+
+@app.get('/api/series/{series_id}/film/selection/status')
+def series_selection_status(series_id: str, episodes: str):
+    return series_selection_outputs(series_id, _parse_series_indices(episodes))
+
+
+@app.post('/api/series/{series_id}/film/selection')
+def series_selection_film_build(series_id: str, body: dict):
+    if set(body) != {'episode_indices'}:
+        raise ValueError('Choose episode_indices only.')
+    build_series_selection(series_id, body['episode_indices'])
+    return series_selection_outputs(series_id, body['episode_indices'])
+
+
+@app.post('/api/series/{series_id}/film/selection/open')
+def series_selection_film_open(series_id: str, body: dict):
+    if set(body) != {'episode_indices'}:
+        raise ValueError('Choose episode_indices only.')
+    result = series_selection_outputs(series_id, body['episode_indices'])
+    if not result['final_ready']:
+        raise HTTPException(404, 'Assemble the selected episodes first.')
+    return _open_generated_folder(Path(result['folder_path']))
+
+
+@app.get('/api/series/{series_id}/film/selection/video')
+def series_selection_film_get(series_id: str, episodes: str, signature: str, download: bool = False):
+    result = series_selection_outputs(series_id, _parse_series_indices(episodes))
+    if not result['final_ready'] or result['signature'] != signature:
+        raise HTTPException(409, 'The selected episode order or adopted takes changed. Assemble again.')
+    return FileResponse(Path(result['file_path']), media_type='video/mp4',
+                        filename=f'H3-Series-Selection-{safe_id(series_id)}.mp4' if download else None)
+
+
+@app.get('/api/productions/{production_id}/keyframe-suggestions')
+def production_keyframe_suggestions(production_id: str):
+    production = production_manager().get(production_id)
+    return {'enabled': production['auto_keyframes_enabled'],
+            'suggestions': production_manager().auto_keyframe_suggestions(production_id)}
+
+
+@app.post('/api/productions/{production_id}/keyframe-suggestions/analyse')
+def production_keyframe_analyse(production_id: str, body: dict):
+    """Explicit local-LLM review; only recommends stills, never submits image jobs."""
+    production = production_manager().assert_active(production_id)
+    limit = body.get('limit', 24)
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise ValueError('Keyframe suggestion limit must be 1–32.')
+    candidates = [segment for segment in production['segments']
+                  if not segment.get('keyframe_asset_ids') and segment.get('image_prompt', '').strip()][:limit]
+    if not candidates:
+        return {'suggestions': [], 'source': 'local_ai', 'warning': None}
+    schema = {'type': 'object', 'properties': {'suggestions': {'type': 'array', 'items': {
+        'type': 'object', 'properties': {
+            'segment_id': {'type': 'string'}, 'needed': {'type': 'boolean'},
+            'reason': {'type': 'string'}, 'prompt': {'type': 'string'}},
+        'required': ['segment_id', 'needed', 'reason', 'prompt'], 'additionalProperties': False}}},
+        'required': ['suggestions'], 'additionalProperties': False}
+    system = ('You are a storyboard reference-image planner. Return JSON only. '
+              'For each listed clip, decide whether ONE additional still would materially help a video model '
+              'understand a new location, distinctive prop, unique composition or complex action. '
+              'Skip ordinary scenes already covered by existing references. '
+              'Never introduce a person, costume, prop or event absent from the clip and its cards. '
+              'For needed=true, write one concise ENGLISH text-to-image prompt with exactly the visible cast '
+              'and the specified style; no duplicate characters, labels or text. '
+              'For needed=false, use an empty prompt. Do not submit jobs.')
+    allowed = {segment['id']: segment for segment in candidates}
+    try:
+        def generate(model):
+            rows = []
+            visual_style = ' '.join(filter(None, (
+                next((card.get('image_analysis', '') for card in production['cards']['styles']
+                      if card.get('image_analysis')), ''),
+                production.get('style_bible', ''), production.get('visual_style_custom', ''))))[:1100]
+            for start in range(0, len(candidates), 4):
+                chunk = candidates[start:start + 4]
+                RESOURCES.stage = f'Analysing storyboard keyframes {start + 1}–{start + len(chunk)}'
+                def selected_cards(segment):
+                    selection = segment.get('card_selection', {})
+                    return {kind: [{'name': card['name'], 'description': card.get('description', '')[:220],
+                                    'has_reference': bool(card.get('asset_ids'))}
+                                   for card in production['cards'][kind]
+                                   if card['name'].strip().casefold() in {
+                                       value.strip().casefold() for value in selection.get(kind, []) if isinstance(value, str)}][:5]
+                            for kind in ('characters', 'wardrobe', 'props', 'environments')}
+                payload = {'visual_style': visual_style,
+                           'clips': [{'segment_id': segment['id'], 'index': segment['index'],
+                                      'setting': segment['setting'][:400], 'story': segment['story'][:800],
+                                      'action': segment['action'][:700], 'image_prompt': segment['image_prompt'][:700],
+                                      'selected_cards': selected_cards(segment),
+                                      'previous_setting': next((item['setting'][:200] for item in production['segments']
+                                                                if item['index'] == segment['index'] - 1), '')}
+                                     for segment in chunk]}
+                answer = client().complete_json(model, system, json.dumps(payload, ensure_ascii=False),
+                                                schema, max_tokens=2400, temperature=0.1)
+                rows.extend(answer.get('suggestions', []))
+            return rows
+        proposed = RESOURCES.run_ai(SETTINGS['model'], generate)
+        suggestions, seen = [], set()
+        for item in proposed:
+            if not isinstance(item, dict) or item.get('needed') is not True:
+                continue
+            segment_id = item.get('segment_id')
+            if segment_id not in allowed or segment_id in seen:
+                continue
+            prompt = item.get('prompt')
+            if not isinstance(prompt, str) or not prompt.strip():
+                continue
+            segment = allowed[segment_id]
+            suggestions.append({'segment_id': segment_id, 'index': segment['index'],
+                                'reason': str(item.get('reason', ''))[:300], 'prompt': prompt.strip()[:2500]})
+            seen.add(segment_id)
+        return {'suggestions': suggestions, 'source': 'local_ai', 'warning': None}
+    except Exception as exc:
+        return {'suggestions': production_manager().auto_keyframe_suggestions(production_id, limit),
+                'source': 'local_heuristic', 'warning': 'Local LLM keyframe analysis was unavailable: ' + str(exc)[:300]}
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/image')
+def production_image(production_id: str, segment_id: str, body: dict):
+    production = production_manager().assert_active(production_id)
+    segment = next((s for s in production['segments'] if s['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    spec = {
+        'prompt': body.get('prompt', segment.get('image_prompt', '')),
+        'name': body.get('name', f"{production['title']} {segment['index']:02d} keyframe"),
+        'semantic_role': body.get('semantic_role', 'background'), 'person_id': None,
+        'prompt_tag': f"production-{segment['index']:02d}-{segment['id'][:8]}",
+        'model': body.get('model', 'z_image_turbo_bf16.safetensors'),
+        'width': body.get('width', 768), 'height': body.get('height', 432),
+        'seed': body.get('seed', secrets.randbelow(2**32))}
+    run = asset_manager().submit(body.get('request_id', str(uuid.uuid4())), spec)
+    production_manager().set_image_run(production_id, segment_id, run['id'])
+    return run
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/assets')
+async def production_segment_asset(production_id: str, segment_id: str,
+                                   file: UploadFile = File(...)):
+    production_manager().assert_active(production_id)
+    data = await file.read(64 * 1024 * 1024 + 1)
+    asset = store_asset(data, file.filename or 'clip-keyframe', file.content_type or '')
+    if asset.get('media_type') != 'image':
+        raise ValueError('Clip keyframes must be PNG, JPEG or WebP images.')
+    production = production_manager().attach_asset(production_id, segment_id, asset)
+    return {'production': production, 'asset': asset}
+
+
+@app.patch('/api/productions/{production_id}/segments/{segment_id}/assets/{asset_id}')
+def production_segment_asset_update(production_id: str, segment_id: str, asset_id: str, body: dict):
+    if body != {'attached': False}:
+        raise ValueError('Set attached to false to remove this keyframe from the clip.')
+    return production_manager().detach_asset(production_id, segment_id, asset_id)
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/image/sync')
+def production_image_sync(production_id: str, segment_id: str):
+    production = production_manager().get(production_id)
+    segment = next((s for s in production['segments'] if s['id'] == safe_id(segment_id)), None)
+    if not segment or not segment.get('image_run_id'):
+        raise ValueError('This clip has no image request to refresh.')
+    run = asset_manager().refresh(segment['image_run_id'])
+    if run.get('status') == 'succeeded' and run.get('asset'):
+        production = production_manager().attach_asset(production_id, segment_id, run['asset'])
+    return {'run': run, 'production': production}
+
+
+def _production_prompt_instructions(production, segment):
+    previous = next((item for item in production.get('segments', [])
+                     if item.get('index') == segment['index'] - 1), None)
+    timeline = segment.get('cast_timeline') if isinstance(segment.get('cast_timeline'), dict) else {}
+    visible_start = [str(name).strip() for name in timeline.get('visible_start', []) if str(name).strip()]
+    visible_end = [str(name).strip() for name in timeline.get('visible_end', []) if str(name).strip()]
+    stable_cast = bool(visible_start) and visible_start == visible_end
+    dense_cast = len(visible_start) >= 4
+    return '\n'.join([
+        'Turn this production clip into one precise, filmable H3 scene plan.',
+        f"Keep exactly one scene and exactly {segment['duration']} seconds.",
+        'Preserve all story facts, declared people, card bindings, exact dialogue, output language and ending continuity.',
+        'Use every selected character card\'s exact canonical name in action, staging and sound direction; never translate, shorten or replace that name with a role label.',
+        'Improve only staging, visible performance, motivated camera and sound detail. Do not add plot events, people, dialogue or extra camera moves.',
+        'This materialised clip has one continuous camera setup. Do not propose a reverse shot, cutaway, split screen, inset, montage or repeated view of the cast. Keep all visible actors as separate, non-overlapping silhouettes in one coherent shared space.',
+        ('TEMPORAL CAST LOCK: the same visible cast remains on screen from opening through ending: '
+         + ', '.join(visible_start)
+         + '. Do not write any exit, entrance, move-out-of-frame, disappearance, re-entry, second reveal, replacement body or background duplicate for these identities.'
+         if stable_cast else ''),
+        ('DENSE ENSEMBLE SAFETY: use a fixed medium-wide or wide master composition from the first frame through the final frame. '
+         'Do not start on a close-up and pull back to reveal the cast; do not pan, arc, track or reframe across them. '
+         'Assign stable left-to-right screen lanes and move only one primary actor at a time while the others react inside their lanes.'
+         if dense_cast else ''),
+        'When authored internal timing is supplied, preserve its relative phase boundaries inside the continuous scene.',
+        'Fit action density to the duration: overlap compatible supporting reactions in parallel, while preserving causal order for dependent actions.',
+        'Be concise: do not repeat the full Character Bible, card library, overview instructions or the same identity block inside action and performance.',
+        'Keep exact spoken words only in structured dialogue; never copy or paraphrase them into action.',
+        'Treat segment-only keyframes as planning context, never as extra H3 image inputs.',
+        ("This clip uses the previous saved motion and audio tail as a protected opening context. "
+         "Previous planned final state: " + (previous.get('ending') or 'not specified')
+         + ". Direct only the NEW action after that context; do not replay the preceding clip's events or dialogue."
+         if production.get('auto_continue_previous') and segment.get('continue_previous', True) and previous else ''),
+        ('Apply this user revision request: ' + segment['prompt_direction']) if segment.get('prompt_direction') else
+        'Keep the current clip direction and make it concrete without changing its meaning.',
+    ]).strip()
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/prompt')
+def production_segment_prompt(production_id: str, segment_id: str, body: dict):
+    from .compiler import compile_project
+    production = production_manager().assert_active(production_id)
+    use_ai = body.get('use_ai', True)
+    if type(use_ai) is not bool:
+        raise ValueError('use_ai must be true or false.')
+    segment = next((item for item in production['segments'] if item['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    materialised = production_manager().materialise(production_id, segment_id)
+    project = materialised['project']
+    started = time.monotonic()
+    if use_ai:
+        planning_project = copy.deepcopy(project)
+
+        def generate(model):
+            lm = client()
+            RESOURCES.stage = f"Building video prompt for clip {segment['index']}"
+            instructions = _production_prompt_instructions(production, segment)
+            if SETTINGS.get('ai_memory_mode') == 'resident_small':
+                from .continuation_suggestions import compact_plan
+                planning_project.setdefault('simple', {})['directed'] = True
+                proposal = compact_plan(lm, model, planning_project, instructions, SETTINGS['persona'])
+            else:
+                proposal = lm.propose_plan(model, planning_project, instructions, SETTINGS['persona'])
+            candidate = merge_plan(planning_project, proposal)
+            candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
+            return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled}
+
+        generated = RESOURCES.run_ai(SETTINGS['model'], generate)
+        proposal, candidate, compiled = generated['proposal'], generated['candidate'], generated['compiled']
+        source = 'local_ai'
+    else:
+        candidate, proposal, source = project, None, 'compiled'
+        compiled = compile_project(candidate)
+    if not compiled['valid']:
+        errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
+        raise ValueError('\n'.join(errors) or 'This clip could not produce a valid H3 prompt.')
+    seconds = time.monotonic() - started
+    candidate['simple_generation'] = {
+        'seconds': round(seconds, 3), 'generated_at': datetime.now(timezone.utc).isoformat(),
+        'method': 'ai' if use_ai else 'manual'}
+    save_project(candidate)
+    production = production_manager().set_segment_prompt(
+        production_id, segment_id, compiled['prompt'], source, seconds, candidate['id'])
+    return {'production': production, 'project': candidate, 'compiled': compiled,
+            'proposal': proposal, 'seconds': round(seconds, 3)}
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/video')
+def production_segment_video(production_id: str, segment_id: str, body: dict):
+    from .compiler import compile_project
+    production = production_manager().assert_active(production_id)
+    segment = next((item for item in production['segments'] if item['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    if not segment.get('project_id') or segment.get('status') != 'ready':
+        production = production_manager().materialise(production_id, segment_id)['production']
+        segment = next(item for item in production['segments'] if item['id'] == safe_id(segment_id))
+    project = copy.deepcopy(load_project(segment['project_id']))
+    if production_manager().has_inherited_clip_directions(production, project):
+        raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
+    profile = video_workflow_manager().get(project.get('comfy_render', {}).get('workflow_profile_id', 'builtin'))
+    if project.get('mode') not in profile['modes']:
+        raise ValueError('The selected ComfyUI workflow does not support this clip input mode.')
+    render = project.setdefault('comfy_render', {})
+    parent_run_id = None
+    if production.get('auto_continue_previous'):
+        if not profile.get('builtin') or project.get('mode') not in ('ref2va', 'fl2va'):
+            raise ValueError('Automatic motion continuation currently needs a built-in H3 reference/first-last workflow. Turn it off for this workflow.')
+        render['save_mmh3'] = True
+        if segment['index'] > 1 and segment.get('continue_previous', True):
+            from .video_timing import frame_budget
+            frame_budget(segment['duration'], {
+                'continuation_source': 'pending', 'continuation_overlap_frames': 39,
+                'duration_basis': 'new_footage'})
+            previous = next((item for item in production['segments'] if item['index'] == segment['index'] - 1), None)
+            previous_row = next((row for row in production_outputs(production_id)['segments']
+                                 if previous and row['segment_id'] == previous['id']), None)
+            source = previous_row.get('selected') if previous_row else None
+            if (not source or source.get('status') != 'succeeded' or not source.get('can_continue')
+                    or not source.get('continuation_source') or source.get('project_id') != previous.get('project_id')):
+                raise ValueError('The preceding clip has no adopted take with verified .mmh3 motion state. Render or adopt that clip with automatic continuation enabled, then retry this one.')
+            parent_run_id = source['id']
+            render.update(continuation_source=source['continuation_source'],
+                          continuation_overlap_frames=39, duration_basis='new_footage')
+        else:
+            for key in ('continuation_source', 'continuation_overlap_frames', 'duration_basis'):
+                render.pop(key, None)
+    else:
+        # A prepared clip may have been rendered while this option was on.
+        # Switching it off must not silently reuse the earlier motion source.
+        for key in ('continuation_source', 'continuation_overlap_frames', 'duration_basis'):
+            render.pop(key, None)
+    if body.get('new_seed', True):
+        if type(body.get('new_seed', True)) is not bool:
+            raise ValueError('new_seed must be true or false.')
+        project.setdefault('comfy_render', {})['seed'] = secrets.randbelow(2**32)
+        save_project(project)
+    compiled = compile_project(project)
+    if not compiled['valid']:
+        errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
+        raise ValueError('\n'.join(errors) or 'This clip needs a valid video prompt before generation.')
+    production = production_manager().set_segment_prompt(
+        production_id, segment_id, compiled['prompt'], segment.get('video_prompt_source') or 'compiled',
+        segment.get('prompt_seconds') or 0, project['id'])
+    run = video_manager().submit(body.get('request_id'), project, compiled['prompt'], parent_run_id=parent_run_id)
+    production = production_manager().set_video_run(production_id, segment_id, run['id'])
+    return {'run': run, 'production': production}
+
 @app.get('/api/stories')
 def stories_list():
     return {'stories': story_manager().list()}
@@ -656,6 +1938,14 @@ def story_turn_create(story_id: str, body: dict):
 @app.get('/api/stories/{story_id}/actions')
 def story_available_actions(story_id: str, target_id: str | None = None):
     return story_manager().available_actions(story_id, target_id)
+
+@app.post('/api/stories/{story_id}/scene-player')
+def story_scene_player(story_id: str, body: dict):
+    return story_manager().bind_scene_player(story_id, body)
+
+@app.post('/api/stories/{story_id}/scene-inspection')
+def story_scene_inspection(story_id: str, body: dict):
+    return story_manager().refresh_scene(story_id, body)
 
 @app.get('/api/video/runs/{run_id}/receipt')
 def video_receipt(run_id: str):
@@ -994,6 +2284,9 @@ def plan(body: dict):
         lm = client()
         if body.get('vision', False):
             images = [a for a in planning_project['assets'] if a.get('enabled') and a.get('media_type') == 'image']
+            # Analyse style references first. Their transferable treatment is the
+            # visual authority, while depicted people/objects/locations stay excluded.
+            images.sort(key=lambda asset: (asset.get('semantic_role') != 'style', asset.get('semantic_role') != 'palette'))
             if len(images) > 12:
                 raise ValueError('Select at most twelve images for one small-model planning pass; other images can stay in the library.')
             for index, asset in enumerate(images):
@@ -1008,11 +2301,14 @@ def plan(body: dict):
         if SETTINGS.get('ai_memory_mode') == 'resident_small':
             from .continuation_suggestions import compact_plan
             planning_project.setdefault('simple', {})['directed'] = True
-            return compact_plan(lm, model, planning_project, body.get('instructions', ''), body.get('persona', SETTINGS['persona']))
-        return lm.propose_plan(model, planning_project, body.get('instructions', ''), body.get('persona', SETTINGS['persona']))
-    proposal = RESOURCES.run_ai(SETTINGS['model'], generate)
-    candidate = merge_plan(planning_project, proposal)
-    compiled = compile_project(candidate)
+            proposal = compact_plan(lm, model, planning_project, body.get('instructions', ''), body.get('persona', SETTINGS['persona']))
+        else:
+            proposal = lm.propose_plan(model, planning_project, body.get('instructions', ''), body.get('persona', SETTINGS['persona']))
+        candidate = merge_plan(planning_project, proposal)
+        candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
+        return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled}
+    generated = RESOURCES.run_ai(SETTINGS['model'], generate)
+    proposal, candidate, compiled = generated['proposal'], generated['candidate'], generated['compiled']
     return {'candidate': candidate, 'proposal': proposal, 'compiled': compiled, 'observations': observations, 'seconds': time.monotonic() - start,
             'notice': 'Review the suggested image observations and scene plan before applying. Accepting approves the shown observations for prompting. Source story, reference identities and exact dialogue were preserved; scene meaning still needs your review.'}
 
@@ -1025,9 +2321,15 @@ def assist(body: dict):
     if not any(s.get('id') == body.get('shot_id') for s in project['shots']):
         raise ValueError('The selected shot no longer exists.')
     start = time.monotonic()
-    proposal = RESOURCES.run_ai(SETTINGS['model'], lambda model: client().assist(model, project, body['shot_id'], body['field'], body.get('instructions', ''), body.get('persona', SETTINGS['persona'])))
-    candidate = merge_assist(project, body['shot_id'], body['field'], proposal['value'])
-    return {'candidate': candidate, 'proposal': proposal, 'compiled': compile_project(candidate), 'seconds': time.monotonic() - start}
+    def generate(model):
+        lm = client()
+        proposal = lm.assist(model, project, body['shot_id'], body['field'], body.get('instructions', ''), body.get('persona', SETTINGS['persona']))
+        candidate = merge_assist(project, body['shot_id'], body['field'], proposal['value'])
+        candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
+        return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled}
+    generated = RESOURCES.run_ai(SETTINGS['model'], generate)
+    return {'candidate': generated['candidate'], 'proposal': generated['proposal'],
+            'compiled': generated['compiled'], 'seconds': time.monotonic() - start}
 
 @app.get('/api/projects/{project_id}/export')
 def export_project(project_id: str):
@@ -1086,7 +2388,7 @@ def frontend(path: str):
     if not candidate.is_relative_to(base):
         raise HTTPException(404)
     if candidate.is_file():
-        return FileResponse(candidate)
+        return FileResponse(candidate, media_type='application/javascript' if candidate.suffix.lower() in ('.js', '.mjs') else None)
     index = base / 'index.html'
     if index.exists():
         return FileResponse(index)

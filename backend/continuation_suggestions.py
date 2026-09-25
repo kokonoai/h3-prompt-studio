@@ -460,7 +460,13 @@ def compact_plan(client, model, project, instructions="", persona="universal"):
 
         context = _bounded_context(build)
         if fields:
-            reply = client.complete_json(model, PLAN_SYSTEM, context, schema, max_tokens=400, temperature=0.2)
+            system = PLAN_SYSTEM + (' Each visible character is one physical instance, even if its image is repeated in a collage. '
+                                    'Keep the established visual style; do not add duplicate background copies.')
+            if project.get('prompt_version') == 'continuity_director':
+                system += (' Each visible roster name is one physical character, even if a reference collage shows them again. '
+                           'Do not add background copies, swap actions or drift into another visual style. '
+                           'Keep the established face, costume, spatial layout and final state; voice and exact dialogue remain locked elsewhere.')
+            reply = client.complete_json(model, system, context, schema, max_tokens=400, temperature=0.2)
             _validate_reply(reply, schema)
             for key in fields:
                 value = reply[key].strip()

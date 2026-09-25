@@ -1,0 +1,43 @@
+.production-series-manager{display:grid;gap:18px}.production-series-manager .section-title{margin-bottom:0}.production-series-manager .section-title p{max-width:860px;margin:8px 0 0;color:#9bb7a6;line-height:1.65}.series-toolbar,.series-create,.series-heading,.series-actions,.series-episode,.series-final{border:1px solid #345244;border-radius:17px;background:#101d17}.series-toolbar{display:flex;align-items:end;gap:14px;padding:17px}.series-toolbar label{flex:1}.series-toolbar>span{white-space:nowrap;color:#a8cbbb;font-size:12px}.series-create{padding:23px}.series-create h3{margin:0 0 16px;color:#eaf8ef}.series-create-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(130px,.6fr) minmax(0,1.3fr);gap:13px;margin-bottom:16px}.series-heading{display:grid;grid-template-columns:1fr 1fr;gap:13px;padding:18px}.series-help{display:flex;align-items:flex-start;gap:9px;margin:0;color:#a6c4b2;font-size:12px;line-height:1.6}.series-help svg{flex:0 0 auto;margin-top:2px;color:#a9efd0}.series-actions{display:flex;flex-wrap:wrap;gap:9px;padding:13px}.series-unsaved{margin:0;padding:11px 13px;border:1px solid #8a703b;border-radius:10px;background:#352b19;color:#ffe1a8}.series-episodes{display:grid;gap:13px}.series-episode{padding:18px}.series-episode>header{display:grid;grid-template-columns:42px minmax(0,1fr) auto;align-items:end;gap:13px;margin-bottom:13px}.series-episode>header>span{width:40px;height:40px;display:grid;place-items:center;border-radius:12px;background:#28513b;color:#c9f9de;font-weight:900}.series-episode>header em{padding:8px 10px;border-radius:999px;background:#1c3829;color:#a4dabc;font-size:11px;font-style:normal;white-space:nowrap}.series-parts{display:grid;gap:7px}.series-part{display:grid;grid-template-columns:25px minmax(0,1fr) minmax(95px,auto) 36px 36px 36px;align-items:center;gap:7px;padding:7px 9px;border:1px solid #304c3d;border-radius:11px;background:#0b1711}.series-part>span{text-align:center;color:#7aa990;font-weight:900}.series-part .series-part-open{justify-content:flex-start;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.series-part .series-part-open svg:last-child{margin-left:auto}.series-part small{color:#9eb9a9;text-align:right}.series-part button:not(.series-part-open){padding:8px}.series-add-part{max-width:680px;margin-top:13px}.series-episode-film{display:grid;grid-template-columns:minmax(0,350px) auto;align-items:end;gap:14px;margin-top:16px}.series-episode-film video,.series-final video{width:100%;max-height:320px;border-radius:12px;background:#000}.series-episode-film a,.series-final a{display:inline-flex;align-items:center;gap:7px;color:#b7efd1;text-decoration:none;font-weight:800}.series-final{display:grid;gap:15px;padding:20px}.series-final strong{color:#e6f7ec;font-size:19px}.series-final p{color:#9eb8a8;line-height:1.55}.series-final video{max-width:800px}
+@media(max-width:900px){.series-create-grid{grid-template-columns:1fr 1fr}.series-create-grid label:first-child{grid-column:1/-1}.series-part{grid-template-columns:25px minmax(0,1fr) repeat(3,36px)}.series-part small{grid-column:2/-1;text-align:left}}
+@media(max-width:650px){.series-toolbar,.series-heading{display:grid;grid-template-columns:1fr}.series-create-grid{grid-template-columns:1fr}.series-create-grid label:first-child{grid-column:auto}.series-episode>header{grid-template-columns:42px minmax(0,1fr)}.series-episode>header em{grid-column:2;justify-self:start}.series-episode-film{grid-template-columns:1fr}.series-part{grid-template-columns:25px minmax(0,1fr) repeat(3,32px)}.series-part button:not(.series-part-open){padding:6px}}
+
+/* The series page has a clear edit → episode → export hierarchy. */
+.production-series-manager{gap:20px;max-width:1540px;margin-inline:auto}
+.production-series-manager .series-toolbar,.production-series-manager .series-heading,.production-series-manager .series-actions{background:linear-gradient(150deg,#172820,#101c16)}
+.series-actions-spacer{flex:1}
+.series-assembly-overview{display:flex;align-items:center;justify-content:space-between;gap:22px;padding:24px 26px;border:1px solid #47745b;border-radius:20px;background:linear-gradient(115deg,#1f4332,#152820 65%);box-shadow:0 14px 35px #06110a45}
+.series-assembly-overview h3{margin:6px 0;font-size:24px;color:#edfff4}
+.series-assembly-overview p{margin:0;max-width:800px;line-height:1.65;color:#b9d2c3}
+.series-assembly-overview>strong{white-space:nowrap;font-size:18px;color:#c3f9d8}
+.series-episodes{gap:16px}
+.series-episode{padding:21px;border-color:#385846;background:linear-gradient(160deg,#17271e,#101c16);box-shadow:0 10px 25px #07110b32}
+.series-episode.collapsed{padding:13px 17px}
+.series-episode.is-ready{border-color:#4a8060}
+.series-episode>header{grid-template-columns:42px minmax(0,1fr) auto auto 38px;align-items:center;margin-bottom:16px}
+.series-episode.collapsed>header{margin-bottom:0}
+.series-episode-toggle{width:38px;height:38px;display:grid;place-items:center;padding:0}
+.series-episode-body{display:grid;gap:0}
+.series-episode>header .series-select-episode{white-space:nowrap}
+.series-episode-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding-top:15px;border-top:1px solid #365344}
+.series-episode-actions>span{color:#95b4a2;font-size:12px}
+.series-select-episode{display:inline-flex;align-items:center;gap:8px;color:#c1d9cb;font-size:13px;cursor:pointer}
+.series-select-episode input{width:17px;height:17px;accent-color:#b9f1d3}
+.series-episode-film{grid-template-columns:minmax(0,380px) minmax(0,1fr);align-items:stretch;padding:16px;border:1px solid #416e51;border-radius:14px;background:#0d1d14}
+.series-film-location{display:flex;flex-direction:column;justify-content:center;gap:12px;min-width:0}
+.series-film-location strong{font-size:15px;color:#d3f8e2}
+.series-film-location code{display:block;max-width:100%;padding:11px 12px;border:1px solid #345841;border-radius:9px;background:#0a1710;color:#afcabb;font-size:12px;overflow-wrap:anywhere;user-select:all}
+.series-film-links{display:flex;flex-wrap:wrap;align-items:center;gap:13px}
+.series-film-links a{display:inline-flex;align-items:center;gap:6px;color:#b2e9ca;text-decoration:none;font-weight:700}
+.series-export-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.series-final{align-content:start;padding:24px;border-color:#3d624c;background:linear-gradient(155deg,#172b20,#101d17)}
+.series-final .eyebrow{display:block;margin-bottom:8px;color:#8fc5a2}
+.series-final>button{justify-self:start}
+.series-final p{margin:9px 0 0}
+.series-selection-count{display:inline-block;margin-top:13px;padding:6px 10px;border-radius:999px;background:#274835;color:#d7f9e4;font-size:12px;font-weight:800}
+.series-export-result{display:grid;gap:14px;padding-top:14px;border-top:1px solid #3c5e49}
+.series-export-result video{width:100%;max-height:360px;border-radius:12px;background:#000}
+.series-export-result .series-film-location{gap:10px}
+@media(max-width:1050px){.series-export-grid{grid-template-columns:1fr}}
+@media(max-width:800px){.series-episode>header{grid-template-columns:42px minmax(0,1fr) auto 38px}.series-episode>header .series-select-episode{grid-column:3}.series-episode>header em{grid-column:2;grid-row:2;justify-self:start}.series-episode-toggle{grid-column:4;grid-row:1}}
+@media(max-width:650px){.series-assembly-overview{display:grid;padding:20px}.series-episode-film{grid-template-columns:1fr}.series-episode-actions{flex-wrap:wrap}.series-actions-spacer{display:none}.series-episode>header{grid-template-columns:40px minmax(0,1fr) 38px}.series-episode>header .series-select-episode{grid-column:2;grid-row:3}.series-episode>header em{grid-column:2;grid-row:2}.series-episode-toggle{grid-column:3;grid-row:1}}

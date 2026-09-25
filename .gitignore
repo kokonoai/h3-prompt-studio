@@ -1,4 +1,7 @@
 .venv/
+.uv-python/
+.cache/
+.npm-cache/
 node_modules/
 dist/
 data/
@@ -19,3 +22,9 @@ release/
 *.mmh3
 Thumbs.db
 .DS_Store
+*.bak
+backups/
+backup-before-*/
+.pytest*/
+pytest-h3-*/
+tests/.pytest*/

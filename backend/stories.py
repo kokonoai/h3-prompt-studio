@@ -68,13 +68,16 @@ def _render_placements(world, effects, visible_ids, action='', *, include_ground
     after_cast = {c['id']: c for c in after['characters']}
     places = {p['id']: p['name'] for p in after['locations']}
     after_entities = {e['id']: e for e in after['entities']}
-    def assignment(entity, cast):
+    def assignment(entity, cast, *, final=False):
         carrier = entity.get('worn_by_id') or entity.get('holder_id')
         if carrier:
             person = cast[carrier]
             relation = 'worn by ' if entity.get('worn_by_id') else 'held by '
             location = places.get(person.get('location_id'))
             return relation + person['name'] + (' in ' + location if location else '')
+        if entity.get('state', {}).get('placement_unverified') and not (final and any(
+                effect.get('entity_id') == entity['id'] and effect.get('kind') in ('holder', 'worn_by') for effect in effects)):
+            return 'Preserve its observed placement; its holder or wearer has not been identified'
         location = places.get(entity.get('location_id'))
         return 'held by nobody and worn by nobody' + (' in ' + location if location else '; its placement follows the approved action')
     rows = []
@@ -88,7 +91,7 @@ def _render_placements(world, effects, visible_ids, action='', *, include_ground
         carrier = final.get('worn_by_id') or final.get('holder_id')
         relation = ('worn by ' if final.get('worn_by_id') else 'held by ') + after_cast[carrier]['name'] if carrier else ''
         rows.append({'entity_id': before['id'], 'name': before['name'], 'start': assignment(before, before_cast),
-                     'end': assignment(final, after_cast), 'unchanged': unchanged,
+                     'end': assignment(final, after_cast, final=True), 'unchanged': unchanged,
                      'carrier_ids': sorted(carriers), 'constant_assignment': relation})
         if include_ground:
             state = before.get('state', {})
@@ -321,6 +324,8 @@ Use transition continue for the same place and current cast. Use cut for moving 
 a new person, or a deliberate new shot. In a cut preserve character identity and explain the new location.
 Existing references have stable tags and owners. Never request replacement images for established faces.
 Generate asset_requests ONLY for genuinely missing visible people, outfits, props, or places needed NOW.
+When generate_references is false, asset_requests must be []. New scenes, people and objects can be
+rendered directly from text; missing reference images do not prevent a text-only scene.
 For missing character images request ONE character whole-look portrait per person, not separate face+clothes.
 Image prompts describe one clean reference image, never a sheet, split-screen, labels or captions. Include
 appearance, clothes and matching visual style. Every new speaker must be in characters with a short voice.
@@ -471,6 +476,8 @@ def settings_for(value):
         raise ValueError('Choose a supported video resolution.')
     if type(value.get('review_before_render', False)) is not bool:
         raise ValueError('Review before rendering must be on or off.')
+    if type(value.get('generate_references', False)) is not bool:
+        raise ValueError('Generate reference images must be on or off.')
     for key, choices in [('aspect_ratio', ('16:9', '9:16', '1:1', '4:3', '3:4')),
                          ('initiative', ('balanced', 'reactive', 'proactive')),
                          ('assistant_provider', ('lmstudio', 'supervised')), ('transition', ('auto', 'continue', 'cut'))]:
@@ -482,6 +489,7 @@ def settings_for(value):
         raise ValueError('Choose 1, 2 or 4 assistant predictions.')
     return {**copy.deepcopy(value), 'duration': duration, 'steps': steps, 'resolution': value.get('resolution', '0.3'),
             'review_before_render': value.get('review_before_render', False),
+            'generate_references': value.get('generate_references', False),
             'image_model': text(value.get('image_model') or 'z_image_turbo_bf16.safetensors', 160),
             'style': text(value.get('style', ''), 1000)}
 
@@ -497,6 +505,7 @@ class StoryManager(StoryStateMixin):
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.records, self.workers = {}, {}
         self.replacement_workers = {}
+        self.scene_workers = {}
         self.cancel_events = {}
         for path in self.directory.glob('*.json'):
             try:
@@ -505,6 +514,9 @@ class StoryManager(StoryStateMixin):
                 for turn in value['turns']:
                     if turn['status'] in WORKING:
                         turn.update(status='uncertain', stage='Session restarted · resume this turn', error='Your work is saved. Resume to reconnect without duplicating a render.')
+                for inspection in value.get('scene_inspections', {}).values():
+                    if inspection.get('status') in ('pending', 'running'):
+                        inspection.update(status='failed', error='Scene inspection stopped when the app restarted. Inspect the saved ending again; no video was rendered.')
                 self.records[value['id']] = value
             except (ValueError, KeyError, TypeError):
                 continue
@@ -623,8 +635,11 @@ class StoryManager(StoryStateMixin):
         if story.get('state_version') != 2:
             story = copy.deepcopy(story)
         state = self._state(story)
-        result = copy.deepcopy({k: v for k, v in story.items() if k not in ('base_project', 'observed_by_run', 'action_requests', 'create_digest', 'branch_states', 'state_by_run')})
+        result = copy.deepcopy({k: v for k, v in story.items() if k not in ('base_project', 'observed_by_run', 'action_requests', 'create_digest', 'branch_states', 'state_by_run', 'scene_inspections', 'scene_binding_requests')})
         result.update(copy.deepcopy(state))
+        if isinstance(result.get('navigation'), dict):
+            result['navigation']['views'] = [{k: view[k] for k in ('run_id', 'location_id', 'position', 'frame_id') if k in view}
+                                             for view in result['navigation'].get('views', [])]
         result['clips'] = [self.videos().get(r) for r in story['branches'][story['active_branch_id']]]
         known = {r['id'] for r in result['clips']}
         all_jobs = list(result['clips'])
@@ -636,6 +651,8 @@ class StoryManager(StoryStateMixin):
             if rid not in known:
                 known.add(rid); all_jobs.append(self.videos().get(rid))
         for turn in result['turns']:
+            if isinstance(turn.get('navigation_move'), dict):
+                turn['navigation_move'].pop('basis', None)
             if turn.get('assistant_repair'):
                 turn['assistant_repair'].pop('rejected_response', None)
             if turn.get('assistant_attempt_history'):
@@ -811,6 +828,7 @@ class StoryManager(StoryStateMixin):
                     'status': 'planning', 'stage': 'Writing the response', 'error': None, 'created_at': time.time(),
                     'branch_id': story['active_branch_id'], 'parent_run_id': story.get('active_run_id'),
                     'duration': duration, 'render_request_id': ident(), 'asset_jobs': [], 'alternate_run_ids': []}
+            turn['plan_origin'] = 'authored' if isinstance(body.get('planned'), dict) else 'automatic'
             self._snapshot_turn(story, turn, body)
             turn['assistant_model'] = self.get_settings().get('model')
             if isinstance(body.get('planned'), dict):
@@ -828,6 +846,63 @@ class StoryManager(StoryStateMixin):
         worker = threading.Thread(target=self.process, args=(story_id, turn_id), daemon=True)
         self.workers[turn_id] = worker
         worker.start()
+
+    def refresh_scene(self, story_id, body):
+        """Explicitly inspect an existing accepted frame; never queue a video."""
+        request_id = safe_id(body.get('request_id'))
+        fingerprint = digest(body)
+        with self.lock:
+            story = self._story(story_id)
+            old = story.get('scene_inspections', {}).get(request_id)
+            if old:
+                if old['request_digest'] != fingerprint:
+                    raise ValueError('This scene inspection request ID belongs to another request.')
+                return {key: old.get(key) for key in ('request_id', 'run_id', 'status', 'error')}
+            state = self._state(story)
+            if (not story.get('active_run_id') or body.get('run_id') != story['active_run_id']
+                    or body.get('branch_id') != story['active_branch_id']
+                    or body.get('configuration_revision') != state['configuration_revision']):
+                raise ValueError('The story ending or settings changed. Inspect the current accepted ending.')
+            if any(turn['status'] in ACTIVE for turn in story['turns']):
+                raise ValueError('Finish or review the current turn before inspecting its accepted source. Use Retry inspection for a pending ending.')
+            if any(job['status'] in ('pending', 'running') for record in self.records.values() for job in record.get('scene_inspections', {}).values()):
+                raise ValueError('A saved-frame inspection is already running. Wait for that result.')
+            if state['settings'].get('assistant_provider') == 'supervised':
+                raise ValueError('Choose the local assistant to inspect an existing scene, or include visible_scene in the next supervised ending response.')
+            job = {'id': request_id, 'request_id': request_id, 'request_digest': fingerprint,
+                   'run_id': body['run_id'], 'branch_id': body['branch_id'], 'snapshot': copy.deepcopy(state),
+                   'configuration_revision': state['configuration_revision'], 'status': 'pending', 'error': None,
+                   'assistant_model': self.get_settings().get('model'), 'ending_observation_protocol': 3}
+            story.setdefault('scene_inspections', {})[request_id] = job
+            self._save(story)
+            if self.start_workers:
+                worker = threading.Thread(target=self.process_scene_inspection, args=(story_id, request_id), daemon=True)
+                self.scene_workers[request_id] = worker
+                worker.start()
+            return {key: job.get(key) for key in ('request_id', 'run_id', 'status', 'error')}
+
+    def process_scene_inspection(self, story_id, request_id):
+        from .ending_observation import observation_request, validate_observation
+        story = self._story(story_id)
+        job = story['scene_inspections'][request_id]
+        with self.lock:
+            if job['status'] != 'pending':
+                return
+            self._change(story, job, status='running', stage='Inspecting the saved ending', error=None)
+        try:
+            snapshot = job['snapshot']
+            execution = {**story, **copy.deepcopy(snapshot)}
+            final = self.ending_asset(job['run_id'])
+            plan = {'characters': [], 'effects': []}
+            context, schema = observation_request(snapshot['world'], plan, snapshot['player_character_id'],
+                object_schema({}), include_scene=True)
+            observation = self._predict(execution, job, 'ending-inspection', None,
+                'Inspect only this actual saved final frame. Return the visible_scene inventory. Do not invent identity, ownership, hidden objects or actions from the expected story.',
+                context, schema, [final])
+            observation = validate_observation(observation, snapshot['world'], plan, snapshot['player_character_id'], include_scene=True)
+            self._change(story, job, status='succeeded', stage='Saved ending inspected', observation=observation, error=None)
+        except Exception as exc:
+            self._change(story, job, status='failed', stage='Saved ending inspection needs attention', error=str(exc)[:1200])
 
     def _change(self, story, turn, **changes):
         with self.lock:
@@ -861,6 +936,7 @@ class StoryManager(StoryStateMixin):
                  'person': next((p['name'] for p in project['subjects'] if a['id'] in p['asset_ids'] or a.get('simple_owner_id') == p['id']), a.get('person_name', ''))}
                 for a in project['assets'] if a.get('enabled', True) and not a.get('video_run_ending')]
         return {'mode': story['mode'], 'player_name': story['player_name'], 'premise': story['premise'],
+                'generate_references': story['mode'] != 'game' or story['settings'].get('generate_references', False),
                 'new_seconds': turn['duration'], 'message': turn['message'], 'style': story['settings']['style'],
                 'cast': [{k: p.get(k, '') for k in ('name', 'description')} for p in project['subjects']],
                 'references': refs, 'observed_current_state': story['observed_by_run'].get(parent, {}),
@@ -908,6 +984,14 @@ class StoryManager(StoryStateMixin):
 
     def plan(self, story, turn, project, ending=None):
         if turn.get('snapshot') and story.get('narrative_version') == 2:
+            if story['mode'] == 'game' and ending and story['settings'].get('fast_actions', True):
+                from .movement import deterministic_movement
+                movement = deterministic_movement(project, story['world'], story.get('player_character_id'),
+                    turn.get('intent'), turn['duration'], guides=story.get('guides', []),
+                    observed_state=self.latest_scene_observation(story, turn.get('parent_run_id')))
+                if movement is not None:
+                    self._change(self._story(story['id']), turn, planning_mode='deterministic_movement', stage='Preparing the movement directly')
+                    return movement
             from .game_director import plan_turn
             def sequence(prepared_model=None):
                 def predict(stage, actor_id, system, content, schema):
@@ -921,15 +1005,16 @@ class StoryManager(StoryStateMixin):
                     if not intent or intent.get('kind') == 'freeform':
                         intent = infer_simple_intent(story['world'], story.get('player_character_id'), turn['message'])
                     fast = None if quoted_speech(turn['message']) else mechanical_plan(story['world'], story.get('player_character_id'), intent, turn['duration'],
-                        guides=story.get('guides', []), user_instructions=_author_instructions(project))
+                        guides=story.get('guides', []), user_instructions=_author_instructions(project),
+                        current_setting=(project.get('shots') or [{}])[-1].get('setting', ''))
                     if fast:
                         visible_context = actor_context(story['world'], story.get('player_character_id'))
                         fast['actor_actions'] = [{'subject_id': story.get('player_character_id'), 'action': fast['action'],
-                                                  'activity': 'hold' if intent['kind'] in ('wait', 'inventory') else 'act'}]
+                                                  'activity': 'hold' if intent['kind'] in ('wait', 'inventory') or (intent['kind'] == 'move' and intent.get('camera') == 'camera') else 'act'}]
                         if intent.get('kind') == 'give' and intent.get('recipient_id'):
                             fast['actor_actions'].append({'subject_id': intent['recipient_id'], 'action': 'Receive the offered object as specified in the approved action.', 'activity': 'act'})
                         directed = direct_plan(fast, project, duration=turn['duration'], predict=predict,
-                            guides=story.get('guides', []), game_mode=True,
+                            guides=story.get('guides', []), game_mode=True, movement_intent=intent,
                             observed_state=story['observed_by_run'].get(turn.get('parent_run_id'), {}),
                             current_facts=_current_scene_facts(story['world'], visible_context),
                             known_objects=_known_scene_objects(story['world'], visible_context,
@@ -942,6 +1027,7 @@ class StoryManager(StoryStateMixin):
                                  message=turn['message'], duration=turn['duration'], predict=predict,
                                  guides=story.get('guides', []), intent=turn.get('intent'), mode=story['mode'],
                                  premise=story.get('premise', ''),
+                                 generate_references=story['settings'].get('generate_references', False),
                                  initiative=story['settings'].get('initiative', 'balanced'),
                                  observed_state=story['observed_by_run'].get(turn.get('parent_run_id'), {}))
             if story['settings'].get('assistant_provider') == 'supervised':
@@ -956,7 +1042,10 @@ class StoryManager(StoryStateMixin):
         for asset in images:
             content.append({'type': 'image_url', 'image_url': {'url': self.image_data(asset['id']), 'detail': 'low'}})
         def generate(model):
-            result = self.client().complete_json(model, PLAN_SYSTEM, content, PLAN_SCHEMA, max_tokens=2400, temperature=.65)
+            schema = copy.deepcopy(PLAN_SCHEMA)
+            if not context['generate_references']:
+                schema['properties']['asset_requests']['maxItems'] = 0
+            result = self.client().complete_json(model, PLAN_SYSTEM, content, schema, max_tokens=2400, temperature=.65)
             return validate_plan(result, story['player_name'], turn['message'], story['mode'], turn['duration'])
         return self.resources.run_ai(self.get_settings()['model'], generate)
 
@@ -1090,6 +1179,12 @@ class StoryManager(StoryStateMixin):
 
     def _project(self, story, turn, source, ending):
         plan = turn['plan']
+        frame_movement = bool(turn.get('planning_mode') == 'deterministic_movement' and ending
+                              and story['settings'].get('transition', 'auto') != 'continue')
+        if frame_movement:
+            # A new first-frame task preserves the visible starting image while
+            # allowing the new button direction to replace the old momentum.
+            plan['transition'] = 'cut'
         project = copy.deepcopy(source)
         if story.get('narrative_version') == 2 and story.get('world'):
             from .world import project_from_world
@@ -1213,6 +1308,8 @@ class StoryManager(StoryStateMixin):
         project['rendered_scene_contracts'] = {scene['id']: hashlib.sha256(
             json.dumps(scene['scene_contract'], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
             for scene in project['shots'] if scene.get('scene_contract') is not None}
+        from .movement import apply_movement_frames
+        apply_movement_frames(story, turn, project, ending, self.ending_asset, current_frame=frame_movement)
         return check_project(project)
 
     def _asset_jobs_for_recovery(self, turn):
@@ -1229,6 +1326,57 @@ class StoryManager(StoryStateMixin):
                 # The immutable spec was saved before its child was admitted.
                 # Reusing this same request ID is safe; submit is idempotent.
         return known
+
+    def _automatic_plan_origin(self, story, turn):
+        """Legacy origin is established by its matching unedited writer receipt."""
+        if turn.get('plan_origin'):
+            return turn['plan_origin'] == 'automatic'
+        if any(receipt.get('turn_id') == turn['id'] and receipt.get('action') in ('approve', 'edit', 'reroll')
+               for receipt in story.get('action_requests', {}).values()):
+            return False
+        plan = turn.get('plan') or {}
+        for request in turn.get('assistant_requests', {}).values():
+            raw = request.get('result')
+            if (request.get('stage') == 'roleplay' and request.get('status') == 'completed'
+                    and isinstance(raw, dict) and raw.get('beats') == plan.get('beats')
+                    and raw.get('asset_requests') == plan.get('asset_requests')
+                    and isinstance(raw.get('beats'), list)):
+                turn['plan_origin'] = 'automatic'
+                return True
+        return False
+
+    def _apply_reference_policy(self, story, turn, *, recovery_jobs=None):
+        """Optional automatic Game images cannot become a render dependency.
+
+        Existing submitted work stays recoverable. Only an explicit recovery
+        may retire saved jobs proven to have failed before submission.
+        """
+        execution = self._execution(story, turn)
+        if (story['mode'] != 'game' or execution['settings'].get('generate_references', False)
+                or not self._automatic_plan_origin(story, turn)):
+            return
+        plan = turn.get('plan') or {}
+        if not plan.get('asset_requests') and not turn.get('asset_specs'):
+            return
+        # A saved render/accepted take already owns its actual conditioning.
+        if turn.get('run_id') or turn.get('project') or turn.get('accepted_state'):
+            return
+        saved_ids = set(turn.get('asset_jobs', [])) | {spec['request_id'] for spec in turn.get('asset_specs', [])}
+        if turn.get('created_assets') or (saved_ids and (recovery_jobs is None or any(
+                identity not in recovery_jobs or recovery_jobs[identity].get('status') != 'failed'
+                or recovery_jobs[identity].get('submission_intent') is not False
+                or recovery_jobs[identity].get('prompt_id') or recovery_jobs[identity].get('asset')
+                for identity in saved_ids))):
+            raise ValueError('This saved reference image may already have been submitted. Recover its original job before changing the response; no image or video was resubmitted.')
+        turn.setdefault('reference_policy_history', []).append({
+            'reason': 'Automatic Game reference generation is disabled; use text and existing references.',
+            'at': time.time(), 'asset_requests': copy.deepcopy(plan.get('asset_requests', [])),
+            'asset_specs': copy.deepcopy(turn.get('asset_specs', [])),
+            'asset_jobs': [copy.deepcopy(recovery_jobs[identity]) for identity in sorted(saved_ids)] if saved_ids else []})
+        turn['plan'] = {**copy.deepcopy(plan), 'asset_requests': []}
+        turn['asset_specs'] = []
+        turn['asset_jobs'] = []
+        self._save(story)
 
     def _edited_plan(self, story, turn, supplied):
         execution = self._execution(story, turn)
@@ -1304,7 +1452,8 @@ class StoryManager(StoryStateMixin):
                                 'automatic_repair_used', 'assistant_repair', 'resolved_intent', 'ending_observation_protocol'):
                         turn.pop(key, None)
                     turn.update(cancel_requested=False, asset_jobs=[], render_request_id=ident(), status='planning',
-                                duration=self._state(story)['settings']['duration'], stage='Writing your revised response', error=None)
+                                duration=self._state(story)['settings']['duration'], stage='Writing your revised response', error=None,
+                                plan_origin='automatic')
                     self.cancel_events.pop(turn['id'], None)
                     for key in ('snapshot', 'configuration_revision', 'logical_turn_id', 'intent', 'resolved_intent', 'receipt'):
                         if key in replacement:
@@ -1330,9 +1479,10 @@ class StoryManager(StoryStateMixin):
                 source['subjects'] = copy.deepcopy(story['base_project']['subjects'])
             ending = self.ending_asset(turn['parent_run_id']) if turn.get('parent_run_id') else None
             if not turn.get('plan'):
-                self._change(story, turn, status='planning', stage='Writing the response', error=None)
+                self._change(story, turn, status='planning', stage='Writing the response', error=None, plan_origin='automatic')
                 plan = self.plan(execution, turn, source, ending)
                 self._change(story, turn, plan=plan)
+            self._apply_reference_policy(story, turn)
             # Revalidate supplied/recovered edits too, including plans that
             # already contain direction. All effects must be legal before GPU
             # work; a syntactically valid plan can still contradict world state.
@@ -1527,6 +1677,11 @@ class StoryManager(StoryStateMixin):
                                                   width=job.get('width'), height=job.get('height'), frames=job.get('frames'),
                                                   new_seconds=job.get('new_seconds'), video_url=job.get('video_url'))
             self._change(story, turn, status='observing', stage='Reading the ending and preparing your choices')
+            if not turn.get('observation') and turn.get('planning_mode') == 'deterministic_movement':
+                from .movement import movement_observation
+                previous = self.latest_scene_observation(story, turn.get('parent_run_id'))
+                observation = movement_observation(previous, turn['plan'], turn.get('parent_run_id'))
+                self._change(story, turn, observation=observation, stage='Movement rendered · ending not inspected')
             if not turn.get('observation'):
                 final = self.ending_asset(job['id'])
                 try:
@@ -1540,11 +1695,12 @@ class StoryManager(StoryStateMixin):
                         # and request hash. Only a genuinely new inspection
                         # opts into complete coverage; old observations remain
                         # readable without rewriting their evidence.
-                        turn['ending_observation_protocol'] = prior[-1].get('observation_protocol_version', 1) if prior else 2
+                        turn['ending_observation_protocol'] = prior[-1].get('observation_protocol_version', 1) if prior else 3
                         self._save(story)
                     require_coverage = turn['ending_observation_protocol'] >= 2 and bool(final_contract.get('actors') or final_contract.get('objects'))
+                    include_scene = turn['ending_observation_protocol'] >= 3 and story['mode'] == 'game'
                     visual_context, observation_schema = observation_request(execution['world'], turn['plan'],
-                        execution.get('player_character_id'), OBSERVE_SCHEMA, final_contract, require_coverage=require_coverage)
+                        execution.get('player_character_id'), OBSERVE_SCHEMA, final_contract, require_coverage=require_coverage, include_scene=include_scene)
                     candidates = visual_context.get('known_visual_candidates', {})
                     candidates['characters'] = [row for row in candidates.get('characters', []) if row['id'] in visible_ids]
                     object_ids = {row['entity_id'] for row in final_contract.get('objects', [])}
@@ -1558,7 +1714,7 @@ class StoryManager(StoryStateMixin):
                          'scene_contract_check': 'Compare only visible evidence against intended final actor posture/position, appearance/colors, distinct people and object identities/counts/holders. Report duplicates or mismatches and ambiguity in uncertainties. The contract is intent, not evidence. A single final frame cannot prove continuous stillness, motion, a transfer, or spoken words. Do not draw conclusions about missing or offscreen people or obscured inventory.',
                          **visual_context}, observation_schema, [final])
                     observation = validate_observation(observation, execution['world'], turn['plan'], execution.get('player_character_id'), final_contract,
-                        require_coverage=require_coverage)
+                        require_coverage=require_coverage, include_scene=include_scene)
                 except AwaitingAssistant:
                     raise
                 except Exception as exc:
@@ -1714,6 +1870,8 @@ class StoryManager(StoryStateMixin):
                 turn.pop('run_id', None)
                 turn['assistant_requests'] = {k: v for k, v in turn.get('assistant_requests', {}).items() if v['stage'] != 'ending-inspection'}
                 if 'plan' in body:
+                    if edited_plan.get('asset_requests') != turn['plan'].get('asset_requests'):
+                        turn['plan_origin'] = 'authored'
                     turn['plan'] = edited_plan
                     for key in ('project', 'reroll_of', 'asset_specs', 'assets_inspected'):
                         turn.pop(key, None)
@@ -1759,9 +1917,13 @@ class StoryManager(StoryStateMixin):
                     if edited_plan != turn.get('plan'):
                         if any(job['status'] not in ('succeeded', 'failed', 'cancelled') for job in asset_jobs.values()):
                             raise ValueError('Recover or stop the original image job before rewriting this response. Its request is still saved; no replacement image was submitted.')
+                        if edited_plan.get('asset_requests') != turn['plan'].get('asset_requests'):
+                            turn['plan_origin'] = 'authored'
                         turn['plan'] = edited_plan
                         for key in ('project', 'asset_specs', 'assets_inspected'):
                             turn.pop(key, None)
+                if action in ('retry', 'resume') and 'plan' not in body:
+                    self._apply_reference_policy(story, turn, recovery_jobs=asset_jobs)
                 if turn.get('run_id'):
                     run = self.videos().refresh(turn['run_id'])
                     if run['status'] == 'uncertain':

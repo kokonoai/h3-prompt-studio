@@ -60,6 +60,143 @@ def test_supported_modes_compile_with_distinct_structures(mode):
         assert "\n\nintegrated_multimodal_description:" in prompt
 
 
+def test_classic_single_shot_removes_conflicting_camera_summary_and_consolidates_sound():
+    p = project()
+    p["story"]["text"] = (
+        "景别：正面中景拍摄守卫，然后反打同伴\n"
+        "The guard steps closer while the companions hold their ground."
+    )
+    p["soundscape"] = ""
+    p["shots"][0]["sound"] = "Mechanical footsteps and a steady clock pendulum."
+    p["subjects"].append({"id": "s2", "name": "Companion", "asset_ids": ["b"],
+                          "description": "A distinct companion."})
+    p["assets"].append(asset("b"))
+    p["shots"][0]["visible_subject_ids"].append("s2")
+    p["shots"][0]["camera"]["focus"] = "deep focus"
+
+    result = compile_project(p)
+
+    assert result["valid"], result["issues"]
+    summary = result["prompt"].split("summary:\n", 1)[1].split("\n\nretention_analysis:", 1)[0]
+    sound = result["prompt"].split("overall_soundscape:\n", 1)[1].split("\n\nnon_diegetic_music:", 1)[0]
+    assert summary == "[reference generation] The guard steps closer while the companions hold their ground."
+    assert "Use one continuous camera setup for the complete clip" in result["prompt"]
+    assert "Use deep focus throughout the continuous shot." in result["prompt"]
+    assert "Focus on deep focus" not in result["prompt"]
+    assert "readable, non-overlapping silhouettes" in result["prompt"]
+    assert "STRICT ONE-TO-ONE VISIBLE IDENTITY LOCK" in result["prompt"]
+    assert "Never transfer body shape, face, surface pattern" in result["prompt"]
+    assert sound == "Mechanical footsteps and a steady clock pendulum."
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_all_prompt_versions_repeat_compact_one_to_one_cast_bindings(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    p["subjects"][0]["description"] = "Rectangular backpack body, zipper mouth and two pencil antennae."
+    p["subjects"].append({"id": "b", "name": "Bokka", "asset_ids": ["b"],
+                          "description": "Round striped watermelon body, curled vine and coral bow."})
+    p["assets"].append(asset("b"))
+    p["shots"][0]["visible_subject_ids"].append("b")
+
+    result = compile_project(p)
+
+    assert result["valid"], result["issues"]
+    assert "STRICT ONE-TO-ONE VISIBLE IDENTITY LOCK" in result["prompt"]
+    assert "rectangular backpack body" in result["prompt"]
+    assert "round striped watermelon body" in result["prompt"]
+    assert "never blend two rows into a hybrid" in result["prompt"]
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_dense_ensemble_uses_fixed_master_and_stable_screen_lanes(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    for index in range(2, 5):
+        sid = f"s{index}"
+        aid = f"a{index}"
+        p["subjects"].append({"id": sid, "name": f"Actor {index}",
+                              "asset_ids": [aid], "description": f"Distinct actor {index}."})
+        p["assets"].append(asset(aid))
+        p["shots"][0]["visible_subject_ids"].append(sid)
+    p["shots"][0]["camera"]["movement"] = "pull_out"
+
+    result = compile_project(p)
+
+    assert result["valid"], result["issues"]
+    assert "ENSEMBLE STABILITY MODE" in result["prompt"]
+    assert "Do not begin on a close-up and then reveal the ensemble" in result["prompt"]
+    assert "Visitor = lane 1" in result["prompt"]
+    assert "Actor 4 = lane 4" in result["prompt"]
+
+
+def test_director_continuity_uses_narrative_storyboard_and_current_speaker_only():
+    p = project()
+    p.update(prompt_version="continuity_director", duration=10,
+             production_language="en", aspect_ratio="16:9")
+    p["shots"][0].update(duration=10, dialogue=[dialogue("Wait here.")],
+                           camera={"framing": "medium", "movement": "tilt up",
+                                   "speed": "slow", "height": "eye level", "focus": "deep"})
+    p["subjects"].append({"id": "silent", "name": "Nora", "description": "Blue scarf.", "asset_ids": ["b"]})
+    p["assets"].append({**asset("b"), "description": "Blue scarf reference."})
+    p["shots"][0]["visible_subject_ids"].append("silent")
+    p["narrative_voice"] = {"series_style": "Warm animated voices.\n- Never robotic.\n#### The characters should have distinct voices:\nNora: husky.",
+                            "cards": [{"subject_id": "s", "name": "Visitor voice", "description": "Bright and gentle.", "notes": "", "has_audio": False},
+                                      {"subject_id": "silent", "name": "Nora voice", "description": "Husky.", "notes": "", "has_audio": False}]}
+    original = copy.deepcopy(p)
+    result = compile_project(p)
+    assert result["valid"] and p == original
+    text = result["prompt"]
+    assert text.startswith("asset_roles:\n")
+    assert [text.index(part) for part in ("asset_roles:", "visual_style_and_continuity:",
+            "dialogue_and_audio:", "overall_soundscape:", "non_diegetic_music:",
+            "stability_constraints:")] == sorted(text.index(part) for part in
+            ("asset_roles:", "visual_style_and_continuity:", "dialogue_and_audio:",
+             "overall_soundscape:", "non_diegetic_music:", "stability_constraints:"))
+    assert "<Picture 1>" in text and "<Picture 2>" in text
+    assert "Target clip duration: 10 seconds" in text
+    assert "Visitor (S1): <d>[English] Wait here.</d>" in text
+    assert "Bright and gentle" in text and "Nora: husky" not in text
+    assert "Voice identity for Nora" not in text
+    assert "AUDIBLE SPEECH LOCK — CURRENT CLIP" in text
+    assert "exactly one structured dialogue line" in text
+    assert "Waiting for an answer or response is visual acting only" in text
+    assert text.count("<d>") == 1
+    assert "N/A" in text and "[Beat 1]" in text
+    assert "subject_definitions:" not in text and "Focus on deep" not in text
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_all_prompt_versions_lock_short_dialogue_and_unused_time(prompt_version):
+    p = project()
+    p.update(prompt_version=prompt_version, duration=10, production_language="en")
+    p["story"]["text"] = "The visitor speaks and waits for an answer."
+    p["shots"][0].update(
+        duration=10,
+        final_state="The visitor waits for a response.",
+        dialogue=[dialogue("Only this line.")],
+    )
+    result = compile_project(p)
+    assert result["valid"], result["issues"]
+    text = result["prompt"]
+    assert text.count("<d>") == 1
+    assert "exactly one structured dialogue line" in text
+    assert "Do not fill unused clip duration with new voices" in text
+    assert "After the final scripted line, only the explicitly requested non-speech ambience is audible" in text
+    assert "waits for an answer" not in text
+    assert "waits for a response" not in text
+    assert "no reply occurs within this clip" in text
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director"])
+def test_prompt_versions_lock_silent_clips(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    result = compile_project(p)
+    assert result["valid"], result["issues"]
+    assert "No audible dialogue, narration, singing" in result["prompt"]
+
+
 def test_exact_fl_and_last_only_alignment():
     fl = compile_project(project("fl2va"))["prompt"]
     assert fl.startswith("How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the 5.00-second mark of the target video.")
@@ -143,11 +280,13 @@ def test_object_starting_owner_is_separate_from_identity_and_does_not_override_h
     p['subjects'].reverse()
     reordered = compile_project(p)
     assert reordered['valid']
-    assert 'The object supplied by <Picture 1> starts with <Subject 2> Mira;' in reordered['prompt']
+    # Subject numbering follows first on/off-screen appearance, not storage
+    # order. Reordering source arrays therefore keeps Mira as Subject 1.
+    assert 'The object supplied by <Picture 1> starts with <Subject 1> Mira;' in reordered['prompt']
     p['assets'][0]['simple_owner_id'] = 'private-nora-id'
     changed = compile_project(p)
     assert changed['valid']
-    assert 'The object supplied by <Picture 1> starts with <Subject 1> Nora;' in changed['prompt']
+    assert 'The object supplied by <Picture 1> starts with <Subject 2> Nora;' in changed['prompt']
 
 
 def test_object_owner_without_visual_reference_uses_name_without_inventing_subject_token():
@@ -237,7 +376,7 @@ def test_audio_bindings_assign_the_described_voice_to_the_actual_speaker_ids():
     assert 'A soft low voice.' in first_audio and 'Voice reference assignment: <Subject 1> Visitor (S2)' in first_audio
     assert 'A bright measured voice.' in second_audio and 'Voice reference assignment: <Subject 2> Host (S1)' in second_audio
     assert '<d>[English]   Welcome! </d>' in result['prompt']
-    assert 'do not add or replace the scripted words' in result['prompt']
+    assert 'Do not copy the sample transcript or add, remove or replace the scripted words' in result['prompt']
     assert 'I heard' not in result['prompt'] and 'cloned' not in result['prompt']
     p['subjects'][0]['asset_ids'] = ['a', 'voice-b']
     p['subjects'][1]['asset_ids'] = ['b', 'voice-a']

@@ -74,6 +74,67 @@ def auth(module):
     return {"X-H3-Token": module.TOKEN, "Origin": "http://127.0.0.1:8766"}
 
 
+def test_production_auto_continuation_uses_only_verified_preceding_take(server, monkeypatch):
+    module, _client, _fake = server
+    from backend import compiler
+    previous_id, current_id, previous_project_id = (str(uuid.uuid4()) for _ in range(3))
+    project = new_project()
+    project['mode'] = 'ref2va'
+    project['comfy_render'] = {'workflow_profile_id': 'builtin', 'continuation_source': 'stale-state.mmh3'}
+    production = {'id': str(uuid.uuid4()), 'auto_continue_previous': True,
+        'segments': [{'id': previous_id, 'index': 1, 'project_id': previous_project_id, 'status': 'ready'},
+                     {'id': current_id, 'index': 2, 'project_id': project['id'], 'status': 'ready', 'duration': 10}]}
+    source = {'id': str(uuid.uuid4()), 'project_id': previous_project_id,
+        'status': 'succeeded', 'can_continue': True,
+        'continuation_source': 'verified-state.mmh3'}
+    submitted = []
+
+    class Manager:
+        def assert_active(self, _ident):
+            return production
+        def has_inherited_clip_directions(self, _production, _project):
+            return False
+        def set_segment_prompt(self, *_args):
+            return production
+        def set_video_run(self, *_args):
+            return production
+
+    class Videos:
+        def submit(self, _request, snapshot, _prompt, *, parent_run_id=None):
+            submitted.append((copy.deepcopy(snapshot['comfy_render']), parent_run_id))
+            return {'id': str(uuid.uuid4())}
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Manager())
+    monkeypatch.setattr(module, 'video_workflow_manager', lambda: type('Profiles', (), {'get': lambda self, _id: {'modes': ['ref2va'], 'builtin': True}})())
+    monkeypatch.setattr(module, 'load_project', lambda _ident: copy.deepcopy(project))
+    monkeypatch.setattr(module, 'production_outputs', lambda _ident: {'segments': [{'segment_id': previous_id, 'selected': source}]})
+    monkeypatch.setattr(module, 'video_manager', lambda: Videos())
+    monkeypatch.setattr(compiler, 'compile_project', lambda _project: {'valid': True, 'issues': [], 'prompt': 'test prompt'})
+    module.production_segment_video(production['id'], current_id, {'new_seed': False, 'request_id': str(uuid.uuid4())})
+    render, parent = submitted[-1]
+    assert parent == source['id']
+    assert render['continuation_source'] == 'verified-state.mmh3'
+    assert render['continuation_overlap_frames'] == 39
+    assert render['duration_basis'] == 'new_footage'
+    assert render['save_mmh3'] is True
+
+    source['can_continue'] = False
+    with pytest.raises(ValueError, match='verified .mmh3'):
+        module.production_segment_video(production['id'], current_id, {'new_seed': False})
+    assert len(submitted) == 1
+
+    production['segments'][1]['continue_previous'] = False
+    module.production_segment_video(production['id'], current_id, {'new_seed': False})
+    render, parent = submitted[-1]
+    assert parent is None and 'continuation_source' not in render
+    assert render['save_mmh3'] is True
+
+    production['auto_continue_previous'] = False
+    module.production_segment_video(production['id'], current_id, {'new_seed': False})
+    render, parent = submitted[-1]
+    assert parent is None and 'continuation_source' not in render
+
+
 def test_upscale_handoff_uses_resolved_scene_and_requires_session(server, monkeypatch, tmp_path):
     module, client, _ = server
     from backend import upscale_adapter
@@ -102,17 +163,100 @@ def test_file_locations_describe_portable_storage(server, monkeypatch, tmp_path)
     result = client.get('/api/files')
     assert result.status_code == 200
     locations = {item['id']: item for item in result.json()['locations']}
-    assert set(locations) == {'examples', 'projects', 'exports', 'videos'}
+    assert set(locations) == {'examples', 'projects', 'exports', 'videos', 'production-films', 'series-films'}
     assert locations['projects']['path'] == str(module.DATA)
     assert locations['exports']['path'] == str(module.DATA / 'exports')
     assert locations['projects']['available'] is True
     assert locations['videos']['path'] == str(module.DATA / 'video_runs')
+    assert locations['production-films']['path'] == str(module.DATA / 'production_films')
+    assert locations['series-films']['path'] == str(module.DATA / 'series_films')
     assert locations['examples']['path'] == str(module.ROOT / 'demo')
     monkeypatch.setenv('H3_STUDIO_COMFY_OUTPUT', str(tmp_path / 'comfy-output'))
     configured = {item['id']: item for item in client.get('/api/files').json()['locations']}
     assert configured['comfy-videos']['path'] == str(tmp_path / 'comfy-output' / 'h3_prompt_studio')
     assert configured['comfy-states']['path'] == str(tmp_path / 'comfy-output' / 'mmh3')
     assert 'browser' in locations['exports']['description']
+
+
+def test_video_library_maps_script_episode_and_adopted_take(server, monkeypatch):
+    module, client, _ = server
+    series_id, production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(5))
+    production = {
+        'id': production_id, 'title': 'Episode part B', 'current_episode': 2,
+        'auto_merge': True, 'timings': {},
+        'segments': [{'id': segment_id, 'index': 1, 'title': 'Arrival',
+                      'project_id': project_id, 'status': 'ready',
+                      'selected_video_run_id': run_id}],
+    }
+    run = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+           'status': 'succeeded', 'video_url': f'/api/video/{run_id}',
+           'scene_video_url': f'/api/video/{run_id}?scene=1', 'duration': 10,
+           'seed': 27, 'width': 1344, 'height': 768}
+
+    class Series:
+        def list(self):
+            return [{'id': series_id, 'title': 'The Story'}]
+        def get(self, _ident):
+            return {'id': series_id, 'title': 'The Story', 'episodes': [
+                {'index': 2, 'title': 'Return', 'production_ids': [production_id]}]}
+
+    class Productions:
+        def list(self):
+            return [{'id': production_id, 'title': production['title']}]
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+    class Videos:
+        def list(self):
+            return [copy.deepcopy(run)]
+
+    monkeypatch.setattr(module, 'series_manager', lambda: Series())
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, 'video_manager', lambda: Videos())
+    response = client.get('/api/video-library')
+    assert response.status_code == 200
+    result = response.json()
+    assert result['ready_count'] == result['video_count'] == 1
+    assert result['scripts'][0]['episodes'][0]['production_ids'] == [production_id]
+    item = result['videos'][0]
+    assert item['selected']['id'] == run_id
+    assert item['memberships'] == [{'series_id': series_id, 'series_title': 'The Story',
+                                    'episode_index': 2, 'episode_title': 'Return',
+                                    'part_index': 1}]
+
+
+def test_video_library_selection_merge_preserves_order_and_validates_runs(server, monkeypatch, tmp_path):
+    module, _client, _ = server
+    run_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    sources = {ident: tmp_path / f'{ident}.mp4' for ident in run_ids}
+    records = {ident: {'id': ident, 'project_id': str(uuid.uuid4()), 'operation': 'video',
+                       'status': 'succeeded', 'video_url': f'/api/video/{ident}',
+                       'width': 1344, 'height': 768} for ident in run_ids}
+    normalized, concatenated = [], []
+
+    class Videos:
+        def get(self, ident):
+            return copy.deepcopy(records[ident])
+
+    def normalize(source, target, width, height):
+        normalized.append((source, target.name, width, height))
+        return target
+
+    def concatenate(files, output):
+        concatenated.append([path.name for path in files])
+        output.write_bytes(b'video')
+
+    monkeypatch.setattr(module, 'video_manager', lambda: Videos())
+    monkeypatch.setattr(module, 'scene_video_path', lambda ident: sources[ident])
+    monkeypatch.setattr(module, '_normalize_series_file', normalize)
+    monkeypatch.setattr(module, '_concat_series_files', concatenate)
+    signature, output = module.build_video_library_film(run_ids)
+    assert output.is_file() and len(signature) == 20
+    assert [item[0] for item in normalized] == [sources[run_ids[0]], sources[run_ids[1]]]
+    assert concatenated == [[f'clip-001-{run_ids[0]}-1344x768.mp4',
+                             f'clip-002-{run_ids[1]}-1344x768.mp4']]
+    with pytest.raises(ValueError, match='only once'):
+        module.build_video_library_film([run_ids[0], run_ids[0]])
 
 
 def test_open_folder_uses_only_known_absolute_path_and_requires_session(server, monkeypatch):

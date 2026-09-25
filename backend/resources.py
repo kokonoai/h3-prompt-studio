@@ -90,7 +90,16 @@ class ResourceManager:
                 self.exclusive_ownership = self._saved_ownership(state.get('exclusive_instance'))
                 candidate = state.get('pending_load')
                 if isinstance(candidate, dict) and isinstance(candidate.get('instance_id'), str) and candidate['instance_id'].startswith(ASSISTANT_PREFIX):
-                    self.pending_load = candidate
+                    self.pending_load = dict(candidate)
+                    started_at = self.pending_load.get('started_at')
+                    if (isinstance(started_at, bool) or not isinstance(started_at, (int, float))
+                            or not 0 < started_at <= time.time()):
+                        # Older versions did not persist a timestamp. The state
+                        # file mtime is a conservative lower bound for its age.
+                        try:
+                            self.pending_load['started_at'] = self.state_path.stat().st_mtime
+                        except OSError:
+                            self.pending_load['started_at'] = time.time()
             except (OSError, ValueError, AttributeError):
                 # An unreadable marker cannot establish that H3 is still warm.
                 self.comfy_kind = 'unknown'
@@ -184,7 +193,19 @@ class ResourceManager:
                 queues.append({'url': url, 'online': False, 'running': 0, 'pending': 0})
                 continue
             try:
-                response = httpx.get(url + '/queue', timeout=3, trust_env=False)
+                # ComfyUI's Python event loop can briefly pause while large
+                # CUDA allocations are being released even though the local
+                # server and empty queue are healthy. Retry read timeouts only;
+                # never treat a timeout as proof that the queue is idle.
+                response = None
+                for attempt, timeout in enumerate((15, 30, 60)):
+                    try:
+                        response = httpx.get(url + '/queue', timeout=timeout, trust_env=False)
+                        break
+                    except httpx.ReadTimeout:
+                        if attempt == 2:
+                            raise
+                        time.sleep(.5)
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data.get('queue_running'), list) or not isinstance(data.get('queue_pending'), list):
@@ -251,6 +272,46 @@ class ResourceManager:
                 self._remember_exclusive(client)
                 self.pending_load = None
                 self._save_state()
+            elif (getattr(client, 'is_ollama', False)
+                  and pending.get('endpoint') == self._client_endpoint(client)):
+                # Ollama has one model identity rather than caller-named
+                # instances, so the durable intent ID cannot appear in /api/ps.
+                # Adopt the exact requested model if it completed after our HTTP
+                # timeout. If it is still absent, clear only an old intent after
+                # a second authoritative empty snapshot; never touch a different
+                # loaded model or relax LM Studio's named-instance rule.
+                matching_pending = [m for m in loaded
+                                    if m.get('model_key', m.get('model')) == pending.get('model')]
+                if len(loaded) == 1 and len(matching_pending) == 1:
+                    self.instance_id = instance_id(matching_pending[0])
+                    self.model_key = pending['model']
+                    self.pending_load = None
+                    self._remember_exclusive(client)
+                    self._save_state()
+                else:
+                    started_at = pending.get('started_at')
+                    old_enough = (not isinstance(started_at, bool)
+                                  and isinstance(started_at, (int, float))
+                                  and 0 < started_at <= time.time() - 180)
+                    if loaded or not old_enough:
+                        raise ResourceError('A previous Ollama assistant load may still be running. Wait before retrying; no duplicate load was started.')
+                    time.sleep(1)
+                    confirmed = client.loaded_instances()
+                    if confirmed:
+                        matching_confirmed = [m for m in confirmed
+                                              if m.get('model_key', m.get('model')) == pending.get('model')]
+                        if len(confirmed) == 1 and len(matching_confirmed) == 1:
+                            self.instance_id = instance_id(matching_confirmed[0])
+                            self.model_key = pending['model']
+                            self.pending_load = None
+                            self._remember_exclusive(client)
+                            self._save_state()
+                        else:
+                            raise ResourceError('Another Ollama model appeared while checking the previous load. It was left unchanged.')
+                    else:
+                        self.pending_load = None
+                        self._save_state()
+                        loaded = []
             else:
                 raise ResourceError('A previous assistant load has an uncertain response. Check its named instance in LM Studio before retrying; no duplicate load was started.')
         if self.instance_id and self.model_key != model:
@@ -282,18 +343,25 @@ class ResourceManager:
             matching = []
         needs_release = bool(online)
         if online and owned_baseline and self.comfy_kind == 'empty':
-            current_memory = gpu_snapshot()
-            if current_memory and current_memory['used_mib'] < self.ai_idle_memory_mib + 1024:
-                # Adjacent actor/director calls can reuse the verified assistant
-                # lease baseline without another deferred Comfy /free roundtrip.
-                needs_release = False
+            # This exact assistant instance and the empty Comfy hand-off are both
+            # already verified.  Do not reinterpret the assistant's own warm KV
+            # cache as newly loaded H3 memory: Ollama in particular may retain
+            # that cache for several minutes after a response, which previously
+            # caused every adjacent production clip to wait for the full 300 s
+            # Comfy release deadline.  A Studio image/video submission changes
+            # comfy_kind before queueing, so a real family switch still releases
+            # Comfy explicitly.
+            needs_release = False
         if online and needs_release:
             self.stage = 'releasing H3 memory'
             for item in online:
-                response = httpx.post(item['url'] + '/free', json={'unload_models': True, 'free_memory': True}, timeout=8, trust_env=False)
+                response = httpx.post(item['url'] + '/free', json={'unload_models': True, 'free_memory': True}, timeout=60, trust_env=False)
                 response.raise_for_status()
             # /free is deferred in Comfy's worker. A 200 response is not proof of release.
-            deadline = time.monotonic() + 40
+            # Large H3/MMH3 allocations can be released asynchronously for
+            # several minutes after ComfyUI accepts /free. Keep checking the
+            # idle queue and actual GPU snapshot before declaring failure.
+            deadline = time.monotonic() + 300
             # A resident owned 9B can itself exceed 8 GiB. Its fresh-load baseline
             # is fixed for this instance, never raised by subsequent inferences.
             # Permit 1 GiB for small runtime/display allocation fluctuations.
@@ -306,7 +374,8 @@ class ResourceManager:
                     self._set_comfy_kind('empty')
                     break
                 if time.monotonic() > deadline:
-                    raise ResourceError('H3 memory release could not be verified. Close the H3 model/ComfyUI and retry; no new LM Studio model was loaded.')
+                    provider = 'Ollama' if getattr(client, 'is_ollama', False) else 'LM Studio'
+                    raise ResourceError(f'H3 memory release could not be verified after 5 minutes. Close the H3 model/ComfyUI and retry; no new {provider} model was loaded.')
                 time.sleep(1)
         self.assert_idle()
         self.stage = 'loading vision model'
@@ -332,7 +401,8 @@ class ResourceManager:
             owned_loader = getattr(client, 'load_owned_model', None)
             if callable(owned_loader):
                 self.pending_load = {'instance_id': ASSISTANT_PREFIX + uuid.uuid4().hex,
-                                     'model': model, 'endpoint': self._client_endpoint(client)}
+                                     'model': model, 'endpoint': self._client_endpoint(client),
+                                     'started_at': time.time()}
                 self._save_state()
                 result = owned_loader(model, context_length=self.get_settings()['context_length'],
                                       instance_id=self.pending_load['instance_id'])
@@ -537,11 +607,11 @@ class ResourceManager:
             self.assert_idle()
             response = httpx.post(item['url'] + '/free',
                                   json={'unload_models': True, 'free_memory': True},
-                                  timeout=8, trust_env=False)
+                                  timeout=60, trust_env=False)
             response.raise_for_status()
         # /free is handled asynchronously by Comfy's worker. A successful HTTP
         # response alone does not establish that the old weights left VRAM.
-        deadline = time.monotonic() + 40
+        deadline = time.monotonic() + 120
         time.sleep(1.25)
         while True:
             self.assert_idle()

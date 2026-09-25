@@ -15,7 +15,7 @@ export type GameWorld = {
   entities: Array<{id:string;name:string;kind:string;location_id?:string|null;owner_id?:string|null;holder_id?:string|null;worn_by_id?:string|null;asset_ids:string[];affordances:string[];state:Record<string,unknown>}>;
   objectives: any[]; rules: string; events: any[];
 };
-export type GameIntent = { kind: string; target_id?: string; recipient_id?: string; extent?: string; speed?: string; camera?: string; presentation?: string; direction?: string };
+export type GameIntent = { kind: string; target_id?: string; recipient_id?: string; extent?: string; speed?: string; camera?: string; presentation?: string; direction?: string; scene_run_id?: string; candidate_id?: string; action?: string };
 export type StoryConfiguration = {
   project: Project; world: GameWorld; guides: GameGuide[]; settings: StorySettings;
   premise: string; player_name: string; player_character_id: string;
@@ -64,6 +64,7 @@ export type StorySettings = {
   review_before_render: boolean;
   duration: number;
   image_model?: string;
+  generate_references?: boolean;
   resolution: string;
   steps: number;
   style?: string;
@@ -89,6 +90,7 @@ export type Story = {
   guides?: GameGuide[];
   configuration_revision?: number;
   player_character_id?: string;
+  navigation?: { version: number; frame_id: string; position: [number, number]; current_run_id?: string; location_id?: string | null; views: { run_id: string; position: [number, number]; frame_id: string; location_id?: string | null }[] };
   [key: string]: unknown;
 };
 export type ImageGeneratorModel = {
@@ -109,6 +111,7 @@ export type StoryTicket = {
 export const PIXEL_STYLE = "2D pixel art, hand-drawn 16-bit sprite animation, crisp visible square pixels, flat illustrated backgrounds, limited palette, readable silhouettes. No 3D voxel blocks, Minecraft or Roblox aesthetic.";
 export const DEFAULT_STORY_SETTINGS: StorySettings = {
   review_before_render: false,
+  generate_references: false,
   duration: 3,
   resolution: "0.2",
   experimental_preview: true,
@@ -138,6 +141,7 @@ export function storyTurnPending(turn?: StoryTurn | null) {
 }
 export function storyTurnLabel(turn?: StoryTurn | null) {
   if (!turn) return "Ready for your first move";
+  if (turn.status === "planning" && turn.planning_mode === "deterministic_movement") return "Preparing movement";
   return (
     {
       planning: "Planning the next moment",
@@ -231,6 +235,30 @@ export function normalizeImageGenerators(
       return [];
     })
     .filter((item) => !seen.has(item.id) && !!seen.add(item.id));
+}
+
+/** Only a successfully read server inventory can diagnose missing requirements. */
+export function imageGeneratorInventory(value: any): ImageGeneratorModel[] {
+  const models = normalizeImageGenerators(value?.generators || value?.models);
+  const listed = new Set(models.map(model => model.id));
+  const missing = new Map<string, string[]>();
+  for (const server of Array.isArray(value?.servers) ? value.servers : []) {
+    if (!server || typeof server.model_missing !== "object" || !server.model_missing) continue;
+    for (const [id, requirements] of Object.entries(server.model_missing)) {
+      if (listed.has(id) || !Array.isArray(requirements)) continue;
+      const names = requirements.filter((item): item is string => typeof item === "string" && !!item.trim());
+      if (!names.length) continue;
+      const lines = missing.get(id) || [];
+      lines.push(`${typeof server.comfy_url === "string" ? server.comfy_url : "Checked ComfyUI server"}: ${names.join(", ")}`);
+      missing.set(id, lines);
+    }
+  }
+  for (const [id, requirements] of missing) models.push({
+    id, name: id.replace(/\.safetensors$/i, "").replaceAll("_", " "),
+    available: false, compatible: false,
+    reason: `Missing requirements in the checked inventory: ${requirements.join("; ")}.`,
+  });
+  return models;
 }
 export function validStoryTicket(
   value: unknown,

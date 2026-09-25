@@ -43,4 +43,4 @@ try {
         throw 'The frontend build did not produce dist/index.html.'
     }
 } finally { Pop-Location }
-Write-Host 'Prompt Studio is ready. Run Launch.ps1 to open it. Existing project data was retained.'
+Write-Host 'Prompt Studio is ready. Run H3-Start.bat to open it. Existing project data was retained.'

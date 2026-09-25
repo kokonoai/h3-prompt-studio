@@ -58,18 +58,18 @@ export default function ModelPicker({ settings, models = [], online, busy, onSel
       <div className="simple-model-heading">
         <Bot size={18} aria-hidden="true" />
         <label htmlFor={id}>Prompt assistant</label>
-        <span className={`simple-model-status ${online ? "online" : ""}`}>{online ? "LM Studio connected" : "LM Studio offline"}</span>
+        <span className={`simple-model-status ${online ? "online" : ""}`}>{online ? "Local AI connected" : "Local AI offline"}</span>
       </div>
       <div className="simple-model-controls">
-        <select id={id} value={selected} disabled={disabled || !options.length} onChange={event => onSelect(event.target.value)} aria-describedby={`${id}-help`} title={selected || "Select an installed LM Studio model"}>
+        <select id={id} value={selected} disabled={disabled || !options.length} onChange={event => onSelect(event.target.value)} aria-describedby={`${id}-help`} title={selected || "Select an installed Ollama or LM Studio model"}>
           {!selected && <option value="">Choose an installed model…</option>}
           {options.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
         </select>
-        <button type="button" className="secondary" disabled={disabled} onClick={() => onRefresh()} title="Refresh installed LM Studio models"><RefreshCw size={14} aria-hidden="true" /> Refresh</button>
+        <button type="button" className="secondary" disabled={disabled} onClick={() => onRefresh()} title="Refresh installed local models"><RefreshCw size={14} aria-hidden="true" /> Refresh</button>
         <button type="button" className="secondary" onClick={onConnections}><Settings2 size={14} aria-hidden="true" /> Connection</button>
       </div>
       <p id={`${id}-help`} className="simple-model-help">
-        {!online ? "Start the local server in LM Studio, then refresh. You can keep editing your film." :
+        {!online ? "Start Ollama or the LM Studio local server, then refresh. You can keep editing your film." :
           current?.missing ? "This saved model is not in the current list. Refresh or choose an installed model before making a prompt." :
           current?.vision === false ? "This model uses your words and saved image descriptions. Choose “Reads photos” to inspect new photos." :
           current?.vision !== true ? "Photo support is not reported for this model. Use a model marked “Reads photos” when you want image analysis." :

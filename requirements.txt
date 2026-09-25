@@ -6,4 +6,6 @@ python-multipart>=0.0.18,<1
 pillow>=11,<13
 jsonschema>=4.23,<5
 lmstudio>=1.5,<2
+fugashi>=1.5,<2
+unidic-lite>=1.0.8,<2
 pytest>=8,<10

@@ -160,6 +160,9 @@ and any locked scene controls. Resolve vague continuation into a specific new NP
 Use continue in the same place with unchanged references; cut only for an actual new shot/place or
 new conditioning. Merely handling a known prop does not require a cut or an asset.
 New people need a stable name and a consistent text description, not a separate identity image.
+When generate_references is false, asset_requests must be []. H3 renders new people, streets,
+rooms, clothing and props directly from text; existing references remain available. Missing images
+are not a dependency of a text-only scene. Do not request an image to establish the first location.
 Use the current footage to preserve an already visible person's appearance when they are first named;
 do not generate a new face, redesign them or cut just to introduce them. A text-only newcomer can enter
 the current shot directly. Request an image only when the user asks for it or specific missing visual
@@ -205,6 +208,14 @@ DIRECTOR_SYSTEM = """You are the H3 visual director, not the roleplay writer.
 Stage the APPROVED narrative beats into one video clip. Return the required direction JSON.
 Use only supplied beat IDs; never add narrative events, new dialogue, characters, props or locations.
 Choose useful framing, camera movement/height/focus/speed, specific observable performance and sound.
+For a directional player move, use the current viewing direction: forward is deeper into the view
+away from the viewer, backward is toward the viewer, left/right are the corresponding side of the
+current view. Never reverse this axis to face the actor toward the camera. Unless authored camera
+controls or active guidance request otherwise, hold the camera position and angle for a local player
+step so displacement against stationary landmarks is visible. Keep feet visible when feasible;
+show weight transfer and planted footfalls, not sliding or a walk cycle in place. A camera-only move
+does not animate the player or another person. Reuse the player appearance supplied in the cast;
+if it is unknown do not invent a face or assign movement to a background person instead.
 Every beat must appear exactly once and every dialogue index exactly once, in their original order.
 Each actor's physical staging belongs only to the current beat. Do not repeat an earlier beat's action,
 question or answer in a later actor row. Keep spoken words exclusively in scheduled dialogue; do not
@@ -523,7 +534,7 @@ def _effect_schema(world, *, allow_discovery_ids=False):
     return {'type': 'array', 'maxItems': 16 if variants else 0, 'items': {'oneOf': variants} if variants else EFFECT}
 
 
-def _narrative_schema(world, duration, requested_shots, identify_language=False, *, remaining_words=None, remaining_lines=None, inspection=None):
+def _narrative_schema(world, duration, requested_shots, identify_language=False, *, remaining_words=None, remaining_lines=None, inspection=None, generate_references=False):
     schema = _obj({k: copy.deepcopy(NARRATIVE_SCHEMA['properties'][k])
                    for k in ('transition', 'beats', 'effects', 'choices', 'asset_requests')})
     props = schema['properties']
@@ -547,6 +558,8 @@ def _narrative_schema(world, duration, requested_shots, identify_language=False,
             'description': 'Only the language name/code of the exact player quotations, or empty if uncertain. Never the quote itself, a sentence or an explanation; never translate their words.'}
         schema['required'].append('player_language')
     props['asset_requests']['description'] = 'Normally []. New people can use text descriptions and current footage without images. Request only user-requested assets or specifically required missing visual conditioning; preserve existing appearances.'
+    if not generate_references:
+        props['asset_requests'].update(maxItems=0, description='Must be []. Generate the scene directly from text and reuse existing references; automatic reference-image generation is disabled.')
     props['choices']['items']['properties']['message']['description'] = 'A brief player attempt or question. Contractions such as I\'ll are valid. Do not decide NPC actions.'
     if duration <= 5 and not requested_shots:
         props['beats']['maxItems'] = 1
@@ -808,7 +821,7 @@ def _check_inspection_effects(narrative, inspection, responses, authored_instruc
 
 
 def plan_turn(*, project, world, player_character_id, message, duration, predict,
-              guides=(), intent=None, mode='game', observed_state=None, initiative='balanced', premise=''):
+              guides=(), intent=None, mode='game', observed_state=None, initiative='balanced', premise='', generate_references=False):
     """Request isolated NPC responses, settle a narrative, then direct its beats.
 
     The ordinary short scene activates at most two NPC speakers. The second sees
@@ -822,6 +835,8 @@ def plan_turn(*, project, world, player_character_id, message, duration, predict
         raise ValueError('Describe a player action or request a continuation.')
     if not isinstance(premise, str):
         raise ValueError('The story premise must be text.')
+    if type(generate_references) is not bool:
+        raise ValueError('Generate reference images must be on or off.')
     if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
         raise ValueError('Choose a valid new-action duration.')
     if intent is not None:
@@ -912,6 +927,7 @@ def plan_turn(*, project, world, player_character_id, message, duration, predict
     narrative = _predict(predict, 'roleplay', 'world', (GAME_ENGINE_SYSTEM + '\n\n' if mode == 'game' else '') + NARRATIVE_SYSTEM, {
         'mode': mode, 'player_character_id': player_character_id, 'player_message': message,
         'story_premise': premise,
+        'generate_references': generate_references if mode == 'game' else True,
         'initiative': initiative,
         'world': context, 'resolved_intent': resolved, 'active_guides': guides_text,
         'read_only_inspection': inspection,
@@ -932,7 +948,8 @@ def plan_turn(*, project, world, player_character_id, message, duration, predict
         'requested_scene_controls': requested_shots,
         'beat_budget': 1 if duration <= 5 and not requested_shots else 6,
     }, _narrative_schema(world, duration, requested_shots, identify_language,
-                        remaining_words=remaining_words, remaining_lines=remaining_lines, inspection=inspection) if mode == 'game' else NARRATIVE_SCHEMA)
+                        remaining_words=remaining_words, remaining_lines=remaining_lines, inspection=inspection,
+                        generate_references=generate_references) if mode == 'game' else NARRATIVE_SCHEMA)
     inspection_exception = _check_inspection_effects(narrative, inspection, responses, authored_instructions, cast) if mode == 'game' else None
     introduction_lines = []
     if mode == 'game':
@@ -990,7 +1007,7 @@ def plan_turn(*, project, world, player_character_id, message, duration, predict
     stages.append({'stage': 'roleplay', 'actor_id': 'world'})
     if mode == 'game':
         narrative['actor_actions'] = [{'subject_id': player_character_id,
-            'activity': 'hold' if (intent or {}).get('kind') in ('wait', 'inventory') else 'act',
+            'activity': 'hold' if (intent or {}).get('kind') in ('wait', 'inventory') or ((intent or {}).get('kind') == 'move' and (intent or {}).get('camera') == 'camera') else 'act',
             'action': (resolved or {}).get('action') or message}]
         narrative['actor_actions'].extend({'subject_id': response['character_id'], 'action': response['action'], 'activity': 'act'}
                                            for response in responses)
@@ -1070,11 +1087,19 @@ def _prepare_project(plan, project, duration):
     return result
 
 
-def _request_direction(plan, project, duration, predict, observed_state=None, guides=(), *, game_mode=True, current_facts=(), known_objects=()):
+def _request_direction(plan, project, duration, predict, observed_state=None, guides=(), *, game_mode=True, current_facts=(), known_objects=(), movement_intent=None):
     schema = copy.deepcopy(DIRECTION_SCHEMA)
     shots = schema['properties']['shots']
     shots['minItems'] = shots['maxItems'] = len(plan['beats'])
     props = shots['items']['properties']
+    local_player_step = bool(movement_intent and movement_intent.get('kind') == 'move'
+        and not movement_intent.get('target_id') and movement_intent.get('camera', 'player') == 'player'
+        and len(plan['beats']) == 1 and project.get('game_viewpoint') != 'pov'
+        and not guides and not _author_instructions(project)
+        and not any(scene.get('director_locks') or (scene.get('scene_contract') and scene.get('scene_contract_source') != 'generated') for scene in project['shots']))
+    if local_player_step:
+        props['camera']['properties']['movement'] = {'type': 'string', 'const': 'static'}
+        props['camera']['properties']['framing'] = {'type': 'string', 'const': 'wide full-body'}
     props['scene_contract'] = scene_contract_schema([subject['id'] for subject in project['subjects']], required=True)
     participants = {entry['subject_id']: entry for entry in plan.get('actor_actions', [])} if game_mode and 'actor_actions' in plan else None
     # Approved beats already own physical performance. Asking a second model
@@ -1106,6 +1131,8 @@ def _request_direction(plan, project, duration, predict, observed_state=None, gu
         'current_controls': [{k: copy.deepcopy(v) for k, v in scene.items() if k != 'id'} for scene in project['shots']],
         'style': project['style'], 'soundscape': project.get('soundscape', ''), 'music': project.get('music', ''),
         'viewpoint': project.get('game_viewpoint', 'third-person'),
+        'movement_control': movement_intent,
+        'local_movement_camera': 'Hold a wide full-body camera at its current position and angle; show displacement against stationary landmarks.' if local_player_step else '',
         'user_instructions': _author_instructions(project), 'active_guides': list(guides),
         'observed_ending': _ending_evidence(observed_state),
         'current_scene_facts': list(current_facts),
@@ -1146,8 +1173,11 @@ def _request_direction(plan, project, duration, predict, observed_state=None, gu
                         # include the player's exact quoted utterance. The beat
                         # already owns physical action; dialogue_indices owns
                         # speech. Repeating either here replays earlier events.
-                        row['action'] = ('Perform only ' + subject_names[subject_id][:120]
-                                         + "'s physical action assigned in this beat; speak only the dialogue scheduled in this shot.")
+                        row['action'] = (participant['action'][:500] if local_player_step else
+                            'Perform only ' + subject_names[subject_id][:120]
+                            + "'s physical action assigned in this beat; speak only the dialogue scheduled in this shot.")
+                        if local_player_step and participant['activity'] != 'hold':
+                            row['end'] = beat['final_state'][:500]
                         if participant['activity'] == 'hold':
                             row['activity'] = 'hold'
                 actors.append(row)
@@ -1168,7 +1198,7 @@ def _request_direction(plan, project, duration, predict, observed_state=None, gu
 
 
 def direct_plan(plan, project, *, duration, predict=None, guides=(), observed_state=None,
-                current_facts=(), game_mode=True, known_objects=()):
+                current_facts=(), game_mode=True, known_objects=(), movement_intent=None):
     """Merge directed shots through Studio's shared merge, preserving exact lines.
 
     A supplied direction is validated and reused without further inference.
@@ -1187,7 +1217,8 @@ def direct_plan(plan, project, *, duration, predict=None, guides=(), observed_st
         if predict is None:
             raise ValueError('This response needs scene direction. Run the director before rendering.')
         direction = _request_direction(value, prepared, duration, predict, observed_state,
-                                       _guide_text(guides), game_mode=game_mode, current_facts=current_facts, known_objects=known_objects)
+                                       _guide_text(guides), game_mode=game_mode, current_facts=current_facts, known_objects=known_objects,
+                                       movement_intent=movement_intent)
     _validate(direction, DIRECTION_SCHEMA, 'The scene direction is incomplete')
     beats = {b['id']: b for b in value['beats']}
     used_beats = [s['beat_id'] for s in direction['shots']]

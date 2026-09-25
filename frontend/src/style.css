@@ -1703,3 +1703,5 @@ details[open] > summary {
 .files-error { color: #e3a79a; font-size: 12px; }
 .files-status { color: #aed7bf; font-size: 12px; }
 @media (max-width: 520px) { .files-location { flex-direction: column; } }
+/* Legacy advanced editor remains structurally unchanged while sharing the app locale. */
+.advanced-workspace{display:contents}

@@ -162,13 +162,16 @@ def _validated_content(content):
     return clean, image_count > 0
 
 
+OLLAMA_COLD_LOAD_TIMEOUT = 600
+
+
 class LMStudioClient:
     def __init__(self, base_url="http://127.0.0.1:1234/v1", api_key="", timeout=180, *, sdk_factory=None):
         parsed = parse.urlsplit(base_url)
         if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
                 or parsed.username or parsed.password or parsed.query or parsed.fragment
                 or parsed.path.rstrip("/") not in ("", "/v1")):
-            raise ValueError("LM Studio URL must be a loopback HTTP address, optionally ending in /v1")
+            raise ValueError("The local AI URL must be a loopback HTTP address, optionally ending in /v1")
         try:
             parsed.port
         except ValueError as exc:
@@ -179,6 +182,10 @@ class LMStudioClient:
             raise ValueError("Invalid API key")
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
         self.base_url = self.origin + "/v1"
+        # Ollama uses the compatible completion endpoint below, plus native
+        # endpoints for discovery and memory management. Port 11434 is the
+        # explicit local opt-in; every other port keeps LM Studio behaviour.
+        self.is_ollama = parsed.port == 11434
         self.api_key = api_key
         self.timeout = float(timeout)
         self._completion_context = contextvars.ContextVar('lmstudio_completion_info', default=None)
@@ -213,7 +220,8 @@ class LMStudioClient:
         if cancel_event is not None and cancel_event.is_set():
             raise LMStudioError('This assistant request was cancelled; its response was not applied.', code='cancelled')
 
-    def _request(self, method, path, payload=None):
+    def _request(self, method, path, payload=None, *, timeout=None):
+        provider = 'Ollama' if self.is_ollama else 'LM Studio'
         headers = {"Accept": "application/json"}
         data = None
         if payload is not None:
@@ -222,12 +230,16 @@ class LMStudioClient:
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
         req = request.Request(self.origin + path, data=data, headers=headers, method=method)
-        timeout = min(self.timeout, 10) if method == 'GET' else self.timeout
+        requested_timeout = self.timeout if timeout is None else timeout
+        if (isinstance(requested_timeout, bool) or not isinstance(requested_timeout, (int, float))
+                or not math.isfinite(requested_timeout) or not 1 <= requested_timeout <= 600):
+            raise ValueError("Local AI request timeout must be 1–600 seconds")
+        timeout = min(requested_timeout, 10) if method == 'GET' else requested_timeout
         try:
             with self._opener.open(req, timeout=timeout) as response:
                 raw = response.read(8_000_001)
                 if len(raw) > 8_000_000:
-                    raise LMStudioError("LM Studio response exceeded the size limit", code="response_too_large")
+                    raise LMStudioError(f"{provider} response exceeded the size limit", code="response_too_large")
                 return _strict_json(raw.decode("utf-8"))
         except error.HTTPError as exc:
             try:
@@ -243,12 +255,12 @@ class LMStudioClient:
             raise LMStudioError(message, code=code, status_code=exc.code, detail=detail[:1000]) from exc
         except (TimeoutError, error.URLError) as exc:
             if isinstance(exc, TimeoutError) or isinstance(getattr(exc, 'reason', None), TimeoutError):
-                raise LMStudioError(f'LM Studio did not respond within {timeout:g} seconds. Its current request may still be running; check the server before retrying.', code='request_timeout') from exc
-            raise LMStudioError("Cannot reach LM Studio; check its local server and try again", code="connection_error") from exc
+                raise LMStudioError(f'{provider} did not respond within {timeout:g} seconds. Its current request may still be running; check the server before retrying.', code='request_timeout') from exc
+            raise LMStudioError(f"Cannot reach {provider}; start its local server and try again", code="connection_error") from exc
         except (http.client.HTTPException, OSError) as exc:
-            raise LMStudioError('The connection to LM Studio ended before its response was confirmed. Check the server before retrying.', code='connection_error') from exc
+            raise LMStudioError(f'The connection to {provider} ended before its response was confirmed. Check the server before retrying.', code='connection_error') from exc
         except (ValueError, UnicodeError, RecursionError) as exc:
-            raise LMStudioError("LM Studio returned invalid JSON", code="invalid_response") from exc
+            raise LMStudioError(f"{provider} returned invalid JSON", code="invalid_response") from exc
 
     def native_models(self):
         data = self._request("GET", "/api/v1/models")
@@ -260,7 +272,40 @@ class LMStudioClient:
                     if isinstance(m.get('loaded_instances'), list) else []}
                 for m in data["models"] if isinstance(m, dict) and isinstance(m.get("key"), str)]
 
+    def ollama_models(self):
+        data = self._request("GET", "/api/tags")
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            raise LMStudioError("Ollama model discovery returned an invalid shape", code="invalid_response")
+        try:
+            running_data = self._request("GET", "/api/ps")
+            running = {item.get("name") or item.get("model") for item in running_data.get("models", [])
+                       if isinstance(item, dict)} if isinstance(running_data, dict) else set()
+        except LMStudioError:
+            running = set()
+        result = []
+        for item in data["models"]:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("name") or item.get("model")
+            if not isinstance(key, str) or not key:
+                continue
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            families = details.get("families") if isinstance(details.get("families"), list) else []
+            hints = (key + " " + " ".join(str(value) for value in families)).lower()
+            vision = any(marker in hints for marker in (
+                "clip", "vision", "qwen2-vl", "qwen2.5vl", "qwen3-vl",
+                "llava", "mllama", "minicpm-v", "gemma3", "gemma4"
+            ))
+            loaded = key in running
+            result.append({"id": key, "key": key, "name": key, "display_name": key,
+                           "vision": vision, "loaded": loaded,
+                           "loaded_instances": [{"id": key, "config": {}}] if loaded else [],
+                           "capabilities": {"vision": vision}, "provider": "ollama"})
+        return result
+
     def models(self):
+        if self.is_ollama:
+            return self.ollama_models()
         try:
             models = self.native_models()
         except LMStudioError as exc:
@@ -278,6 +323,11 @@ class LMStudioClient:
                 for m in models if m.get("type") == "llm"]
 
     def loaded_instances(self):
+        if self.is_ollama:
+            return [{"instance_id": item["key"], "id": item["key"], "model": item["key"],
+                     "model_key": item["key"], "key": item["key"], "vision": item.get("vision"),
+                     "config": {}, "provider": "ollama"}
+                    for item in self.ollama_models() if item.get("loaded")]
         return [{"instance_id": instance["id"], "id": instance["id"], "model": m["key"], "key": m["key"],
                  "vision": m.get("capabilities", {}).get("vision", False), "config": instance.get("config", {})}
                 for m in self.native_models() for instance in m.get("loaded_instances", [])
@@ -297,6 +347,17 @@ class LMStudioClient:
             raise LMStudioError("Select a valid local model", code="invalid_model")
         if isinstance(context_length, bool) or not isinstance(context_length, int) or not 1024 <= context_length <= 32768:
             raise LMStudioError("Context length must be between 1024 and 32768 tokens", code="invalid_request")
+        if self.is_ollama:
+            if not any(m["key"] == model for m in self.ollama_models()):
+                raise LMStudioError("The selected Ollama model is not installed", code="invalid_model")
+            # A large Ollama model can need several minutes for its first disk to
+            # GPU load. Keep ordinary completions bounded by self.timeout, while
+            # giving only this explicit cold-load request a ten-minute window.
+            self._request("POST", "/api/generate", {"model": model, "prompt": "", "stream": False,
+                                                       "keep_alive": "10m", "options": {"num_ctx": context_length}},
+                          timeout=OLLAMA_COLD_LOAD_TIMEOUT)
+            return {"instance_id": model, "model": model, "status": "loaded",
+                    "load_config": {"context_length": context_length}, "provider": "ollama"}
         if not any(m["key"] == model for m in self.native_models()):
             raise LMStudioError("The selected model is not in the local model inventory", code="invalid_model")
         if offload_kv_cache_to_gpu is not None and type(offload_kv_cache_to_gpu) is not bool:
@@ -318,6 +379,9 @@ class LMStudioClient:
         """
         if type(context_length) is not int or not 1024 <= context_length <= 32768:
             raise LMStudioError('Choose a supported loaded context length.', code='invalid_request')
+        if self.is_ollama:
+            return {**self.load_model(model, context_length=context_length),
+                    'ownership_transport': 'ollama_model_identity'}
         instance_id = instance_id or ASSISTANT_PREFIX + uuid.uuid4().hex
         if not isinstance(instance_id, str) or not instance_id.startswith(ASSISTANT_PREFIX):
             raise LMStudioError('An owned assistant instance needs its app-generated identifier.', code='invalid_request')
@@ -382,7 +446,7 @@ class LMStudioClient:
                 'remaining_for_images_and_text': available - text_tokens,
                 'text_fits': text_tokens <= available, 'fully_measured': not has_images}
 
-    def complete_json_stream(self, model, system, content, schema, max_tokens=1800, temperature=.3,
+    def complete_json_stream(self, model, system, content, schema, max_tokens=4096, temperature=.3,
                              *, request_id=None, cancel_event=None, on_progress=None):
         """Optional SDK transport with actual scoped cancellation and progress.
 
@@ -567,6 +631,10 @@ class LMStudioClient:
     def unload_model(self, instance_id):
         if not isinstance(instance_id, str) or not instance_id or len(instance_id) > 512:
             raise LMStudioError("Select a valid loaded instance", code="invalid_model")
+        if self.is_ollama:
+            self._request("POST", "/api/generate", {"model": instance_id, "prompt": "",
+                                                       "stream": False, "keep_alive": 0})
+            return {"instance_id": instance_id, "status": "unloaded", "provider": "ollama"}
         data = self._request("POST", "/api/v1/models/unload", {"instance_id": instance_id})
         if not isinstance(data, dict) or data.get("instance_id") != instance_id:
             raise LMStudioError("Unload did not confirm the requested instance ID", code="invalid_response")
@@ -575,6 +643,14 @@ class LMStudioClient:
     def _loaded_model(self, model, require_vision=False):
         if not isinstance(model, str) or not model or len(model) > 512:
             raise LMStudioError("Select a model", code="invalid_model")
+        if self.is_ollama:
+            matches = [entry for entry in self.ollama_models() if entry["key"] == model]
+            if len(matches) != 1:
+                raise LMStudioError("The selected Ollama model is not installed", code="invalid_model")
+            capabilities = matches[0].get("capabilities", {})
+            if require_vision and capabilities.get("vision") is not True:
+                raise LMStudioError("The selected Ollama model is not recognized as a vision model", code="vision_unsupported")
+            return model, capabilities
         matches = []
         for entry in self.native_models():
             if entry.get('type') != 'llm':
@@ -603,7 +679,7 @@ class LMStudioClient:
                 self._schema_fallbacks[key] = now + 300
             return key in self._schema_fallbacks
 
-    def complete_json(self, model, system, content, schema, max_tokens=1800, temperature=0.3,
+    def complete_json(self, model, system, content, schema, max_tokens=4096, temperature=0.3,
                       *, request_id=None, cancel_event=None, on_progress=None):
         self.last_completion_info = None
         self._check_cancel(cancel_event)
@@ -639,7 +715,12 @@ class LMStudioClient:
         # LM Studio 0.4.23+1: zero reasoning tokens, complete image JSON in 1.74s.
         # Default thinking otherwise exhausted the 700-token image budget.
         reasoning = capabilities.get('reasoning')
-        if isinstance(reasoning, dict) and isinstance(reasoning.get('allowed_options'), list) and "off" in reasoning['allowed_options']:
+        # Ollama thinking models enable reasoning by default. All Studio calls
+        # expect bounded structured JSON, so reserve the output budget for the
+        # result instead of allowing an internal trace to consume it.
+        if self.is_ollama:
+            payload["reasoning_effort"] = "none"
+        elif isinstance(reasoning, dict) and isinstance(reasoning.get('allowed_options'), list) and "off" in reasoning['allowed_options']:
             payload["reasoning_effort"] = "none"
         started = time.perf_counter()
         retry_reasons = []
@@ -697,7 +778,7 @@ class LMStudioClient:
                     if exc.status_code in (400, 422):
                         self._schema_fallback(instance_id, schema, remember=True)
                     continue
-                if capability_error and 'reasoning_effort' in payload and 'reasoning_effort' in detail:
+                if capability_error and not self.is_ollama and 'reasoning_effort' in payload and 'reasoning_effort' in detail:
                     self._check_cancel(cancel_event)
                     retry_reasons.append('Server rejected reasoning_effort; retried once with model defaults')
                     compatibility_retry = True
@@ -767,7 +848,7 @@ class LMStudioClient:
         if not isinstance(asset, dict):
             raise LMStudioError("Asset metadata must be an object", code="invalid_request")
         content = prompts.image_content(validate_data_url(data_url), asset)
-        return self.complete_json(model, prompts.image_system(asset), content, prompts.IMAGE_SCHEMA, max_tokens=700, temperature=0.2)
+        return self.complete_json(model, prompts.image_system(asset), content, prompts.IMAGE_SCHEMA, max_tokens=4096, temperature=0.2)
 
     def propose_plan(self, model, project, instructions="", persona="universal"):
         if not isinstance(instructions, str) or len(instructions) > 8000:
@@ -787,4 +868,4 @@ class LMStudioClient:
         if not isinstance(instructions, str) or len(instructions) > 8000:
             raise LMStudioError("Assistance instructions exceed the supported limit", code="invalid_request")
         system, content, schema = prompts.assist_prompt(project, shot_id, field, instructions, persona)
-        return self.complete_json(model, system, content, schema, max_tokens=700)
+        return self.complete_json(model, system, content, schema, max_tokens=4096)

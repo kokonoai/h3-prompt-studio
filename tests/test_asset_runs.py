@@ -46,6 +46,9 @@ class Server:
         assert request.url.host == '127.0.0.1' and request.url.port == 8010
         if path == '/object_info':
             return httpx.Response(200, json=self.info)
+        if path.startswith('/object_info/'):
+            node_name = path.rsplit('/', 1)[1]
+            return httpx.Response(200, json={node_name: self.info[node_name]} if node_name in self.info else {})
         if path == '/queue' and request.method == 'GET':
             return httpx.Response(200, json={'queue_pending': self.pending, 'queue_running': self.running})
         if path == '/queue' and request.method == 'POST':

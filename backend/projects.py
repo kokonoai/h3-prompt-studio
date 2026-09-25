@@ -12,6 +12,11 @@ DIRECTOR_LOCK_FIELDS = frozenset({
     'camera.framing', 'camera.movement', 'camera.height', 'camera.focus', 'camera.speed',
     'transition', 'setting', 'visible_subject_ids', 'offscreen_subject_ids', 'final_state', 'scene_contract',
 })
+PROJECT_LANGUAGES = frozenset({'zh-CN', 'zh-TW', 'en', 'ja'})
+TIME_ONLY_STATE = re.compile(
+    r'^\s*(?:at\s+)?\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)\s*$',
+    re.IGNORECASE,
+)
 
 
 def directed_structure(project):
@@ -33,11 +38,15 @@ def shot(duration=5):
 
 def new_project():
     return {'schema_version': 1, 'id': uid(), 'title': 'Untitled film', 'mode': 'ref2va',
+            'production_language': 'zh-CN',
             'duration': 5, 'aspect_ratio': '16:9', 'profile': 'director', 'authoring_mode': 'assisted',
             'story': {'text': '', 'locked': True},
             'style': {'genre': 'cinematic', 'vibe': '', 'lighting': '', 'color': '', 'notes': ''},
             'assets': [], 'subjects': [], 'shots': [shot()], 'soundscape': '', 'music': '',
             'custom_instructions': ''}
+
+
+PROMPT_VERSIONS = {"classic", "continuity_director", "storyboard_narrative"}
 
 def safe_id(value):
     if not isinstance(value, str) or not re.fullmatch(r'[a-fA-F0-9-]{36}', value):
@@ -97,7 +106,16 @@ def check_project(project):
             raise ValueError(f'{path} must contain text fields only.')
 
     text_fields(project, ('title', 'mode', 'aspect_ratio', 'profile', 'authoring_mode',
-                          'soundscape', 'music', 'custom_instructions'), 'project', required=('title', 'mode'))
+                          'production_language', 'soundscape', 'music', 'custom_instructions',
+                          'production_planning_context'), 'project', required=('title', 'mode'))
+    if not isinstance(project.get('prompt_version', 'classic'), str) or project.get('prompt_version', 'classic') not in PROMPT_VERSIONS:
+        raise ValueError('project.prompt_version must be classic, continuity_director or storyboard_narrative.')
+    verbatim_blocks = project.get('h3_verbatim_blocks', [])
+    if (not isinstance(verbatim_blocks, list) or len(verbatim_blocks) > 8
+            or not all(isinstance(block, str) and 0 < len(block) <= 30000 for block in verbatim_blocks)):
+        raise ValueError('project.h3_verbatim_blocks must contain at most eight bounded text blocks.')
+    if project.get('production_language', 'zh-CN') not in PROJECT_LANGUAGES:
+        raise ValueError('project.production_language must be zh-CN, zh-TW, en or ja.')
     number(project.get('duration'), 'project.duration')
     story = object_value(project.get('story'), 'story')
     text_fields(story, ('text',), 'story', required=('text',))
@@ -125,6 +143,8 @@ def check_project(project):
             elif key == 'subjects':
                 text_fields(value, ('name', 'description'), path, required=('name',))
                 string_list(value.get('asset_ids'), path + '.asset_ids')
+                if 'collective_member_ids' in value:
+                    string_list(value['collective_member_ids'], path + '.collective_member_ids')
             else:
                 number(value.get('duration'), path + '.duration')
                 text_fields(value, ('action', 'setting', 'performance', 'final_state', 'sound', 'transition'), path)
@@ -283,6 +303,30 @@ def merge_plan(project, proposal):
                 if sid not in destination[field]:
                     destination[field].append(sid)
         old_start += old['duration']
+    # The final visible/off-screen roster is protected authoring data and is
+    # restored after the model proposal. Reconcile only model-generated
+    # physical staging with that final roster: an off-screen voice has no body
+    # to pose, and duplicate actor rows do not describe two people. Authored
+    # scene contracts remain untouched and continue to fail closed on conflict.
+    for scene in new_shots:
+        if scene.get('scene_contract_source') != 'generated' or not isinstance(scene.get('scene_contract'), dict):
+            continue
+        visible_ids = set(scene.get('visible_subject_ids', []))
+        seen, actors = set(), []
+        for row in scene['scene_contract'].get('actors', []):
+            sid = row.get('subject_id') if isinstance(row, dict) else None
+            if sid in visible_ids and sid not in seen:
+                # start/end describe physical states, not timestamps. Some
+                # local models copy a timing hint into these fields (for
+                # example "0s" / "4s"), which makes a ten-second character
+                # appear to vanish early in the compiled H3 direction.
+                if TIME_ONLY_STATE.fullmatch(row.get('start', '')):
+                    row['start'] = 'in the established opening posture and position'
+                if TIME_ONLY_STATE.fullmatch(row.get('end', '')):
+                    row['end'] = 'in the declared final posture and position'
+                actors.append(row)
+                seen.add(sid)
+        scene['scene_contract']['actors'] = actors
     result['shots'] = new_shots
     for field in ('soundscape', 'music'):
         if isinstance(proposal.get(field), str):

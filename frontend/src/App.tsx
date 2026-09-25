@@ -66,6 +66,9 @@ import VideoWorkspace, { type VideoJob, type ContinuationSuggestions } from './V
 import { useVideoRuns } from './useVideoRuns';
 import { useStudioStoryLinks, studioLinkDefinitive } from './useStudioStoryLinks';
 import GameStudio from './GameStudio';
+import ProductionStudio from './ProductionStudio';
+import { UI_LANGUAGE_OPTIONS, useUiLanguage } from './i18n';
+import { useLegacyUiTranslation } from './LegacyUiTranslation';
 import { ContinuationPlanner } from './TimelinePlanner';
 import './WorkspaceModes.css';
 import { completedVideoStory } from './videoStory';
@@ -214,7 +217,11 @@ function Modal({ title, subtitle, onClose, children, wide = false }: any) {
 }
 
 export default function App() {
-  const [workspaceMode, setWorkspaceMode] = useState<'studio'|'game'>(()=>{try{return new URLSearchParams(window.location.search).has('game') || localStorage.getItem('h3-workspace-mode')==='game'?'game':'studio';}catch{return 'studio';}});
+  const {language:uiLanguage,setLanguage:setUiLanguage,text:uiText}=useUiLanguage();
+  const t=(zh:string,en:string,ja:string,tw=zh)=>uiText({'zh-CN':zh,'zh-TW':tw,en,ja});
+  const appUiRef=useRef<HTMLDivElement>(null);
+  useLegacyUiTranslation(appUiRef,uiLanguage);
+  const [workspaceMode, setWorkspaceMode] = useState<'studio'|'production'|'game'>(()=>{try{const query=new URLSearchParams(window.location.search);const saved=localStorage.getItem('h3-workspace-mode');return query.has('game')?'game':query.has('production')?'production':saved==='game'||saved==='production'?saved:'studio';}catch{return 'studio';}});
   const [gameSource, setGameSource] = useState<string|undefined>();
   const [gameSourceKey, setGameSourceKey] = useState(0);
   const [studioStoryId,setStudioStoryId] = useState('');
@@ -458,7 +465,7 @@ export default function App() {
 
   if (!p)
     return (
-      <div className="boot">
+      <div ref={appUiRef} className="boot">
         <div className="logo-mark">H3</div>
         <h2>Prompt Studio</h2>
         <p>{error || "Opening your local workspace…"}</p>
@@ -1052,11 +1059,23 @@ export default function App() {
 
   return (
     <div
+      ref={appUiRef}
       className={
         "studio " + (view === "simple" ? "simple-view " : "") + (showAI ? "ai-open " : "") + (showRefs ? "refs-open" : "")
       }
     >
-      <nav className="workspace-mode-bar" aria-label="Workspace mode"><strong>H3 Prompt Studio</strong><div><button aria-pressed={workspaceMode==='studio'} onClick={()=>setWorkspaceMode('studio')}>Studio</button><button aria-pressed={workspaceMode==='game'} onClick={()=>setWorkspaceMode('game')}>Game</button></div><span>{workspaceMode==='studio'?'Direct your scenes':'Play a character. Let the story respond.'}</span></nav>
+      <nav className="workspace-mode-bar" aria-label={uiText({'zh-CN':'工作区模式','zh-TW':'工作區模式',en:'Workspace mode',ja:'ワークスペース'})}>
+        <strong>H3 Prompt Studio</strong>
+        <div className="workspace-mode-tabs">
+          <button aria-pressed={workspaceMode==='studio'} onClick={()=>setWorkspaceMode('studio')}>{uiText({'zh-CN':'镜头工作室','zh-TW':'鏡頭工作室',en:'Scene Studio',ja:'シーンスタジオ'})}</button>
+          <button aria-pressed={workspaceMode==='production'} onClick={()=>setWorkspaceMode('production')}>{uiText({'zh-CN':'剧本制作','zh-TW':'劇本製作',en:'Story Production',ja:'脚本制作'})}</button>
+          <button aria-pressed={workspaceMode==='game'} onClick={()=>setWorkspaceMode('game')}>{uiText({'zh-CN':'互动故事','zh-TW':'互動故事',en:'Game',ja:'インタラクティブ'})}</button>
+        </div>
+        <span>{workspaceMode==='studio'?uiText({'zh-CN':'导演你的镜头','zh-TW':'導演你的鏡頭',en:'Direct your scenes',ja:'シーンを演出'}):workspaceMode==='production'?uiText({'zh-CN':'动态 5–15 秒 · 本地 AI 与 ComfyUI','zh-TW':'動態 5–15 秒 · 本地 AI 與 ComfyUI',en:'Dynamic 5–15s clips · local AI and ComfyUI',ja:'動的 5〜15秒 · ローカルAIとComfyUI'}):uiText({'zh-CN':'扮演角色，让故事回应你','zh-TW':'扮演角色，讓故事回應你',en:'Play a character. Let the story respond.',ja:'役を演じ、物語を動かす'})}</span>
+        {workspaceMode==='studio'&&<label className="workspace-language workspace-project-language"><span>{uiText({'zh-CN':'项目输出','zh-TW':'專案輸出',en:'Project output',ja:'出力言語'})}</span><select aria-label={uiText({'zh-CN':'项目输出语言','zh-TW':'專案輸出語言',en:'Project output language',ja:'プロジェクト出力言語'})} value={p.production_language||'zh-CN'} onChange={event=>update(d=>{d.production_language=event.target.value as Project['production_language']})}>{UI_LANGUAGE_OPTIONS.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select></label>}
+        <label className="workspace-language"><span>{uiText({'zh-CN':'界面','zh-TW':'介面',en:'UI',ja:'表示'})}</span><select aria-label={uiText({'zh-CN':'界面语言','zh-TW':'介面語言',en:'Interface language',ja:'表示言語'})} value={uiLanguage} onChange={event=>setUiLanguage(event.target.value as typeof uiLanguage)}>{UI_LANGUAGE_OPTIONS.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select></label>
+      </nav>
+      <div className="workspace-pane" hidden={workspaceMode!=='production'}><ProductionStudio project={p} onOpenProject={loadProject} onStudio={(target)=>{setWorkspaceMode('studio');if(target==='connections'){void refresh();setModal('connections');}}}/></div>
       <div className="workspace-pane" hidden={workspaceMode!=='game'}><GameStudio project={p} modelPicker={promptModelPicker} onAddFiles={addFiles} onUploadFiles={async files=>{const assets:Asset[]=[];for(const file of files){const form=new FormData();form.append('file',file);assets.push(await api('/assets',undefined,form));}return assets;}} onStudio={()=>setWorkspaceMode('studio')} initialSourceRunId={gameSource} initialSourceKey={gameSourceKey}/></div>
       <div className="workspace-pane" hidden={workspaceMode!=='studio'}>
       {view === "simple" && <SimpleStudio
@@ -1076,23 +1095,23 @@ export default function App() {
           storyId={studioStoryId||undefined} activeEndpointId={studioStory?.id===studioStoryId?studioStory.active_run_id:undefined} storyClips={studioStory?.id===studioStoryId?studioStory.clips:undefined} onBranch={branchVideo} onPlayGame={playGame}
           onSelectJob={videos.onSelectJob} onGenerate={generateVideo} onReroll={rerollVideo} onContinue={continueVideo} onSuggest={suggestVideo} onCombine={combineVideo} onResolve={resolveVideo} onUpdateTake={videos.updateMetadata}
           />{videos.error&&<p className="comfy-error" role="alert">{videos.error}</p>}</>}
-        settingsPanel={<ComfyPanel project={p} prompt={compiled.prompt} ready={simpleResultFresh} busy={!!busy||videos.active}
+        settingsPanel={<ComfyPanel project={p} prompt={compiled.prompt} references={compiled.references} ready={simpleResultFresh} busy={!!busy||videos.active}
           onSettings={value=>setP(current=>current?{...current,comfy_render:value}:current)}
           onContinuationSource={value=>update(d=>{if(value&&!['ref2va','t2va'].includes(d.mode))setSimpleMode(d,'t2va');d.comfy_render={...d.comfy_render,continuation_source:value};})}
           embedded={!!bridge.current?.context?.embedded} sendEmbedded={ticket=>bridge.current?.sendTransfer(ticket)===true}/>}
       />}
-      {view === "advanced" && <>
+      {view === "advanced" && <div className="advanced-workspace" lang={uiLanguage}>
       <header className="topbar">
         <a className="brand" href="#" onClick={(e) => e.preventDefault()}>
           <span className="logo-mark">H3</span>
           <div>
-            Prompt Studio<small>LOCAL AUTHORING WORKSPACE</small>
+            Prompt Studio<small>{t("本地创作工作区","LOCAL AUTHORING WORKSPACE","ローカル制作ワークスペース","本地創作工作區")}</small>
           </div>
         </a>
         <span className="top-divider" />
         <div className="project-title">
           <input
-            aria-label="Project title"
+            aria-label={t("项目标题","Project title","プロジェクト名","專案標題")}
             value={p.title}
             onChange={(e) =>
               update((d) => {
@@ -1106,40 +1125,40 @@ export default function App() {
           </span>
         </div>
         <div className="top-actions">
-          <button className="quiet" onClick={() => { setView("simple"); setError(""); }}>Simple view</button>
+          <button className="quiet" onClick={() => { setView("simple"); setError(""); }}>{t("简洁视图","Simple view","シンプル表示","簡潔檢視")}</button>
           <button
             className="reference-toggle quiet"
-            aria-label="References"
+            aria-label={t("参考资料","References","参照素材","參考資料")}
             onClick={() => {
               setShowRefs(!showRefs);
               setShowAI(false);
             }}
           >
             <Layers size={15} />
-            <span>References</span>
+            <span>{t("参考资料","References","参照素材","參考資料")}</span>
           </button>
           <button
             className="quiet tools-toggle"
-            aria-label="Tools"
+            aria-label={t("工具","Tools","ツール","工具")}
             onClick={() => setModal("tools")}
           >
             <SlidersHorizontal size={15} />
-            <span>Tools</span>
+            <span>{t("工具","Tools","ツール","工具")}</span>
           </button>
           <button
             className="assistant-toggle quiet"
-            aria-label="Assistant"
+            aria-label={t("助手","Assistant","アシスタント","助手")}
             onClick={() => {
               setShowAI(!showAI);
               setShowRefs(false);
             }}
           >
             <Sparkles size={15} />
-            <span>Assistant</span>
+            <span>{t("助手","Assistant","アシスタント","助手")}</span>
           </button>
           <IconButton
             icon={Undo2}
-            title="Undo last plan or mode change"
+            title={t("撤销上一次规划或模式变更","Undo last plan or mode change","直前の計画・モード変更を元に戻す","復原上一次規劃或模式變更")}
             disabled={!history.length}
             onClick={() => {
               setP(history[history.length - 1]);
@@ -1153,7 +1172,7 @@ export default function App() {
               setModal("projects");
             }}
           >
-            <FolderOpen size={15} /> Projects
+            <FolderOpen size={15} /> {t("项目","Projects","プロジェクト","專案")}
           </button>
           <button
             className="connection-button"
@@ -1167,16 +1186,18 @@ export default function App() {
                 "status-dot " + (connection.lm?.online ? "online" : "")
               }
             />
-            {connection.lm?.online ? "LM Studio" : "Connect LM Studio"}
+            {connection.lm?.online
+              ? (String(settings.lm_url).includes(':11434') ? 'Ollama' : 'LM Studio')
+              : uiText({'zh-CN':'连接本地 AI','zh-TW':'連接本地 AI',en:'Connect local AI',ja:'ローカルAIに接続'})}
             <Settings2 size={14} />
           </button>
         </div>
       </header>
       <div className="projectbar">
         <div className="mode-group">
-          <span className="eyebrow">GENERATION</span>
+          <span className="eyebrow">{t("生成方式","GENERATION","生成方式","生成方式")}</span>
           <Select
-            ariaLabel="Generation mode"
+            ariaLabel={t("生成模式","Generation mode","生成モード","生成模式")}
             value={p.mode}
             onChange={setMode}
             options={MODES}
@@ -1184,7 +1205,7 @@ export default function App() {
         </div>
         <div className="compact-controls">
           <Select
-            label="Length"
+            label={t("时长","Length","長さ","時長")}
             value={p.duration}
             onChange={(v: string) =>
               update((d) => {
@@ -1194,7 +1215,7 @@ export default function App() {
             }
             options={Array.from({ length: 12 }, (_, i) => [
               i + 4,
-              `${i + 4} seconds`,
+              t(`${i+4} 秒`,`${i+4} seconds`,`${i+4}秒`,`${i+4} 秒`),
             ])}
           />
           <Select
@@ -2545,7 +2566,7 @@ export default function App() {
               onClick={() =>
                 run("Preparing H3", async () => {
                   await api("/gpu/prepare-h3", {});
-                  toast("LM Studio unloaded. H3 is ready.");
+                  toast("Local AI unloaded. H3 is ready.");
                 })
               }
             >
@@ -2579,7 +2600,7 @@ export default function App() {
           )}
         </aside>
       </div>
-      </>}
+      </div>}
       </div>
       {view === "simple" && bridgeImport && <div className="banner bridge-banner">
         <span>ComfyUI sent photos and a prompt. Open them as a new project?</span>
@@ -2618,7 +2639,7 @@ export default function App() {
         <Modal
           wide
           title="Reusable system prompt"
-          subtitle={`${aiPersona} · ${p.mode.toUpperCase()} · for a separate LM Studio chat`}
+          subtitle={`${aiPersona} · ${p.mode.toUpperCase()} · for a separate local AI chat`}
           onClose={() => setModal("")}
         >
           <p className="help">
@@ -2642,8 +2663,8 @@ export default function App() {
       )}
       {modal === "connections" && (
         <Modal
-          title="Connections & GPU"
-          subtitle="Switch models without closing your workflow."
+          title={t("连接与显存","Connections & GPU","接続・GPU","連線與顯示記憶體")}
+          subtitle={t("无需关闭当前工作流即可切换本地模型。","Switch models without closing your workflow.","現在のワークフローを閉じずにローカルモデルを切り替えられます。","無需關閉目前工作流即可切換本地模型。")}
           onClose={() => setModal("")}
         >
           <div className="connection-status">
@@ -2654,45 +2675,50 @@ export default function App() {
             />
             <strong>
               {connection.lm?.online
-                ? "LM Studio is online"
-                : "LM Studio is offline"}
+                ? t("本地 AI 已连接","Local AI is online","ローカルAIはオンライン","本地 AI 已連線")
+                : t("本地 AI 未连接","Local AI is offline","ローカルAIはオフライン","本地 AI 未連線")}
             </strong>
             <button className="text-button" onClick={refresh}>
-              <RefreshCw size={13} /> Refresh
+              <RefreshCw size={13} /> {t("刷新","Refresh","更新","重新整理")}
             </button>
           </div>
           <Input
-            label="LM Studio endpoint"
+            label={uiText({'zh-CN':'本地模型接口','zh-TW':'本地模型介面',en:'Local model endpoint',ja:'ローカルモデル接続先'})}
             value={settings.lm_url}
             onChange={(v: string) => setSettings({ ...settings, lm_url: v })}
           />
+          <div className="button-row">
+            <button type="button" className={String(settings.lm_url).includes(':11434')?'primary':''} onClick={()=>setSettings({...settings,lm_url:'http://127.0.0.1:11434/v1'})}>Ollama · 11434</button>
+            <button type="button" className={String(settings.lm_url).includes(':1234')?'primary':''} onClick={()=>setSettings({...settings,lm_url:'http://127.0.0.1:1234/v1'})}>LM Studio · 1234</button>
+          </div>
+          <p className="hint">{uiText({'zh-CN':'两者任选一个。切换只改变 H3 的本地模型地址，不会卸载、删除或修改另一端的模型。','zh-TW':'兩者任選一個。切換只改變 H3 的本地模型位址，不會卸載、刪除或修改另一端的模型。',en:'Use either provider. Switching only changes H3’s local endpoint; it does not unload, delete or modify models in the other app.',ja:'どちらかを選べます。切替はH3の接続先だけを変更し、もう一方のモデルを削除・変更しません。'})}</p>
           <Select
-            label="Prompt assistant model"
+            label={uiText({'zh-CN':'提示词助手模型','zh-TW':'提示詞助手模型',en:'Prompt assistant model',ja:'プロンプト補助モデル'})}
             value={settings.model}
             onChange={(v: string) => setSettings({ ...settings, model: v })}
             options={
               connection.lm?.models
                 ?.map((m: any) => [
                   m.id,
-                  (m.name || m.id) + (m.vision === true ? ' · reads photos' : m.vision === false ? ' · text only' : ' · photo support unknown') + (m.loaded ? " · loaded" : ""),
+                  (m.name || m.id) + (m.vision === true ? t(' · 可识图',' · reads photos','・画像対応',' · 可識圖') : m.vision === false ? t(' · 仅文字',' · text only','・テキストのみ',' · 僅文字') : t(' · 识图支持未知',' · photo support unknown','・画像対応不明',' · 識圖支援未知')) + (m.loaded ? t(" · 已加载"," · loaded","・読込済み"," · 已載入") : ""),
                 ]) || [[settings.model, settings.model]]
             }
           />
           <Select
-            label="Context length"
+            label={t("上下文长度","Context length","コンテキスト長","上下文長度")}
             value={settings.context_length}
             onChange={(v: string) =>
               setSettings({ ...settings, context_length: Number(v) })
             }
             options={[
               [4096, "4,096 tokens"],
-              [8192, "8,192 tokens · recommended for small models"],
+              [8192, t("8,192 tokens · 推荐小模型","8,192 tokens · recommended for small models","8,192 tokens・小型モデル推奨","8,192 tokens · 推薦小模型")],
               [12288, "12,288 tokens"],
               [16384, "16,384 tokens"],
             ]}
           />
           <Area
-            label="ComfyUI instances (one local URL per line)"
+            label={t("ComfyUI 实例（每行一个本地地址）","ComfyUI instances (one local URL per line)","ComfyUIインスタンス（1行に1つのローカルURL）","ComfyUI 執行個體（每行一個本地位址）")}
             value={(settings.comfy_urls || []).join("\n")}
             onChange={(v: string) =>
               setSettings({
@@ -2709,65 +2735,63 @@ export default function App() {
                 <code>{c.url}</code>
                 <span>
                   {!c.online
-                    ? "Closed"
+                    ? t("未连接","Closed","未接続","未連線")
                     : c.running || c.pending
-                      ? `${c.running} running · ${c.pending} queued`
-                      : "Idle"}
+                      ? t(`${c.running} 个运行中 · ${c.pending} 个排队`,`${c.running} running · ${c.pending} queued`,`${c.running}件実行中・${c.pending}件待機`,`${c.running} 個執行中 · ${c.pending} 個排隊`)
+                      : t("空闲","Idle","待機中","閒置")}
                 </span>
               </div>
             ))}
           </div>
           <p className="callout">
-            <ShieldCheck size={16} /> Studio refuses to interrupt running or
-            queued ComfyUI jobs. Enable the optional GPU guard in the ComfyUI
-            panel to protect normal Run-button submissions too.
+            <ShieldCheck size={16} /> {t("Studio 不会强行中断正在运行或排队的 ComfyUI 任务。也可在 ComfyUI 面板启用可选的 GPU 防护，保护普通 Run 按钮提交的任务。","Studio refuses to interrupt running or queued ComfyUI jobs. Enable the optional GPU guard in the ComfyUI panel to protect normal Run-button submissions too.","Studioは実行中または待機中のComfyUIジョブを強制中断しません。ComfyUIパネルの任意GPUガードを有効にすると、通常のRunボタン送信も保護できます。","Studio 不會強制中斷正在執行或排隊的 ComfyUI 任務。也可在 ComfyUI 面板啟用選用的 GPU 防護，保護普通 Run 按鈕提交的任務。")}
           </p>
           <div className="modal-actions">
             <button
               className="quiet"
               onClick={() =>
-                run("Saving connections", async () => {
+                run(t("正在保存连接","Saving connections","接続を保存中","正在儲存連線"), async () => {
                   setSettings(await api("/settings", settings));
-                  toast("Connections saved.");
+                  toast(t("连接设置已保存。","Connections saved.","接続設定を保存しました。","連線設定已儲存。"));
                   refresh();
                 })
               }
             >
-              Save connection
+              {t("保存连接","Save connection","接続を保存","儲存連線")}
             </button>
             <button
               className="primary"
               disabled={!!busy}
               onClick={() =>
-                run("Preparing vision model", async () => {
+                run(t("正在准备视觉模型","Preparing vision model","画像モデルを準備中","正在準備視覺模型"), async () => {
                   setSettings(await api("/settings", settings));
                   const result = await api("/gpu/prepare-ai", {});
-                  toast("Vision model loaded. H3 is out of GPU memory.");
+                  toast(t("视觉模型已加载，H3 已释放显存。","Vision model loaded. H3 is out of GPU memory.","画像モデルを読み込み、H3はGPUメモリから解放されました。","視覺模型已載入，H3 已釋放顯示記憶體。"));
                   refresh();
                 })
               }
             >
-              <Sparkles size={14} /> Prepare AI
+              <Sparkles size={14} /> {t("准备 AI","Prepare AI","AIを準備","準備 AI")}
             </button>
             <button
               disabled={!!busy}
               onClick={() =>
-                run("Preparing H3", async () => {
+                run(t("正在准备 H3","Preparing H3","H3を準備中","正在準備 H3"), async () => {
                   await api("/gpu/prepare-h3", {});
-                  toast("LM Studio unloaded. Ready for H3.");
+                  toast(t("本地 AI 已释放，H3 可以加载。","Local AI unloaded. Ready for H3.","ローカルAIを解放し、H3の準備ができました。","本地 AI 已釋放，H3 可以載入。"));
                   refresh();
                 })
               }
             >
-              Prepare H3
+              {t("准备 H3","Prepare H3","H3を準備","準備 H3")}
             </button>
           </div>
         </Modal>
       )}
       {modal === "files" && (
         <Modal
-          title="Files & outputs"
-          subtitle="Find your prompts, projects and videos on this computer."
+          title={t("文件与输出","Files & outputs","ファイル・出力","檔案與輸出")}
+          subtitle={t("查找保存在本机的提示词、项目和视频。","Find your prompts, projects and videos on this computer.","このPCに保存したプロンプト・プロジェクト・映像を確認します。","查找儲存在本機的提示詞、專案和影片。")}
           onClose={() => setModal("")}
         >
           <FilesOutputs />
@@ -2775,12 +2799,12 @@ export default function App() {
       )}
       {modal === "projects" && (
         <Modal
-          title="Your projects"
-          subtitle="Saved on this computer, including references and exact dialogue."
+          title={t("我的项目","Your projects","プロジェクト","我的專案")}
+          subtitle={t("保存在本机，包含参考资料和精确对白。","Saved on this computer, including references and exact dialogue.","参照素材と正確な台詞を含め、このPCに保存されています。","儲存在本機，包含參考資料和精確對白。")}
           onClose={() => setModal("")}
         >
           <button className="quiet" onClick={() => setModal("files")}>
-            <FolderOpen size={14} /> Files & outputs
+            <FolderOpen size={14} /> {t("文件与输出","Files & outputs","ファイル・出力","檔案與輸出")}
           </button>
           <div className="project-list">
             {projects.map((item) => (
