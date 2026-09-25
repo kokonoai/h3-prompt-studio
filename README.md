@@ -1,8 +1,9 @@
-install it with:
+#install:
 git clone https://github.com/kokonoai/h3-prompt-studio.git
 Set-Location h3-prompt-studio
 .\Install-H3.bat
 .\H3-Start.bat
+
 Alternatively, they can click Code → Download ZIP, extract it, run Install-H3.bat, and then run H3-Start.bat.
 
 # H3 Prompt Studio
