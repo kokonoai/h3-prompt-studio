@@ -1,3 +1,10 @@
+install it with:
+git clone https://github.com/kokonoai/h3-prompt-studio.git
+Set-Location h3-prompt-studio
+.\Install-H3.bat
+.\H3-Start.bat
+Alternatively, they can click Code → Download ZIP, extract it, run Install-H3.bat, and then run H3-Start.bat.
+
 # H3 Prompt Studio
 
 A local workspace for turning reference photos and a plain-language idea into MiniMax H3 video. **Studio** gives you direct control of shots, references and dialogue. **Game** lets you play a character: describe what you do or say, let the local assistant respond, and watch that response as the next video scene.
