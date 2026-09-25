@@ -1,3 +1,10 @@
+install it with:
+git clone https://github.com/kokonoai/h3-prompt-studio.git
+Set-Location h3-prompt-studio
+.\Install-H3.bat
+.\H3-Start.bat
+Alternatively, they can click Code → Download ZIP, extract it, run Install-H3.bat, and then run H3-Start.bat.
+
 # H3 Prompt Studio
 
 For this local extended build: [简体中文安装说明](docs/Quick-Start-Simplified-Chinese.md) · [English install guide](docs/Quick-Start-English.md) · [日本語インストールガイド](docs/Quick-Start-Japanese.md) · [繁體中文安裝說明](docs/Quick-Start-Traditional-Chinese.md). These guides cover the private installation, required local models, shared cards, project films, and separate episode/selection/full-series assembly.
