@@ -915,6 +915,60 @@ def test_ref2va_materialise_excludes_non_card_source_people_and_assets(tmp_path)
     assert [segment["status"] for segment in manager.get(production["id"])["segments"]] == ["ready", "ready"]
 
 
+def test_text_only_clip_falls_back_from_ref2va_without_using_style_image_as_subject(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    style_image = _image(store_asset, "watercolor-style", "blue")
+    production = manager.create({
+        "source_project": source, "brief": "Hero waits in the rain.", "source_mode": "ref2va",
+        "video_quality": "lora8",
+    })
+    production["cards"]["characters"] = [_card("Hero")]
+    production["cards"]["styles"] = [
+        _card("Watercolor", [style_image["id"]], image_analysis="Loose watercolor pigment on paper.")]
+    production = manager.save(production)
+    timeline = {"visible_start": ["Hero"], "visible_end": ["Hero"], "enters": [], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    production = manager.apply_plan(
+        production["id"], [_planned_clip("Hero waits", ["Hero"], timeline)], "local_ai")
+
+    result = manager.materialise(production["id"], production["segments"][0]["id"])
+    project = result["project"]
+
+    assert project["mode"] == "t2va"
+    assert project["comfy_render"]["workflow_profile_id"] == "builtin"
+    assert project["comfy_render"]["quality"] == "fast"
+    assert project["production_link"]["reference_strategy"]["effective_mode"] == "t2va"
+    assert [(asset["id"], asset["role"]) for asset in project["assets"]] == [
+        (style_image["id"], "context")]
+    compiled = compile_project(project)
+    assert compiled["valid"] is True, compiled["issues"]
+
+
+def test_text_only_source_promotes_clip_to_ref2va_when_selected_card_has_an_image(tmp_path):
+    manager, source, projects, _assets, store_asset = _rig(tmp_path)
+    source["mode"] = "t2va"
+    projects[source["id"]] = copy.deepcopy(source)
+    hero_image = _image(store_asset, "hero", "green")
+    production = manager.create({
+        "source_project": source, "brief": "Hero enters.", "source_mode": "t2va",
+    })
+    production["cards"]["characters"] = [_card("Hero", [hero_image["id"]])]
+    production = manager.save(production)
+    timeline = {"visible_start": [], "visible_end": ["Hero"], "enters": ["Hero"], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    production = manager.apply_plan(
+        production["id"], [_planned_clip("Hero enters", ["Hero"], timeline)], "local_ai")
+
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+
+    assert project["mode"] == "ref2va"
+    assert project["production_link"]["reference_strategy"]["effective_mode"] == "ref2va"
+    assert [asset["id"] for asset in project["assets"] if asset.get("role") == "reference_image"] == [
+        hero_image["id"]]
+    compiled = compile_project(project)
+    assert compiled["valid"] is True, compiled["issues"]
+
+
 def test_merge_plan_drops_offscreen_actor_from_generated_physical_staging():
     project = new_project()
     project["mode"] = "t2va"

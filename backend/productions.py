@@ -2453,6 +2453,31 @@ class ProductionManager:
         if use_ref8:
             render.update(ref8_recipe_settings())
         card_selection = self._apply_cards(base, production, segment)
+        # Reference-driven and text-only productions share the same card
+        # library. A clip can therefore have strong written identity/style
+        # direction without owning a renderable image or audio reference.
+        # Ref2VA rejects that valid text-only clip, while treating a style
+        # analysis image as a subject reference would leak its depicted
+        # content into the scene. Select the effective H3 conditioning mode
+        # from the clip's actual reference assets instead.
+        if production.get("source_mode") in ("ref2va", "t2va"):
+            has_reference_asset = bool(
+                card_selection["image_asset_ids"] or card_selection["audio_asset_ids"])
+            base["mode"] = "ref2va" if has_reference_asset else "t2va"
+            card_selection["effective_mode"] = base["mode"]
+            if base["mode"] == "t2va" and render.get("workflow_profile_id") == REF8_WORKFLOW_ID:
+                # The optional eight-step LoRA graph is Ref2VA-only. Fall back
+                # to the unchanged built-in workflow for this one text-only
+                # clip instead of failing the whole episode. Restore any
+                # source render values so the LoRA recipe cannot leak into it.
+                source_render = source.get("comfy_render", {})
+                for key in ("loras", "shift_video", "shift_audio"):
+                    if key in source_render:
+                        render[key] = copy.deepcopy(source_render[key])
+                    else:
+                        render.pop(key, None)
+                render["workflow_profile_id"] = "builtin"
+                render["quality"] = "fast" if production["video_quality"] == "lora8" else production["video_quality"]
         relevant_cards = self._relevant_cards(production, segment)
         def clip_text(value):
             return canonicalise_character_mentions(value, production, relevant_cards["characters"])
