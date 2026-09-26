@@ -929,7 +929,7 @@ def production_cards_plan(production_id: str, body: dict):
 def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
-                              planning_chunks, planning_payload, production_schema_for_story,
+                              planning_payload, production_schema_for_story, storyboard_planning_chunks,
                               timed_clip_groups)
     started = time.monotonic()
     production = production_manager().assert_active(production_id)
@@ -949,7 +949,7 @@ def production_plan(production_id: str, body: dict):
                 # cannot pull dialogue or action across an authored boundary.
                 source_groups = timed_clip_groups(story)
                 pieces = ([group['text'] for group in source_groups]
-                          if source_groups else planning_chunks(story))
+                          if source_groups else storyboard_planning_chunks(story))
                 segments, previous_ending = [], ''
                 for index, piece in enumerate(pieces):
                     RESOURCES.stage = f'Planning story part {index + 1} of {len(pieces)}'

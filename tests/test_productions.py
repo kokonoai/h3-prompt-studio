@@ -10,7 +10,7 @@ from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, 
                                  card_plan_source_hash, character_aliases, current_episode_story,
                                  episode_timing_targets, fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
-                                 locked_timed_dialogue, planning_payload,
+                                 locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  production_schema_for_story, render_character_identity,
                                  scoped_character_bible, script_dialogue, timed_clip_groups)
 from backend.projects import merge_plan, new_project, shot
@@ -222,6 +222,19 @@ def test_thirty_second_episode_targets_about_three_five_to_fifteen_second_clips(
     assert len(clips) == 3
     assert sum(clip["duration"] for clip in clips) == 30
     assert all(5 <= clip["duration"] <= 15 for clip in clips)
+
+
+def test_storyboard_planning_chunks_keep_long_local_answers_bounded():
+    story = "\n".join(
+        f"Beat {index}: The performers complete a distinct visible action and reach a changed state."
+        for index in range(140)
+    )
+
+    pieces = storyboard_planning_chunks(story)
+
+    assert len(pieces) >= 5
+    assert max(map(len, pieces)) <= 2000
+    assert "".join(pieces).replace("\n", "") == story.replace("\n", "")
 
 
 def test_merged_authored_clip_gets_local_action_timing_without_dialogue_copy():

@@ -212,6 +212,11 @@ CONTENT
 - Do not force dialogue into a visual beat. Protect reaction time, silence and emotional aftermath when they carry the scene.
 - Section headings, part-ending labels, broad time-range labels and planning notes are editorial metadata. Do not turn them into visible action, dialogue, props or spoken narration.
 
+COMPACT STRUCTURED OUTPUT
+- Keep the JSON production-usable but concise so local models can finish it. Use a short title; one or two sentences for story; one sentence for setting; one to three sentences for action; one sentence for ending; one short clause for duration_reason; and one or two sentences for image_prompt.
+- Never repeat the character bible, voice cards, visual-style bible, card descriptions or these instructions inside a segment. Refer to cards only by their exact names in card_selection.
+- Authored dialogue is the exception: preserve every required line verbatim (or faithfully translated when requested), even when that makes a segment longer.
+
 ENSEMBLE GENERATION SAFETY
 - Prefer 1-4 visible named identities in one generation clip. When a source block requires more, subdivide at a causal action boundary so each adjacent clip preserves story order and total duration. Do not omit required characters merely to satisfy this preference.
 - Give every visible character one stable physical instance and a distinct screen region. Characters with similar palette, size or silhouette need different body geometry and signature markers stated in setting/action/image_prompt. Never solve crowding by duplicating, mirroring, blending, replacing or swapping identities.
@@ -3268,6 +3273,19 @@ def planning_chunks(story, limit=4500):
     if current.strip():
         chunks.append(current.strip())
     return chunks or [story]
+
+
+def storyboard_planning_chunks(story):
+    """Bound each local-model storyboard answer to about five clips.
+
+    A 4,500-character part can require roughly ten fully structured segment
+    objects. That JSON regularly exceeds the 4,096-token output ceiling used
+    by local OpenAI-compatible servers even though its input fits the context
+    window. Two thousand source characters keeps ordinary long episodes near
+    five segment objects per call while preserving source order and line
+    breaks through ``planning_chunks``.
+    """
+    return planning_chunks(story, limit=2000)
 
 
 def planning_card_catalog(production):
