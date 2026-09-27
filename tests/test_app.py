@@ -40,6 +40,24 @@ class FakeLM:
         self.loaded = [m for m in self.loaded if m["id"] != instance]
         return {"unloaded": True}
 
+    def complete_json(self, model, system, content, schema, **options):
+        """Return a contract-shaped language pass without touching hardware."""
+        request = json.loads(content)
+        directions = [
+            {"index": item["index"], "text": "Translated direction."}
+            for item in request.get("direction_segments", [])
+        ]
+        dialogue_text = {
+            "Simplified Chinese": "测试对白。",
+            "Traditional Chinese": "測試對白。",
+            "Japanese written only in hiragana; convert kanji and katakana to their contextual hiragana readings": "てすとせりふ。",
+        }.get(request.get("target_dialogue_language"), "Test dialogue.")
+        dialogue = [
+            {"index": item["index"], "text": dialogue_text}
+            for item in request.get("dialogue", [])
+        ]
+        return {"direction_segments": directions, "dialogue": dialogue}
+
 
 def denied(*args, **kwargs):
     raise AssertionError("Unexpected hardware/network operation in mocked integration test")
@@ -646,7 +664,10 @@ def test_assist_updates_only_allowed_field_without_saving(server, monkeypatch):
     response = client.post("/api/ai/assist", headers=auth(module), json={"project": p, "shot_id": p["shots"][0]["id"], "field": "action"})
     assert response.status_code == 200
     expected = copy.deepcopy(p); expected["shots"][0]["action"] = "A revised light movement."
-    assert response.json()["candidate"] == expected
+    candidate = response.json()["candidate"]
+    translation = candidate.pop("h3_prompt_translation")
+    assert translation["target_language"] == p["production_language"]
+    assert candidate == expected
     assert client.get("/api/projects/" + p["id"]).json() == p
 
 

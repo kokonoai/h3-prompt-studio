@@ -1113,6 +1113,153 @@ def character_aliases(production, story=None):
     return aliases
 
 
+def voice_character_aliases(production):
+    """Return unambiguous voice-card labels bound to their character card.
+
+    Local planners sometimes emit a voice ID (``RICK_V1``) or voice-card name
+    in the dialogue speaker field.  Those values describe *how* the owning
+    character sounds; they are never additional visual identities.  Keep this
+    mapping separate from screenplay aliases so voice labels are only accepted
+    where a speaker is being resolved.
+    """
+    cards = production.get("cards", {})
+    characters = {card.get("id"): card for card in cards.get("characters", []) if card.get("id")}
+    owners = {}
+    ambiguous = set()
+    for voice in cards.get("voices", []):
+        character = characters.get(voice.get("character_card_id"))
+        if character is None:
+            continue
+        for value in (voice.get("name"), voice.get("voice_id")):
+            key = str(value or "").strip().casefold()
+            if not key:
+                continue
+            previous = owners.get(key)
+            if previous is not None and previous.get("id") != character.get("id"):
+                ambiguous.add(key)
+            else:
+                owners[key] = character
+    return {key: card for key, card in owners.items() if key not in ambiguous}
+
+
+def segment_identity_repair_reasons(production, segment):
+    """Diagnose only saved clips whose old identity contract is unsafe.
+
+    A renderer-version bump invalidates every clip in every project.  Identity
+    repairs are narrower: voice-card labels used as people, visible speakers
+    omitted from the cast timeline, and already-rendered text-only characters
+    without any visual authority.  Return per-clip reasons so unaffected takes
+    remain ready and selectable.
+    """
+    characters = {card.get("id"): card for card in production.get("cards", {}).get("characters", [])}
+    alias_sets = character_aliases(production)
+    aliases = {
+        alias: characters[card_id]
+        for card_id, values in alias_sets.items()
+        if card_id in characters
+        for alias in values
+    }
+    voice_aliases = voice_character_aliases(production)
+    reasons = []
+    legacy_voice_labels = sorted({
+        str(line.get("speaker", "")).strip()
+        for line in segment.get("dialogue", [])
+        if str(line.get("speaker", "")).strip().casefold() in voice_aliases
+    })
+    if legacy_voice_labels:
+        reasons.append(
+            "本段对白把声线卡 ID 当成了画面角色（" + ", ".join(legacy_voice_labels) +
+            "），请只重新生成本段提示词和视频")
+
+    timeline = segment.get("cast_timeline", {})
+    visible_timeline = {
+        str(name).strip().casefold()
+        for key in ("visible_start", "enters", "exits", "visible_end")
+        for name in timeline.get(key, [])
+        if str(name).strip()
+    }
+    missing_visible_speakers = []
+    for line in segment.get("dialogue", []):
+        if line.get("voiceover"):
+            continue
+        raw = re.split(r"[|｜]", str(line.get("speaker", "")).strip().casefold(), maxsplit=1)[0].strip()
+        character = aliases.get(raw) or voice_aliases.get(raw)
+        canonical = str(character.get("name", "")).strip() if character else ""
+        if canonical and canonical.casefold() not in visible_timeline:
+            missing_visible_speakers.append(canonical)
+    if missing_visible_speakers:
+        reasons.append(
+            "本段可见说话角色未进入角色时间线（" + ", ".join(dict.fromkeys(missing_visible_speakers)) +
+            "），请只重新规划并重做本段")
+
+    has_render = bool(segment.get("selected_video_run_id") or segment.get("last_video_run_id"))
+    has_character_overview = bool(production.get("overview_asset_ids", {}).get("characters"))
+    if has_render and not has_character_overview:
+        selected = {
+            str(name).strip().casefold()
+            for name in segment.get("card_selection", {}).get("characters", [])
+            if str(name).strip()
+        }
+        missing_images = [
+            card.get("name", "") for card in characters.values()
+            if not card.get("asset_ids") and any(alias in selected for alias in
+                                                  alias_sets.get(card.get("id"), set()))
+        ]
+        if missing_images:
+            reasons.append(
+                "本段已生成视频中的可见角色缺少独立参考图或角色总图（" +
+                ", ".join(missing_images) + "）；补图后只重做本段")
+    return reasons
+
+
+def repair_segment_identity_contract(production, segment):
+    """Repair legacy speaker identity locally while rebuilding one clip."""
+    characters = {card.get("id"): card for card in production.get("cards", {}).get("characters", [])}
+    aliases = {
+        alias: characters[card_id]
+        for card_id, values in character_aliases(production).items()
+        if card_id in characters
+        for alias in values
+    }
+    aliases.update(voice_character_aliases(production))
+    timeline = segment.setdefault("cast_timeline", normalise_cast_timeline(None))
+    changes = []
+    for line in segment.get("dialogue", []):
+        raw = re.split(r"[|｜]", str(line.get("speaker", "")).strip().casefold(), maxsplit=1)[0].strip()
+        character = aliases.get(raw)
+        if character is None:
+            continue
+        canonical = str(character.get("name", "")).strip()
+        if not canonical:
+            continue
+        if line.get("speaker") != canonical:
+            changes.append(f"bound speaker {line.get('speaker')} to {canonical}")
+            line["speaker"] = canonical
+        if line.get("voiceover"):
+            if canonical not in timeline["offscreen"]:
+                timeline["offscreen"].append(canonical)
+            continue
+        visible = {
+            str(name).strip().casefold()
+            for key in ("visible_start", "enters", "exits", "visible_end")
+            for name in timeline.get(key, [])
+        }
+        if canonical.casefold() not in visible:
+            timeline["visible_start"].append(canonical)
+            timeline["visible_end"].append(canonical)
+            changes.append(f"restored visible speaker {canonical} to this clip")
+        for key in ("offscreen", "mentioned_only"):
+            timeline[key] = [name for name in timeline[key] if str(name).strip().casefold() != canonical.casefold()]
+        selected = segment.setdefault("card_selection", {}).setdefault("characters", [])
+        if canonical not in selected:
+            selected.append(canonical)
+    if changes:
+        warning = "Single-clip identity repair: " + "; ".join(changes)
+        segment["continuity_warnings"] = list(dict.fromkeys(
+            [*segment.get("continuity_warnings", []), warning]))[:16]
+    return changes
+
+
 def canonicalise_character_mentions(value, production, cards):
     """Render selected screenplay aliases with their canonical card names.
 
@@ -1307,11 +1454,25 @@ def estimate_seconds(text):
     return max(PLANNED_MIN_SECONDS, min(MAX_SECONDS, math.ceil(raw_estimate_seconds(text))))
 
 
+def dialogue_minimum_seconds(segment):
+    """Return a conservative clip floor for exact authored speech.
+
+    Dialogue is immutable source material in production projects.  Giving a
+    35-40 word exchange a nominal ten seconds forces H3 to rush, truncate or
+    invent timing.  Allocate enough of the existing episode budget before
+    distributing spare action time; explicit source timecodes still win.
+    """
+    text = " ".join(str(line.get("text", "")).strip()
+                    for line in segment.get("dialogue", []) if str(line.get("text", "")).strip())
+    return estimate_seconds(text) if text else PLANNED_MIN_SECONDS
+
+
 def fit_planned_durations(segments, target_seconds, language="en", source_story=None):
     """Preserve the plan while making its generated duration match the episode target."""
     result = copy.deepcopy(segments)
     count = len(result)
     target = int(round(target_seconds))
+    requested_target = target
     timed_groups = timed_clip_groups(source_story) if source_story is not None else []
     if timed_groups:
         minimum = len(timed_groups)
@@ -1327,16 +1488,33 @@ def fit_planned_durations(segments, target_seconds, language="en", source_story=
         raise ValueError(
             f"The planned clip count cannot cover the {target}-second episode target with 5-15 second clips.")
     original = [int(item["duration"]) for item in result]
-    preferred = ([group["duration"] for group in timed_groups]
-                 if timed_groups and len(timed_groups) == count else original)
-    durations = [min(MAX_SECONDS, max(PLANNED_MIN_SECONDS, value)) for value in preferred]
+    if timed_groups and len(timed_groups) == count:
+        preferred = [group["duration"] for group in timed_groups]
+        durations = [min(MAX_SECONDS, max(PLANNED_MIN_SECONDS, value)) for value in preferred]
+    else:
+        speech_floors = [dialogue_minimum_seconds(item) for item in result]
+        # Episode length is an editorial target, while authored dialogue is an
+        # exact source constraint.  A modest overrun must not discard an
+        # otherwise valid AI storyboard and replace it with blind text chunks.
+        # Keep every clip within 5-15 seconds and extend only the generated
+        # total to the minimum natural speech budget.
+        target = max(target, sum(speech_floors))
+        preferred = [max(before, floor, estimate_seconds(
+            " ".join(x for x in (str(item.get("action", "")).strip(),
+                                  " ".join(str(line.get("text", "")).strip()
+                                           for line in item.get("dialogue", []))) if x)))
+                     for item, before, floor in zip(result, original, speech_floors)]
+        durations = list(speech_floors)
     difference = target - sum(durations)
     while difference:
         if difference > 0:
             candidates = [index for index, value in enumerate(durations) if value < MAX_SECONDS]
             if not candidates:
                 raise ValueError("The episode target exceeds the available clip duration.")
-            index = min(candidates, key=lambda value: (durations[value], value))
+            # First satisfy the action/dialogue preference, then spread any
+            # remaining time evenly instead of padding the earliest clip.
+            index = max(candidates, key=lambda value: (
+                preferred[value] - durations[value], -durations[value], -value))
             durations[index] += 1
             difference -= 1
         else:
@@ -1352,11 +1530,22 @@ def fit_planned_durations(segments, target_seconds, language="en", source_story=
         "ja": "話全体の目標尺に合わせて{duration}秒に調整（合計{target}秒）",
         "en": "Aligned to {duration}s for the {target}s episode target",
     }
+    expanded_labels = {
+        "zh-CN": "为保留完整对白，本集生成时长由 {requested} 秒自动放宽至 {target} 秒",
+        "zh-TW": "為保留完整對白，本集生成時長由 {requested} 秒自動放寬至 {target} 秒",
+        "ja": "台詞を省略しないため、生成尺を{requested}秒から{target}秒へ自動延長",
+        "en": "Preserved exact dialogue by extending generated duration from {requested}s to {target}s",
+    }
     for item, before, duration in zip(result, original, durations):
         item["duration"] = duration
         if before != duration:
             note = labels.get(language, labels["en"]).format(duration=duration, target=target)
             item["duration_reason"] = (item.get("duration_reason", "").rstrip(".。；; ") + "; " + note).lstrip("; ")
+    if target > requested_target and result:
+        note = expanded_labels.get(language, expanded_labels["en"]).format(
+            requested=requested_target, target=target)
+        result[0]["duration_reason"] = (
+            result[0].get("duration_reason", "").rstrip(".。；; ") + "; " + note).lstrip("; ")
     return result
 
 
@@ -1752,7 +1941,9 @@ class ProductionManager:
         upstream_changed = False
         for segment in result["segments"]:
             reasons = []
-            if segment["project_id"] and segment["source_hash"] != segment_hash(segment):
+            source_changed = bool(segment["project_id"] and
+                                  segment["source_hash"] != segment_hash(segment))
+            if source_changed:
                 reasons.append("分镜内容或时长在 H3 工程创建后发生了变化")
             if segment["project_id"] and segment.get("context_hash") != current_context_hash:
                 reasons.append("全片约束或资产卡已变化")
@@ -1762,6 +1953,8 @@ class ProductionManager:
             if (segment["project_id"] and
                     segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION):
                 reasons.append("角色入场、退场与结尾在场规则已升级，请先重新规划本集分镜")
+            if segment["project_id"]:
+                reasons.extend(segment_identity_repair_reasons(result, segment))
             own_change = bool(reasons)
             if own_change:
                 segment["status"] = "stale"
@@ -1769,7 +1962,11 @@ class ProductionManager:
             if upstream_changed and segment["project_id"] and not own_change:
                 segment["status"] = "stale"
                 segment["stale_reasons"] = ["前序分镜已变化，人物、道具或运动连续性需要重新确认"]
-            upstream_changed = upstream_changed or own_change
+            # A changed story beat can alter downstream blocking.  A local
+            # prompt/reference repair cannot, so never invalidate good later
+            # clips merely because an earlier clip used a voice ID or lacked a
+            # reference image.
+            upstream_changed = upstream_changed or source_changed
         return result
 
     def save(self, value):
@@ -2158,6 +2355,7 @@ class ProductionManager:
             alias: card for card in current["cards"]["characters"]
             for alias in alias_sets.get(card["id"], {card["name"].strip().casefold()})
         }
+        character_by_voice_alias = voice_character_aliases(current)
         planned = copy.deepcopy(planned)
         if any(group.get("dialogue_parse_failed") for group in locked_groups):
             raise ValueError(
@@ -2166,7 +2364,7 @@ class ProductionManager:
 
         def speaker_key(value):
             value = re.split(r"[|｜]", str(value or "").strip().casefold(), maxsplit=1)[0].strip()
-            card = character_by_alias.get(value)
+            card = character_by_alias.get(value) or character_by_voice_alias.get(value)
             return card["name"].strip().casefold() if card else value
 
         def translated_dialogue(item, locked):
@@ -2270,7 +2468,9 @@ class ProductionManager:
                     # vertical bar. It is not part of the character's name.
                     speaker_name = re.split(r"[|｜]", speaker_key, maxsplit=1)[0].strip()
                     character = (character_by_alias.get(speaker_name) or character_by_name.get(speaker_name) or
-                                 character_by_alias.get(speaker_key) or character_by_name.get(speaker_key))
+                                 character_by_voice_alias.get(speaker_name) or
+                                 character_by_alias.get(speaker_key) or character_by_name.get(speaker_key) or
+                                 character_by_voice_alias.get(speaker_key))
                     if character:
                         # Store the reusable canonical name so voice cards and
                         # prompt subjects remain bound in every UI language.
@@ -2313,6 +2513,21 @@ class ProductionManager:
                         timeline["visible_end"].append(speaker_name)
 
                 entering = {name.casefold() for name in timeline["enters"]}
+                visible_speaker_keys = {name.casefold() for name in visible_speaker_names}
+                # If the authored current clip visibly stages a speaking
+                # character after an earlier story departure, the present-tense
+                # performance is an implicit re-entry.  Do not let a missing
+                # planner ``enters`` token erase the speaker and then emit the
+                # contradictory pair "visible Subject" / "show exactly none".
+                for name in temporal_visible:
+                    folded = name.casefold()
+                    if folded in departed_characters and folded in visible_speaker_keys:
+                        if name not in timeline["enters"]:
+                            timeline["enters"].append(name)
+                            segment_corrections.append(
+                                f"Clip {index + 1}: restored visible speaker {name} as an implicit re-entry.")
+                        entering.add(folded)
+                        departed_characters.discard(folded)
                 departed_characters.difference_update(entering)
                 illegal = [name for name in temporal_visible
                            if name.casefold() in departed_characters and name.casefold() not in entering]
@@ -2396,6 +2611,9 @@ class ProductionManager:
         if segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION:
             raise ValueError(
                 "This storyboard predates temporal cast tracking. Replan this episode before rebuilding its video prompts.")
+        # Rebuilding one stale clip is sufficient for legacy voice-ID and
+        # visible-speaker errors. Keep every unaffected prompt/take untouched.
+        repair_segment_identity_contract(production, segment)
         source = copy.deepcopy(self.load_project(production["source_project_id"]))
         existing_id = segment.get("project_id")
         try:
@@ -2491,12 +2709,20 @@ class ProductionManager:
         base["style"] = {"genre": continuity_visual_lock(production, relevant_cards),
                          "vibe": "", "lighting": "", "color": "", "notes": ""}
         names = {s["name"].strip().casefold(): s for s in base["subjects"]}
+        character_by_id = {card["id"]: card for card in production["cards"]["characters"]}
+        character_by_speaker_alias = voice_character_aliases(production)
+        for card_id, aliases in character_aliases(production).items():
+            character = character_by_id.get(card_id)
+            if character:
+                for alias in aliases:
+                    character_by_speaker_alias.setdefault(alias, character)
         lines, visible, offscreen, selected_voices, selected_voice_ids = [], [], [], [], set()
         collective_subjects = []
         selected_names = {card["name"].strip().casefold() for card in relevant_cards["characters"]}
         for line in segment["dialogue"]:
             key = line["speaker"].strip().casefold()
-            subject = names.get(key)
+            character = character_by_speaker_alias.get(key)
+            subject = names.get(character["name"].strip().casefold()) if character else names.get(key)
             is_collective = (collective_speaker(line["speaker"]) and not line["voiceover"]
                              and key not in selected_names)
             if subject is None:
@@ -2564,6 +2790,10 @@ class ProductionManager:
             f"Custom visual style: {custom_style}" if custom_style else "",
             f"Visual style bible: {distinct_style_bible}" if distinct_style_bible else "",
             "STYLE PRIORITY: analysed style-card images override custom style text; custom style text overrides the named preset. Transfer visual treatment only, never depicted subjects or scene content.",
+            ("TEXT-ONLY VISIBLE IDENTITY WARNING: these selected characters have no dedicated image or approved character overview binding: "
+             + ", ".join(card_selection.get("missing_visual_identity_names", []))
+             + ". Their written cards remain authoritative, but stable appearance across separately rendered clips is not guaranteed; add a character image or approved overview before final rendering."
+             if card_selection.get("missing_visual_identity_names") else ""),
             f"Long-form narrative style: {production.get('narrative_style', 'cinematic')}.",
             f"Custom narrative style: {production.get('narrative_style_custom', '')}" if production.get("narrative_style_custom") else "",
             f"Narrative notes: {production.get('narrative_notes', '')}" if production.get("narrative_notes") else "",
@@ -2739,8 +2969,11 @@ class ProductionManager:
             ("title", "story", "setting", "action", "ending", "image_prompt")).casefold()
         speakers = {line.get("speaker", "").strip().casefold() for line in segment.get("dialogue", [])}
         alias_sets = character_aliases(production)
+        voice_aliases = voice_character_aliases(production)
+        voice_character_ids = {card["id"] for alias, card in voice_aliases.items() if alias in speakers}
         speaker_cards = {card["id"] for card in production["cards"]["characters"]
-                         if any(alias in speakers for alias in alias_sets.get(card["id"], set()))}
+                         if (card["id"] in voice_character_ids or
+                             any(alias in speakers for alias in alias_sets.get(card["id"], set())))}
         if segment.get("card_selection_source") == "local_ai":
             selection = segment.get("card_selection", {})
             result = {}
@@ -2896,6 +3129,11 @@ class ProductionManager:
             subject["asset_ids"] = [asset_id for asset_id in subject["asset_ids"] if asset_id not in card_asset_ids]
 
         relevant = self._relevant_cards(production, segment)
+        missing_visual_identity_names = []
+        character_overview = production["overview_asset_ids"].get("characters")
+        if not character_overview:
+            missing_visual_identity_names = [card["name"] for card in relevant["characters"]
+                                             if not card.get("asset_ids")]
         active_subject_ids = [subject_for_card[card["id"]] for card in relevant["characters"]]
         if production.get("source_mode") in ("ref2va", "t2va"):
             active_subject_id_set = set(active_subject_ids)
@@ -3058,6 +3296,7 @@ class ProductionManager:
         return {"subject_ids": active_subject_ids, "image_asset_ids": selected_images,
                 "audio_asset_ids": selected_audio, "overview_kinds": overview_kinds,
                 "overview_sources": overview_sources,
+                "missing_visual_identity_names": missing_visual_identity_names,
                 "style_context_asset_ids": style_context,
                 "voice_authority": "audio_primary" if selected_audio else "text_only",
                 "image_limit": 9, "audio_limit": 3,

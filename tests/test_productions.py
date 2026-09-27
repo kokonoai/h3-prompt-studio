@@ -12,7 +12,8 @@ from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, 
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  production_schema_for_story, render_character_identity,
-                                 scoped_character_bible, script_dialogue, timed_clip_groups)
+                                 scoped_character_bible, script_dialogue, segment_hash,
+                                 timed_clip_groups)
 from backend.projects import merge_plan, new_project, shot
 from backend.video_workflows import VideoWorkflowManager
 
@@ -222,6 +223,39 @@ def test_thirty_second_episode_targets_about_three_five_to_fifteen_second_clips(
     assert len(clips) == 3
     assert sum(clip["duration"] for clip in clips) == 30
     assert all(5 <= clip["duration"] <= 15 for clip in clips)
+
+
+def test_duration_fitting_gives_dense_exact_dialogue_more_of_fixed_episode_budget():
+    long_line = " ".join(f"word{index}" for index in range(32))
+    clips = [
+        {"duration": 10, "action": "A delivers the report.",
+         "dialogue": [{"speaker": "A", "text": long_line}]},
+        {"duration": 10, "action": "B crosses the room.", "dialogue": []},
+        {"duration": 10, "action": "The light fades.", "dialogue": []},
+    ]
+
+    fitted = fit_planned_durations(clips, 30, "en")
+
+    assert sum(item["duration"] for item in fitted) == 30
+    assert fitted[0]["duration"] == 15
+    assert all(5 <= item["duration"] <= 15 for item in fitted)
+
+
+def test_dialogue_overrun_keeps_ai_storyboard_and_relaxes_episode_target():
+    clips = [{
+        "title": f"Distinct beat {index}", "duration": 10,
+        "action": f"Character {index} completes a distinct action.",
+        "duration_reason": "AI planned dramatic beat",
+        "dialogue": [{"speaker": "A", "text": " ".join(
+            f"word{word}" for word in range(22))}],
+    } for index in range(3)]
+
+    fitted = fit_planned_durations(clips, 30, "en")
+
+    assert [item["title"] for item in fitted] == ["Distinct beat 0", "Distinct beat 1", "Distinct beat 2"]
+    assert sum(item["duration"] for item in fitted) == 33
+    assert all(item["duration"] == 11 for item in fitted)
+    assert "extending generated duration from 30s to 33s" in fitted[0]["duration_reason"]
 
 
 def test_storyboard_planning_chunks_keep_long_local_answers_bounded():
@@ -780,6 +814,42 @@ def test_materialise_keeps_silent_selected_cast_visible_and_voiceover_offscreen(
     assert [names[ident] for ident in scene["offscreen_subject_ids"]] == ["C"]
 
 
+def test_voice_id_speaker_resolves_to_owner_without_creating_visible_duplicate(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    ree = _card("Ree", [_image(store_asset, "Ree", "purple")["id"]])
+    voice = _card("Ree voice", character_card_id=ree["id"], voice_id="REE_V1",
+                  language="en", pace="clipped")
+    ree["voice_card_id"] = voice["id"]
+    production = manager.create({"source_project": source, "brief": "Ree reports an alert."})
+    production["cards"]["characters"] = [ree]
+    production["cards"]["voices"] = [voice]
+    production = manager.save(production)
+    planned = [{
+        "title": "Alert", "story": "Ree reports an alert.", "setting": "plaza",
+        "action": "Ree raises one hand.", "ending": "Ree remains visible.",
+        "duration": 5, "duration_reason": "one short line", "image_prompt": "Ree in the plaza",
+        "dialogue": [{"speaker": "REE_V1", "text": "Incoming beacon.",
+                      "language": "English", "voiceover": False}],
+        "card_selection": {"characters": ["Ree"], "voices": ["Ree voice"]},
+    }]
+
+    production = manager.apply_plan(production["id"], planned, "local_ai")
+    segment = production["segments"][0]
+    assert segment["dialogue"][0]["speaker"] == "Ree"
+
+    # Old saved productions can still contain the voice ID. Rebuilding them
+    # must repair the detached render project without changing the card library.
+    segment["dialogue"][0]["speaker"] = "REE_V1"
+    production = manager.save(production)
+    project = manager.materialise(production["id"], segment["id"])["project"]
+    assert [subject["name"] for subject in project["subjects"]] == ["Ree"]
+    scene = project["shots"][0]
+    assert scene["visible_subject_ids"] == [project["subjects"][0]["id"]]
+    assert scene["dialogue"][0]["speaker_id"] == project["subjects"][0]["id"]
+    assert all(subject["description"] != "Production dialogue speaker; add identity references if visible."
+               for subject in project["subjects"])
+
+
 def test_materialise_compiles_all_as_visible_ensemble_not_extra_character(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "A and B answer together.", "language": "en"})
@@ -938,6 +1008,8 @@ def test_text_only_clip_falls_back_from_ref2va_without_using_style_image_as_subj
     assert project["comfy_render"]["workflow_profile_id"] == "builtin"
     assert project["comfy_render"]["quality"] == "fast"
     assert project["production_link"]["reference_strategy"]["effective_mode"] == "t2va"
+    assert project["production_link"]["reference_strategy"]["missing_visual_identity_names"] == ["Hero"]
+    assert "TEXT-ONLY VISIBLE IDENTITY WARNING" in project["production_planning_context"]
     assert [(asset["id"], asset["role"]) for asset in project["assets"]] == [
         (style_image["id"], "context")]
     compiled = compile_project(project)
@@ -963,6 +1035,7 @@ def test_text_only_source_promotes_clip_to_ref2va_when_selected_card_has_an_imag
 
     assert project["mode"] == "ref2va"
     assert project["production_link"]["reference_strategy"]["effective_mode"] == "ref2va"
+    assert project["production_link"]["reference_strategy"]["missing_visual_identity_names"] == []
     assert [asset["id"] for asset in project["assets"] if asset.get("role") == "reference_image"] == [
         hero_image["id"]]
     compiled = compile_project(project)
@@ -1255,6 +1328,52 @@ def test_old_prepared_reference_strategy_is_marked_stale_without_changing_cards(
     assert checked["cards"] == original_cards
     assert checked["segments"][0]["status"] == "stale"
     assert any("参考图分配规则已升级" in reason for reason in checked["segments"][0]["stale_reasons"])
+
+
+def test_identity_repair_marks_only_the_affected_saved_clip_stale(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    hero = _card("Hero", [_image(store_asset, "hero", "red")["id"]])
+    friend = _card("Friend", [_image(store_asset, "friend", "blue")["id"]])
+    voice = _card("Hero voice", character_card_id=hero["id"], voice_id="HERO_V1",
+                  language="en", pace="steady")
+    hero["voice_card_id"] = voice["id"]
+    production = manager.create({"source_project": source, "brief": "Hero speaks, then Friend waits."})
+    production["cards"]["characters"] = [hero, friend]
+    production["cards"]["voices"] = [voice]
+    production = manager.save(production)
+    hero_timeline = {"visible_start": ["Hero"], "visible_end": ["Hero"], "enters": [],
+                     "exits": [], "offscreen": [], "mentioned_only": []}
+    friend_timeline = {"visible_start": ["Friend"], "visible_end": ["Friend"], "enters": [],
+                       "exits": [], "offscreen": [], "mentioned_only": []}
+    first = _planned_clip("Hero reports", ["Hero"], hero_timeline)
+    first["dialogue"] = [{"speaker": "Hero", "text": "Ready.",
+                           "language": "English", "voiceover": False}]
+    production = manager.apply_plan(production["id"], [
+        first, _planned_clip("Friend waits", ["Friend"], friend_timeline),
+    ], "local_ai")
+    for segment in list(production["segments"]):
+        production = manager.materialise(production["id"], segment["id"])["production"]
+
+    production["segments"][0]["dialogue"][0]["speaker"] = "HERO_V1"
+    production["segments"][0]["cast_timeline"] = {
+        "visible_start": [], "visible_end": [], "enters": [], "exits": [],
+        "offscreen": ["Friend"], "mentioned_only": []}
+    production["segments"][0]["source_hash"] = segment_hash(production["segments"][0])
+    checked = manager.save(production)
+
+    assert checked["segments"][0]["status"] == "stale"
+    assert any("声线卡 ID" in reason for reason in checked["segments"][0]["stale_reasons"])
+    assert any("角色时间线" in reason for reason in checked["segments"][0]["stale_reasons"])
+    assert checked["segments"][1]["status"] == "ready"
+    assert checked["segments"][1]["stale_reasons"] == []
+
+    repaired = manager.materialise(checked["id"], checked["segments"][0]["id"])["production"]
+    repaired_first = repaired["segments"][0]
+    assert repaired_first["dialogue"][0]["speaker"] == "Hero"
+    assert repaired_first["cast_timeline"]["visible_start"] == ["Hero"]
+    assert repaired_first["cast_timeline"]["visible_end"] == ["Hero"]
+    assert repaired_first["status"] == "ready"
+    assert repaired["segments"][1]["status"] == "ready"
 
 
 def test_character_name_does_not_fuzzily_select_all_owned_props(tmp_path):
@@ -1604,6 +1723,40 @@ def test_temporal_cast_guard_allows_an_explicit_reentry(tmp_path):
     assert returned["card_selection"]["characters"] == ["Hero", "Guard"]
     assert returned["cast_timeline"]["enters"] == ["Guard"]
     assert returned["continuity_warnings"] == []
+
+
+def test_temporal_cast_guard_restores_visible_speaker_as_implicit_reentry(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    hero, guard = _card("Hero"), _card("Guard")
+    guard_voice = _card("Guard voice", character_card_id=guard["id"], voice_id="GUARD_V1",
+                        language="en", pace="steady")
+    guard["voice_card_id"] = guard_voice["id"]
+    production = manager.create({"source_project": source, "brief": "Guard leaves, then speaks after returning."})
+    production["cards"]["characters"] = [hero, guard]
+    production["cards"]["voices"] = [guard_voice]
+    production = manager.save(production)
+    empty = {key: [] for key in
+             ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")}
+    departure = copy.deepcopy(empty)
+    departure.update(visible_start=["Hero", "Guard"], visible_end=["Hero"], exits=["Guard"])
+    mistaken_return = copy.deepcopy(empty)
+    mistaken_return.update(visible_start=["Hero", "Guard"], visible_end=["Hero", "Guard"])
+    second = _planned_clip("Guard returns and reports", ["Hero", "Guard"], mistaken_return)
+    second["dialogue"] = [{"speaker": "GUARD_V1", "text": "I am back.",
+                           "language": "English", "voiceover": False}]
+
+    production = manager.apply_plan(production["id"], [
+        _planned_clip("Guard departs the story", ["Hero", "Guard"], departure, "state_change"),
+        second,
+    ], "local_ai")
+
+    returned = production["segments"][1]
+    assert returned["dialogue"][0]["speaker"] == "Guard"
+    assert returned["cast_timeline"]["enters"] == ["Guard"]
+    assert returned["cast_timeline"]["visible_end"] == ["Hero", "Guard"]
+    assert any("implicit re-entry" in item for item in returned["continuity_warnings"])
+    project = manager.materialise(production["id"], returned["id"])["project"]
+    assert "FINAL-FRAME CAST LOCK: show exactly Hero, Guard" in project["shots"][0]["final_state"]
 
 
 def test_temporal_cast_guard_does_not_make_a_camera_exit_permanent(tmp_path):
