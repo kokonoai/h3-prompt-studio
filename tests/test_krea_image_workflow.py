@@ -37,3 +37,16 @@ def test_krea_uses_supplied_sampler_but_no_style_lora_or_preview_only_output():
     assert graph['7']['inputs']['sampler_name'] == 'er_sde'
     assert graph['9']['class_type'] == 'SaveImage'
     assert not any(node['class_type'] in ('LoraLoaderModelOnly', 'PreviewImage') for node in graph.values())
+
+
+def test_krea_completed_image_is_imported_from_its_own_save_node(setup):
+    manager, server, _, imports, *_ = setup
+    install_krea(server)
+    ident = uid()
+    manager.submit(ident, spec(model=KREA_MODEL))
+    assert manager.process(ident)['status'] == 'queued'
+    assert server.posts[0]['prompt']['9']['class_type'] == 'SaveImage'
+    server.finish(ident, output_node='9')
+    result = manager.refresh(ident)
+    assert result['status'] == 'succeeded'
+    assert len(imports) == 1

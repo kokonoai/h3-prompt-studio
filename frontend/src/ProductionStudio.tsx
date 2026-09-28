@@ -1265,7 +1265,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         const result=await api("/productions/"+current.id+"/cards/"+kind+"/"+card.id+"/image/attach",{run_id:runId}) as {production:Production};
         setProduction(result.production);setDraft(result.production);return result.production;
       }
-      if(["failed","cancelled","paused"].includes(state.status))throw new Error(state.error||"Local image generation stopped.");
+      if(["failed","cancelled","paused","uncertain"].includes(state.status))throw new Error(state.error||"Local image generation needs attention.");
       await sleep(1500);
     }
     throw new Error(t("图片仍在 ComfyUI 运行，请稍后刷新。","The image is still running in ComfyUI; refresh later.","画像はComfyUIで処理中です。後で更新してください。","圖片仍在 ComfyUI 執行，請稍後重新整理。"));

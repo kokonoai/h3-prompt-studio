@@ -554,7 +554,17 @@ class AssetRunManager:
             asset = json.loads(asset_path.read_text(encoding='utf-8'))
         else:
             outputs = entry.get('outputs', {})
-            result = outputs.get('10', {}) if isinstance(outputs, dict) else {}
+            graph_path = folder / 'graph.json'
+            try:
+                graph = json.loads(graph_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AssetRunError('The saved image workflow could not be verified.') from exc
+            save_nodes = [str(node_id) for node_id, node in graph.items()
+                          if isinstance(node, dict) and node.get('class_type') == 'SaveImage'] \
+                if isinstance(graph, dict) else []
+            if len(save_nodes) != 1:
+                raise AssetRunError('The saved image workflow must contain exactly one owned SaveImage node.')
+            result = outputs.get(save_nodes[0], {}) if isinstance(outputs, dict) else {}
             images = result.get('images') if isinstance(result, dict) else None
             if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
                 raise AssetRunError('The image job did not return exactly one owned SaveImage result.')

@@ -77,11 +77,12 @@ class Server:
             return httpx.Response(200, json={'prompt_id': payload['prompt_id']})
         raise AssertionError(f'Unexpected network operation: {request.method} {path}')
 
-    def finish(self, ident, **changes):
+    def finish(self, ident, output_node='10', **changes):
         self.pending[:] = [entry for entry in self.pending if entry[1] != ident]
         self.running[:] = [entry for entry in self.running if entry[1] != ident]
         image = {'filename': 'image_00001_.png', 'subfolder': f'h3_prompt_studio/assets/{ident}', 'type': 'output', **changes}
-        self.history[ident] = {'status': {'completed': True, 'status_str': 'success'}, 'outputs': {'10': {'images': [image]}}}
+        self.history[ident] = {'status': {'completed': True, 'status_str': 'success'},
+                               'outputs': {output_node: {'images': [image]}}}
 
 
 class Resources:
