@@ -2077,9 +2077,11 @@ class ProductionManager:
                 reasons.append("分镜内容或时长在 H3 工程创建后发生了变化")
             if segment["project_id"] and segment.get("context_hash") != current_context_hash:
                 reasons.append("全片约束或资产卡已变化")
-            if (segment["project_id"] and
-                    segment.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION):
-                reasons.append("参考图分配规则已升级，请重新生成本段提示词后再生成视频")
+            # A reference allocator upgrade changes future renders, but it does
+            # not invalidate an already adopted video. Keep the saved take
+            # available and repair the one clip lazily when the user asks for a
+            # new render; server-side admission still prevents submitting the
+            # outdated project snapshot unchanged.
             if (segment["project_id"] and
                     segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION):
                 reasons.append("角色入场、退场与结尾在场规则已升级，请先重新规划本集分镜")
@@ -2089,6 +2091,12 @@ class ProductionManager:
             if own_change:
                 segment["status"] = "stale"
                 segment["stale_reasons"] = reasons
+            elif segment["project_id"] and segment.get("status") == "stale":
+                # Staleness is derived from the current production contract,
+                # not a permanent flag. This also clears legacy global
+                # reference-version warnings after an upgrade is installed.
+                segment["status"] = "ready"
+                segment["stale_reasons"] = []
             if upstream_changed and segment["project_id"] and not own_change:
                 segment["status"] = "stale"
                 segment["stale_reasons"] = ["前序分镜已变化，人物、道具或运动连续性需要重新确认"]
@@ -3550,6 +3558,7 @@ class ProductionManager:
             source["assets"].append(attached)
         check_project(source)
         self.save_project(source)
+        self._rebase_unrelated_card_contexts(production, kind, card)
         return {"production": self.save(production), "asset": asset}
 
     def attach_generated_card_asset(self, ident, kind, card_id, asset):
@@ -3569,7 +3578,31 @@ class ProductionManager:
         asset_id = safe_id(asset.get("id"))
         card["asset_ids"] = [asset_id] + [value for value in card["asset_ids"] if value != asset_id]
         card["asset_ids"] = card["asset_ids"][:24]
+        self._rebase_unrelated_card_contexts(production, kind, card)
         return {"production": self.save(production), "asset": asset}
+
+    def _rebase_unrelated_card_contexts(self, production, kind, card):
+        """Keep an edited card local to clips that actually select it.
+
+        The legacy context hash contains the complete library, so adding one
+        character image would otherwise mark every prepared clip stale. Rebase
+        unrelated clips to the new library hash and leave selected clips on
+        their prior hash so validation asks to rebuild only those clips.
+        """
+        current_hash = production_context_hash(production)
+        keys = {str(card.get("id", "")).strip().casefold(),
+                str(card.get("name", "")).strip().casefold()}
+        keys.discard("")
+        for segment in production.get("segments", []):
+            if not segment.get("project_id"):
+                continue
+            selected = {
+                str(value).strip().casefold()
+                for value in segment.get("card_selection", {}).get(kind, [])
+                if str(value).strip()
+            }
+            if not keys.intersection(selected):
+                segment["context_hash"] = current_hash
 
     def auto_keyframe_suggestions(self, ident, limit=3):
         """Suggest sparse environment plates; never generate or upload here."""

@@ -1476,7 +1476,9 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     try{return await submit();}
     catch(e){
       const reason=(e as Error).message;
-      if(!reason.includes("directions inherited from an older clip"))throw e;
+      if(!reason.includes("directions inherited from an older clip")&&
+          !reason.includes("outdated character-reference assignment")&&
+          !reason.includes("production clip is stale"))throw e;
       setBusy(t("第 "+target.index+" 段安全检查：自动重建提示词","Clip "+target.index+" safety check: rebuilding its prompt","クリップ "+target.index+" の安全確認：プロンプトを再作成","第 "+target.index+" 段安全檢查：自動重建提示詞"));
       const repaired=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as {production:Production};
       current=repaired.production;setProduction(current);setDraft(current);

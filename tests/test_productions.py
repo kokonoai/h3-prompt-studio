@@ -1417,7 +1417,7 @@ def test_cast_parenthetical_state_is_not_registered_as_a_character_alias(tmp_pat
     assert "徽章形态" not in aliases
 
 
-def test_old_prepared_reference_strategy_is_marked_stale_without_changing_cards(tmp_path):
+def test_old_prepared_reference_strategy_keeps_adopted_take_ready(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "A enters."})
     character = _card("A", [_image(store_asset, "a", "red")["id"]])
@@ -1434,8 +1434,35 @@ def test_old_prepared_reference_strategy_is_marked_stale_without_changing_cards(
     checked = manager.validate(production)
 
     assert checked["cards"] == original_cards
-    assert checked["segments"][0]["status"] == "stale"
-    assert any("参考图分配规则已升级" in reason for reason in checked["segments"][0]["stale_reasons"])
+    assert checked["segments"][0]["status"] == "ready"
+    assert checked["segments"][0]["stale_reasons"] == []
+
+
+def test_generated_card_image_marks_only_clips_using_that_card_stale(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "Hero waits. Friend enters."})
+    hero = _card("Hero")
+    friend = _card("Friend", [_image(store_asset, "friend", "blue")["id"]])
+    production["cards"]["characters"] = [hero, friend]
+    production = manager.save(production)
+    timeline = lambda name: {"visible_start": [name], "visible_end": [name], "enters": [],
+                             "exits": [], "offscreen": [], "mentioned_only": []}
+    production = manager.apply_plan(production["id"], [
+        _planned_clip("Hero waits", ["Hero"], timeline("Hero")),
+        _planned_clip("Friend enters", ["Friend"], timeline("Friend")),
+    ], "local_ai")
+    for segment in list(production["segments"]):
+        production = manager.materialise(production["id"], segment["id"])["production"]
+
+    generated = _image(store_asset, "hero-generated", "red")
+    changed = manager.attach_generated_card_asset(
+        production["id"], "characters", hero["id"], generated)["production"]
+
+    assert changed["segments"][0]["status"] == "stale"
+    assert any("全片约束或资产卡已变化" in reason
+               for reason in changed["segments"][0]["stale_reasons"])
+    assert changed["segments"][1]["status"] == "ready"
+    assert changed["segments"][1]["stale_reasons"] == []
 
 
 def test_identity_repair_marks_only_the_affected_saved_clip_stale(tmp_path):
