@@ -1261,6 +1261,30 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     }
     throw new Error(t("图片仍在 ComfyUI 运行，请稍后刷新。","The image is still running in ComfyUI; refresh later.","画像はComfyUIで処理中です。後で更新してください。","圖片仍在 ComfyUI 執行，請稍後重新整理。"));
   };
+  const ensureSegmentCharacterImages=async(current:Production,segmentId:string):Promise<Production>=>{
+    const target=current.segments.find(item=>item.id===segmentId);
+    if(!target)return current;
+    const selectedNames=new Set(target.card_selection.characters
+      .map(name=>name.trim().toLocaleLowerCase()).filter(Boolean));
+    const missing=current.cards.characters.filter(card=>
+      !card.asset_ids.length&&selectedNames.has(card.name.trim().toLocaleLowerCase()));
+    if(!missing.length)return current;
+    if(!models.includes(imageModel))throw new Error(t(
+      "第 "+target.index+" 段的出场角色缺少身份图（"+missing.map(card=>card.name).join("、")+"），且本地生图模型不可用。请在设置连接生图工作流，或先到角色资料库上传/生成角色图。",
+      "Clip "+target.index+" has visible characters without identity images ("+missing.map(card=>card.name).join(", ")+") and the local image model is unavailable. Connect the image workflow in Settings, or upload/generate those character images first.",
+      "クリップ "+target.index+" の登場キャラクターに参照画像がありません（"+missing.map(card=>card.name).join("、")+"）。ローカル画像モデルも利用できません。設定で画像ワークフローを接続するか、先にキャラクター画像を追加してください。",
+      "第 "+target.index+" 段的出場角色缺少身份圖（"+missing.map(card=>card.name).join("、")+"），且本地生圖模型不可用。請在設定連接生圖工作流，或先到角色資料庫上傳/生成角色圖。"));
+    for(let i=0;i<missing.length;i++){
+      const card=current.cards.characters.find(item=>item.id===missing[i].id)||missing[i];
+      setBusy(t(
+        "第 "+target.index+" 段 · 补角色身份图 "+(i+1)+"/"+missing.length,
+        "Clip "+target.index+" · character identity "+(i+1)+"/"+missing.length,
+        "クリップ "+target.index+"・キャラクター画像 "+(i+1)+"/"+missing.length,
+        "第 "+target.index+" 段 · 補角色身份圖 "+(i+1)+"/"+missing.length));
+      current=await produceCardImage(current,"characters",card);
+    }
+    return current;
+  };
   const generateCardImage=(kind:CardKind,card:ProductionCard)=>run(t("生成参考图","Generate reference image","参照画像を生成","生成參考圖"),async()=>{
     const current=await save();await produceCardImage(current,kind,card);
     setNotice(t("新图已绑定；旧图仍保留，可逐张移除。","New image attached; previous images remain available for removal.","新しい画像を追加しました。以前の画像は個別に外せます。","新圖已綁定；舊圖仍保留，可逐張移除。"));
@@ -1441,7 +1465,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   },[production?.task_state,production?.auto_merge,outputs?.all_ready,outputs?.active_jobs,outputs?.uncertain_jobs,outputs?.final_ready,outputs?.signature,merging,bulkAction]);
 
   const rebuildPrompt=(segment:Segment,useAI=true)=>run(useAI?t("用本地 LLM 重做视频提示词","Rebuild video prompt with local LLM","ローカルLLMで映像プロンプトを再作成","用本地 LLM 重做影片提示詞"):t("按当前结构重建视频提示词","Recompile current video prompt","現在の構造から映像プロンプトを再構築","按目前結構重建影片提示詞"),async()=>{
-    const saved=await save();
+    let saved=await save();
+    saved=await ensureSegmentCharacterImages(saved,segment.id);
     const result=await api("/productions/"+saved.id+"/segments/"+segment.id+"/prompt",{use_ai:useAI},undefined,"POST",{timeoutMs:900000}) as any;
     setProduction(result.production);setDraft(result.production);await refreshList();
     setNotice(t("第 "+segment.index+" 段视频提示词已更新，用时 "+formatSeconds(result.seconds)+"。","Clip "+segment.index+" video prompt updated in "+formatSeconds(result.seconds)+".","クリップ "+segment.index+" の映像プロンプトを "+formatSeconds(result.seconds)+" で更新しました。","第 "+segment.index+" 段影片提示詞已更新，用時 "+formatSeconds(result.seconds)+"。"));
@@ -1468,11 +1493,13 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   };
   const generateVideo=(segment:Segment)=>run(t("提交第 "+segment.index+" 段视频","Submit clip "+segment.index+" video","クリップ "+segment.index+" の映像を送信","提交第 "+segment.index+" 段影片"),async()=>{
     let saved=await save();
-    const target=saved.segments.find(item=>item.id===segment.id)||segment;
+    saved=await ensureSegmentCharacterImages(saved,segment.id);
+    let target=saved.segments.find(item=>item.id===segment.id)||segment;
     if(segmentNeedsVideoPrompt(target)){
       setBusy(t("先更新本段视频提示词","Updating this clip's prompt first","先にこのクリップのプロンプトを更新","先更新本段影片提示詞"));
       const prompted=await api("/productions/"+saved.id+"/segments/"+segment.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as {production:Production};
       saved=prompted.production;setProduction(saved);setDraft(saved);
+      target=saved.segments.find(item=>item.id===segment.id)||target;
     }
     setBusy(t("提交第 "+segment.index+" 段视频","Submit clip "+segment.index+" video","クリップ "+segment.index+" の映像を送信","提交第 "+segment.index+" 段影片"));
     const result=await submitVideoWithPromptRepair(saved,target);
