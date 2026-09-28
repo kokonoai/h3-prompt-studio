@@ -1071,8 +1071,17 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const refreshList=async()=>setItems(await api("/productions"));
   const refreshCollections=async()=>setCollections(await api("/card-collections"));
   const refreshVideoWorkflows=async()=>setVideoWorkflows(await api("/video-workflows"));
-  const refreshImageModels=async()=>{const x=await api("/assets/generators") as any;setImageInventory(x);setModels(x.models||[]);
-    setImageModel(current=>x.models?.includes(current)?current:(x.default_model||current));};
+  const refreshImageModels=async()=>{const x=await api("/assets/generators") as any;const available:string[]=x.models||[];
+    const selected=available.includes(imageModel)?imageModel:(available.includes(x.default_model)?x.default_model:(available[0]||imageModel));
+    setImageInventory(x);setModels(available);setImageModel(selected);
+    if(available.includes(selected))localStorage.setItem("h3.production.imageModel",selected);
+    return {inventory:x,models:available,model:selected};};
+  const resolveImageModel=async()=>{
+    if(models.includes(imageModel))return imageModel;
+    const refreshed=await refreshImageModels();
+    if(refreshed.models.includes(refreshed.model))return refreshed.model;
+    throw new Error(t("没有检测到可用的本地生图工作流。请确认 ComfyUI 已启动且模型完整。","No usable local image workflow was detected. Make sure ComfyUI is running and the required models are installed.","利用可能なローカル画像ワークフローが見つかりません。ComfyUIの起動とモデルを確認してください。","沒有偵測到可用的本地生圖工作流。請確認 ComfyUI 已啟動且模型完整。"));
+  };
   const chooseImageModel=(value:string)=>{setImageModel(value);localStorage.setItem("h3.production.imageModel",value);};
   useEffect(()=>{void refreshList();void refreshCollections();void refreshImageModels().catch(()=>{});void refreshVideoWorkflows();},[]);
   useEffect(()=>{if(!production)setDraft(blank(project));},[project.id]);
@@ -1240,14 +1249,14 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       card.description,card.notes,card.image_generation_prompt&&"Additional image-generation direction: "+card.image_generation_prompt,style&&"Visual style: "+style,
       "Preserve this card's identity and design. One coherent composition. No labels, lettering, collage, duplicates or extra characters."].filter(Boolean).join(" ").slice(0,6000);
   };
-  const produceCardImage=async(current:Production,kind:CardKind,card:ProductionCard):Promise<Production>=>{
-    if(!models.includes(imageModel))throw new Error(t("选定的本地生图模型不可用。请在设置刷新模型。","The selected image model is unavailable. Refresh models in Settings.","選択した画像モデルが使えません。設定で更新してください。","選定的本地生圖模型不可用。請在設定重新整理模型。"));
+  const produceCardImage=async(current:Production,kind:CardKind,card:ProductionCard,modelOverride?:string):Promise<Production>=>{
+    const activeImageModel=modelOverride||await resolveImageModel();
     const role={characters:"character",wardrobe:"wardrobe",props:"object",environments:"background"}[kind];
     if(!role)throw new Error("Only visual cards support image generation.");
     const runId=crypto.randomUUID();
     await api("/asset-runs",{request_id:runId,spec:{prompt:cardImagePrompt(current,kind,card),
       name:(current.title+" · "+card.name).slice(0,100),semantic_role:role,person_id:null,
-      prompt_tag:"card-"+current.id.slice(0,8)+"-"+card.id.slice(0,8),model:imageModel,
+      prompt_tag:"card-"+current.id.slice(0,8)+"-"+card.id.slice(0,8),model:activeImageModel,
       ...(kind==="environments"?productionKeyframeSize(current.video_aspect_ratio):{width:768,height:768}),
       seed:Math.floor(Math.random()*4294967296)}},undefined,"POST",{timeoutMs:90000});
     for(let attempt=0;attempt<600;attempt++){
@@ -1269,11 +1278,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     const missing=current.cards.characters.filter(card=>
       !card.asset_ids.length&&selectedNames.has(card.name.trim().toLocaleLowerCase()));
     if(!missing.length)return current;
-    if(!models.includes(imageModel))throw new Error(t(
-      "第 "+target.index+" 段的出场角色缺少身份图（"+missing.map(card=>card.name).join("、")+"），且本地生图模型不可用。请在设置连接生图工作流，或先到角色资料库上传/生成角色图。",
-      "Clip "+target.index+" has visible characters without identity images ("+missing.map(card=>card.name).join(", ")+") and the local image model is unavailable. Connect the image workflow in Settings, or upload/generate those character images first.",
-      "クリップ "+target.index+" の登場キャラクターに参照画像がありません（"+missing.map(card=>card.name).join("、")+"）。ローカル画像モデルも利用できません。設定で画像ワークフローを接続するか、先にキャラクター画像を追加してください。",
-      "第 "+target.index+" 段的出場角色缺少身份圖（"+missing.map(card=>card.name).join("、")+"），且本地生圖模型不可用。請在設定連接生圖工作流，或先到角色資料庫上傳/生成角色圖。"));
+    const activeImageModel=await resolveImageModel();
     for(let i=0;i<missing.length;i++){
       const card=current.cards.characters.find(item=>item.id===missing[i].id)||missing[i];
       setBusy(t(
@@ -1281,7 +1286,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         "Clip "+target.index+" · character identity "+(i+1)+"/"+missing.length,
         "クリップ "+target.index+"・キャラクター画像 "+(i+1)+"/"+missing.length,
         "第 "+target.index+" 段 · 補角色身份圖 "+(i+1)+"/"+missing.length));
-      current=await produceCardImage(current,"characters",card);
+      current=await produceCardImage(current,"characters",card,activeImageModel);
     }
     return current;
   };
@@ -1632,15 +1637,11 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       const missingCharacterImages=current.cards.characters.filter(card=>
         !card.asset_ids.length&&requiredCharacterNames.has(card.name.trim().toLocaleLowerCase()));
       if(missingCharacterImages.length){
-        if(!models.includes(imageModel))throw new Error(t(
-          "本集有出场角色缺少身份图（"+missingCharacterImages.map(card=>card.name).join("、")+"），且本地生图模型不可用。请在设置连接生图工作流，或先到角色资料库上传/生成角色图。",
-          "Visible characters are missing identity images ("+missingCharacterImages.map(card=>card.name).join(", ")+") and the local image model is unavailable. Connect the image workflow in Settings, or upload/generate those character images first.",
-          "登場キャラクターの参照画像がありません（"+missingCharacterImages.map(card=>card.name).join("、")+"）。ローカル画像モデルも利用できません。設定で画像ワークフローを接続するか、先にキャラクター画像を追加してください。",
-          "本集有出場角色缺少身份圖（"+missingCharacterImages.map(card=>card.name).join("、")+"），且本地生圖模型不可用。請在設定連接生圖工作流，或先到角色資料庫上傳/生成角色圖。"));
+        const activeImageModel=await resolveImageModel();
         for(let i=0;i<missingCharacterImages.length;i++){
           const card=current.cards.characters.find(item=>item.id===missingCharacterImages[i].id)||missingCharacterImages[i];
           setBusy(t("一键生成 · 补角色身份图 "+(i+1)+"/"+missingCharacterImages.length,"One-click · character identity "+(i+1)+"/"+missingCharacterImages.length,"一括制作・キャラクター画像 "+(i+1)+"/"+missingCharacterImages.length,"一鍵生成 · 補角色身份圖 "+(i+1)+"/"+missingCharacterImages.length));
-          current=await produceCardImage(current,"characters",card);
+          current=await produceCardImage(current,"characters",card,activeImageModel);
         }
       }
 
