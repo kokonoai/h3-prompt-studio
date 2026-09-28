@@ -322,7 +322,12 @@ class AssetRunManager:
                 errors.append(message)
                 unavailable.append({'comfy_url': origin, 'reason': 'inventory_unavailable', 'message': message})
         available = [model for model in (*MODELS, H3_FRAME_MODEL, KREA_MODEL) if any(s['ready'] and model in s['models'] for s in servers)]
-        return {'ready': bool(available), 'models': available, 'default_model': available[0] if available else None,
+        # The H3 frame extractor is an experimental last resort, not the best
+        # default for reusable character/prop cards. Prefer a native image
+        # recipe, then Krea 2, and use H3 frame only when it is the sole option.
+        default_model = next((model for model in available if model != H3_FRAME_MODEL),
+                             available[0] if available else None)
+        return {'ready': bool(available), 'models': available, 'default_model': default_model,
                 'encoder': ENCODER, 'vae': VAE, 'width': 512, 'height': 512, 'max_dimension': 1024,
                 'steps': 8, 'cfg': 1, 'sampler': 'res_multistep', 'scheduler': 'simple', 'shift': 3,
                 'generators': [{'id': model, 'model': model, 'available': True, 'compatible': True,
