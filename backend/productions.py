@@ -17,7 +17,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 3
+REFERENCE_STRATEGY_VERSION = 4
 CAST_TIMELINE_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
 CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices", "styles")
@@ -1415,6 +1415,132 @@ def voice_prompt_context(production, cards):
     return "\n\n".join(sections)
 
 
+def render_visual_style(value):
+    """Keep the artwork treatment while removing model-sheet composition cues.
+
+    Character cards commonly describe their source image as a turnaround or
+    expression sheet.  Those words are useful when cataloguing the card, but
+    putting them into a video prompt asks the renderer to reproduce several
+    views of the same identity.  The saved card/style text remains untouched;
+    only the clip-time rendering direction is cleaned here.
+    """
+    text = " ".join(str(value or "").split())
+    replacements = (
+        (r"(?i)\bcharacter\s+(?:model\s+|reference\s+)?sheet\b", ""),
+        (r"(?i)\bmodel\s+sheet\b", ""),
+        (r"(?i)\breference\s+sheet\b", ""),
+        (r"(?i)\bexpression\s+sheet\b", ""),
+        (r"(?i)\bpose\s+sheet\b", ""),
+        (r"(?i)\bcontact\s+sheet\b", ""),
+        (r"(?i)\bturn[ -]?around(?:s)?\b", ""),
+        (r"(?i)\bfront\s*[,/+-]?\s*side\s*[,/+-]?\s*(?:and\s+)?back(?:\s+views?)?\b", ""),
+        (r"(?i)\bmultiple\s+views?\b", ""),
+        (r"(?i)\borthographic\s+views?\b", ""),
+        (r"(?i)\b(?:clean|plain|pure)?\s*white\s+background\b", ""),
+        (r"角色(?:设定|設定|参考|參考)图", ""),
+        (r"角色(?:设定|設定|参考|參考)表", ""),
+        (r"三[视視]图", ""),
+        (r"正[侧側]背(?:面)?", ""),
+        (r"正面[、,，/ ]*[侧側]面[、,，/ ]*背面", ""),
+        (r"表情(?:设定|設定)?(?:图|圖|表)", ""),
+        (r"(?:纯|純|干净|乾淨)?白色背景", ""),
+    )
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    text = re.sub(r"\s+([,.;:，。；：])", r"\1", text)
+    text = re.sub(r"([,;，；])\s*(?:[,;，；]\s*)+", r"\1 ", text)
+    text = re.sub(r"(?:^|\s)[,;，；]+\s*", " ", text)
+    return " ".join(text.split()).strip(" ,;，；")
+
+
+def _primary_character_view(source):
+    """Crop a model sheet to its leftmost full-height identity view.
+
+    The operation is deliberately conservative: it only crops landscape
+    images with a near-uniform border and several disconnected foreground
+    regions.  Portraits, illustrations and busy-background references pass
+    through unchanged.
+    """
+    from PIL import Image, ImageChops
+
+    image = source.convert("RGB")
+    width, height = image.size
+    if width < height * 1.18 or min(width, height) < 96:
+        return image
+
+    sample_points = (
+        (0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1),
+        (width // 2, 0), (width // 2, height - 1),
+        (0, height // 2), (width - 1, height // 2),
+    )
+    samples = [image.getpixel(point) for point in sample_points]
+    background = tuple(sorted(pixel[channel] for pixel in samples)[len(samples) // 2]
+                       for channel in range(3))
+    if max(max(pixel[channel] for pixel in samples) - min(pixel[channel] for pixel in samples)
+           for channel in range(3)) > 54:
+        return image
+
+    scale = min(1.0, 480 / width)
+    reduced = image.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                           Image.Resampling.LANCZOS)
+    flat = Image.new("RGB", reduced.size, background)
+    mask = ImageChops.difference(reduced, flat).convert("L").point(lambda value: 255 if value > 22 else 0)
+    mask_width, mask_height = mask.size
+    pixels = mask.load()
+    visited = bytearray(mask_width * mask_height)
+    components = []
+    for y in range(mask_height):
+        for x in range(mask_width):
+            offset = y * mask_width + x
+            if visited[offset] or not pixels[x, y]:
+                continue
+            stack = [(x, y)]
+            visited[offset] = 1
+            left = right = x
+            top = bottom = y
+            area = 0
+            while stack:
+                current_x, current_y = stack.pop()
+                area += 1
+                left, right = min(left, current_x), max(right, current_x)
+                top, bottom = min(top, current_y), max(bottom, current_y)
+                for next_y in range(max(0, current_y - 1), min(mask_height, current_y + 2)):
+                    for next_x in range(max(0, current_x - 1), min(mask_width, current_x + 2)):
+                        next_offset = next_y * mask_width + next_x
+                        if not visited[next_offset] and pixels[next_x, next_y]:
+                            visited[next_offset] = 1
+                            stack.append((next_x, next_y))
+            if area >= mask_width * mask_height * .0015:
+                components.append((left, top, right + 1, bottom + 1, area))
+
+    tall = [component for component in components
+            if component[3] - component[1] >= mask_height * .43
+            and component[2] - component[0] <= mask_width * .58]
+    meaningful = [component for component in components
+                  if component[4] >= mask_width * mask_height * .003]
+    if not tall or len(meaningful) < 2:
+        return image
+    selected = min(tall, key=lambda component: (component[0], -component[4]))
+
+    inverse = 1 / scale
+    left, top, right, bottom = [round(value * inverse) for value in selected[:4]]
+    # Turnaround sheets normally place the canonical front view in the first
+    # panel.  Even when floor shadows or touching limbs merge several views
+    # into one mask component, never let the automatic identity tile cross
+    # into the adjacent panel.
+    sheet_panel_right = round(width * .27)
+    if left <= width * .12 and sheet_panel_right > left + width * .10:
+        right = min(right, sheet_panel_right)
+    pad_x = max(12, round((right - left) * .18))
+    pad_y = max(10, round((bottom - top) * .08))
+    crop = (max(0, left - pad_x), max(0, top - pad_y),
+            min(sheet_panel_right if left <= width * .12 else width, right + pad_x),
+            min(height, bottom + pad_y))
+    if crop[2] - crop[0] < width * .12 or crop[3] - crop[1] < height * .45:
+        return image
+    return image.crop(crop)
+
+
 def continuity_visual_lock(production, selected_cards):
     """Choose one renderable style authority for either prompt version."""
     styles = selected_cards.get("styles", [])
@@ -1436,9 +1562,13 @@ def continuity_visual_lock(production, selected_cards):
             direction = production["style_bible"]
         else:
             direction = production.get("visual_style_preset", "cinematic_realism").replace("_", " ")
+    direction = render_visual_style(direction)
     return ("Single visual-style authority for this clip and every camera beat: " + direction
             + " Keep the same rendering medium, character design, palette, lighting logic and texture. "
-              "A style reference transfers treatment only, never its depicted people, props or location.")
+              "A style reference transfers treatment only, never its depicted people, props or location. "
+              "Uploaded identity references provide appearance evidence only: render exactly one spatial "
+              "instance of each named subject, never extra copies, inset portraits, lineup panels, printed "
+              "labels or a catalog background.")
 
 
 def raw_estimate_seconds(text):
@@ -2927,7 +3057,7 @@ class ProductionManager:
         source_ids = [card["asset_ids"][0] for card in cards if card["asset_ids"]][:9]
         # Version the contact-sheet layout so older unnumbered cached sheets are
         # rebuilt once and cannot be mistaken for the new numbered region map.
-        digest = _hash({"overview_version": 2, "kind": kind, "assets": source_ids})
+        digest = _hash({"overview_version": 3, "kind": kind, "assets": source_ids})
         cached = production["generated_overviews"].get(digest)
         if cached:
             try:
@@ -2947,7 +3077,8 @@ class ProductionManager:
             meta = self.load_asset(asset_id)
             path = self.data_dir / "assets" / asset_id / meta["filename"]
             with Image.open(path) as source:
-                image = ImageOps.contain(source.convert("RGB"), (cell - 12, cell - 12))
+                prepared = _primary_character_view(source) if kind == "characters" else source.convert("RGB")
+                image = ImageOps.contain(prepared, (cell - 12, cell - 12))
                 x = (index % columns) * cell + (cell - image.width) // 2
                 y = (index // columns) * cell + (cell - image.height) // 2
                 canvas.paste(image, (x, y))

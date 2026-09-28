@@ -3,15 +3,18 @@ import io
 import uuid
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from backend.compiler import compile_project
-from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, authored_internal_timing,
+from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
+                                 authored_internal_timing,
                                  card_plan_source_hash, character_aliases, current_episode_story,
+                                 continuity_visual_lock,
                                  episode_timing_targets, fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  production_schema_for_story, render_character_identity,
+                                 render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash,
                                  timed_clip_groups)
 from backend.projects import merge_plan, new_project, shot
@@ -85,6 +88,43 @@ def _planned_clip(title, characters, timeline, transition="hard_cut"):
         "card_selection": {"characters": list(characters), "wardrobe": [], "props": [],
                            "environments": [], "voices": []},
     }
+
+
+def test_character_sheet_crop_keeps_one_primary_identity_view():
+    sheet = Image.new("RGB", (960, 540), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.rounded_rectangle((45, 45, 245, 505), 28, fill="red", outline="black", width=6)
+    draw.rounded_rectangle((330, 60, 510, 500), 28, fill="blue", outline="black", width=6)
+    draw.rounded_rectangle((575, 70, 735, 495), 28, fill="green", outline="black", width=6)
+    for left, top in ((770, 50), (855, 50), (770, 145), (855, 145)):
+        draw.ellipse((left, top, left + 60, top + 60), fill="purple", outline="black", width=4)
+
+    cropped = _primary_character_view(sheet)
+
+    assert cropped.width < sheet.width * .45
+    colours = {colour for _count, colour in cropped.resize((80, 80)).getcolors(maxcolors=80 * 80)}
+    assert any(red > 180 and green < 100 and blue < 100 for red, green, blue in colours)
+    assert not any(blue > 180 and red < 100 and green < 100 for red, green, blue in colours)
+
+
+def test_render_style_removes_reference_sheet_layout_but_keeps_art_direction():
+    source = ("Stylized 3D animated character sheet, anthropomorphic animal design, "
+              "front side back turnaround, expression sheet, clean white background, "
+              "detailed fur, cinematic lighting")
+    cleaned = render_visual_style(source)
+
+    assert "character sheet" not in cleaned.casefold()
+    assert "turnaround" not in cleaned.casefold()
+    assert "expression sheet" not in cleaned.casefold()
+    assert "white background" not in cleaned.casefold()
+    assert "detailed fur" in cleaned
+    assert "cinematic lighting" in cleaned
+
+    production = {"visual_style_custom": source, "visual_style_preset": "cinematic_realism",
+                  "style_bible": ""}
+    lock = continuity_visual_lock(production, {"styles": []})
+    assert "appearance evidence only" in lock
+    assert "exactly one spatial instance of each named subject" in lock
 
 
 def test_generated_card_image_is_project_scoped_and_newest_is_primary(tmp_path):
