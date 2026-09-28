@@ -500,8 +500,10 @@ def video_run_create(body: dict):
             production = manager.get(link['production_id'])
         except ValueError:
             production = None  # A detached Studio copy may outlive its production.
-        if production and manager.has_inherited_clip_directions(production, project):
-            raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
+        if production:
+            manager.assert_video_project_current(production, project)
+            if manager.has_inherited_clip_directions(production, project):
+                raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
     compiled = compile_project(project)
     if not compiled['valid'] or body.get('prompt') != compiled['prompt']:
         raise ValueError('Make a current valid prompt before generating this video.')
@@ -1861,6 +1863,7 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
         production = production_manager().materialise(production_id, segment_id)['production']
         segment = next(item for item in production['segments'] if item['id'] == safe_id(segment_id))
     project = copy.deepcopy(load_project(segment['project_id']))
+    production_manager().assert_video_project_current(production, project)
     if production_manager().has_inherited_clip_directions(production, project):
         raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
     profile = video_workflow_manager().get(project.get('comfy_render', {}).get('workflow_profile_id', 'builtin'))

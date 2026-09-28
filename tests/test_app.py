@@ -121,6 +121,8 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
             return production
         def has_inherited_clip_directions(self, _production, _project):
             return False
+        def assert_video_project_current(self, _production, _project):
+            return None
         def set_segment_prompt(self, *_args):
             return production
         def set_video_run(self, *_args):

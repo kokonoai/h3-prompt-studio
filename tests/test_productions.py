@@ -127,6 +127,74 @@ def test_render_style_removes_reference_sheet_layout_but_keeps_art_direction():
     assert "exactly one spatial instance of each named subject" in lock
 
 
+def test_individual_character_reference_uses_cached_single_view_derivative(tmp_path):
+    manager, source, _projects, assets, store_asset = _rig(tmp_path)
+    sheet = Image.new("RGB", (960, 540), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.rounded_rectangle((40, 35, 245, 515), 28, fill="red", outline="black", width=6)
+    draw.rounded_rectangle((330, 55, 520, 510), 28, fill="blue", outline="black", width=6)
+    draw.ellipse((680, 70, 780, 170), fill="purple", outline="black", width=5)
+    buffer = io.BytesIO()
+    sheet.save(buffer, "PNG")
+    original = store_asset(buffer.getvalue(), "hero_sheet.png", "image/png")
+    production = manager.create({"source_project": source, "brief": "Hero enters."})
+    card = _card("Hero", [original["id"]])
+    production["cards"]["characters"] = [card]
+
+    derived = manager._ensure_character_identity(production, card)
+
+    assert derived != original["id"]
+    assert manager._ensure_character_identity(production, card) == derived
+    meta = assets[derived]
+    with Image.open(manager.data_dir / "assets" / derived / meta["filename"]) as image:
+        assert image.width < sheet.width * .4
+        assert image.height >= sheet.height * .8
+
+
+def test_local_ai_visible_action_recovers_omitted_character_but_keeps_voice_offscreen(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "Underwater encounter."})
+    cj, rick, creature = (_card("CJ"), _card("Rick Park"), _card("Anchor-Worm"))
+    production["cards"]["characters"] = [cj, rick, creature]
+    segment = {
+        "title": "Reveal", "story": "The creature appears.", "setting": "Flooded tunnel",
+        "action": ("CJ swims forward. The Anchor-Worm glides along the ceiling. "
+                   "Rick Park's voice crackles over comms."),
+        "ending": "CJ faces the Anchor-Worm.", "image_prompt": "CJ and the Anchor-Worm underwater",
+        "dialogue": [{"speaker": "Rick Park", "text": "Pull back.", "voiceover": True}],
+        "card_selection_source": "local_ai",
+        "card_selection": {"characters": ["Anchor-Worm"], "wardrobe": [], "props": [],
+                           "environments": [], "voices": []},
+        "cast_timeline": {"visible_start": [], "visible_end": ["Anchor-Worm"],
+                          "enters": ["Anchor-Worm"], "exits": [],
+                          "offscreen": ["Rick Park"], "mentioned_only": ["CJ"]},
+    }
+
+    relevant = manager._relevant_cards(production, segment)
+
+    assert [card["name"] for card in relevant["characters"]] == ["Anchor-Worm", "CJ"]
+
+
+def test_video_admission_rejects_old_or_missing_character_identity_strategy(tmp_path):
+    manager, _source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production_id, segment_id, project_id = _id(), _id(), _id()
+    production = {"id": production_id, "segments": [{
+        "id": segment_id, "project_id": project_id, "status": "ready",
+        "reference_strategy_version": REFERENCE_STRATEGY_VERSION}]}
+    project = {"id": project_id, "production_link": {
+        "production_id": production_id, "segment_id": segment_id,
+        "reference_strategy": {"reference_strategy_version": REFERENCE_STRATEGY_VERSION,
+                               "missing_visual_identity_names": ["Heron Mask"]}}}
+
+    with pytest.raises(ValueError, match="Heron Mask"):
+        manager.assert_video_project_current(production, project)
+    project["production_link"]["reference_strategy"]["missing_visual_identity_names"] = []
+    manager.assert_video_project_current(production, project)
+    project["production_link"]["reference_strategy"]["reference_strategy_version"] -= 1
+    with pytest.raises(ValueError, match="outdated character-reference assignment"):
+        manager.assert_video_project_current(production, project)
+
+
 def test_generated_card_image_is_project_scoped_and_newest_is_primary(tmp_path):
     manager, source, projects, _, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "title": "Episode", "brief": "A character enters."})

@@ -17,7 +17,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 4
+REFERENCE_STRATEGY_VERSION = 5
 CAST_TIMELINE_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
 CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices", "styles")
@@ -3095,6 +3095,42 @@ class ProductionManager:
         production["generated_overviews"][digest] = asset["id"]
         return asset["id"]
 
+    def _ensure_character_identity(self, production, card):
+        """Return a single-instance render asset without altering the card.
+
+        One-to-three-character clips previously bypassed the automatic cast
+        overview and sent full multi-view sheets straight to H3. Cache a
+        cropped derivative when that layout is detected; ordinary portraits
+        and scene references retain their original asset.
+        """
+        if not card.get("asset_ids"):
+            return None
+        source_id = card["asset_ids"][0]
+        digest = _hash({"character_identity_version": 1, "card": card["id"], "asset": source_id})
+        cached = production["generated_overviews"].get(digest)
+        if cached:
+            try:
+                self.load_asset(cached)
+                return cached
+            except Exception:
+                pass
+        if not self.store_asset:
+            return source_id
+        from PIL import Image
+        meta = self.load_asset(source_id)
+        path = self.data_dir / "assets" / source_id / meta["filename"]
+        with Image.open(path) as source:
+            original = source.convert("RGB")
+            prepared = _primary_character_view(original)
+            if prepared.size == original.size:
+                return source_id
+            buffer = io.BytesIO()
+            prepared.save(buffer, "JPEG", quality=95, optimize=True)
+        asset = self.store_asset(
+            buffer.getvalue(), f"character_identity_{digest[:12]}.jpg", "image/jpeg")
+        production["generated_overviews"][digest] = asset["id"]
+        return asset["id"]
+
     def _relevant_cards(self, production, segment):
         text = "\n".join(str(segment.get(key, "")) for key in
             ("title", "story", "setting", "action", "ending", "image_prompt")).casefold()
@@ -3113,6 +3149,34 @@ class ProductionManager:
                 result[kind] = [card for card in production["cards"][kind]
                                 if card["name"].strip().casefold() in chosen and
                                 (kind != "characters" or not character_is_embedded_form(card, text))]
+            # Local planning is advisory, while visible physical staging is
+            # authoritative. Recover a named character that the planner left
+            # out when the character is explicitly placed in the action or in
+            # a visible cast-timeline bucket. Keep declared off-screen voices
+            # off-screen (for example "Rick's voice crackles over comms").
+            timeline = segment.get("cast_timeline", {})
+            visible_names = {
+                str(name).strip().casefold()
+                for key in ("visible_start", "enters", "exits", "visible_end")
+                for name in timeline.get(key, []) if str(name).strip()
+            }
+            offscreen_names = {
+                str(name).strip().casefold()
+                for name in timeline.get("offscreen", []) if str(name).strip()
+            }
+            staged_text = "\n".join(str(segment.get(key, "")) for key in
+                                     ("action", "image_prompt", "ending")).casefold()
+            active_ids = {card["id"] for card in result["characters"]}
+            for card in production["cards"]["characters"]:
+                if card["id"] in active_ids or character_is_embedded_form(card, text):
+                    continue
+                aliases = alias_sets.get(card["id"], {card["name"].strip().casefold()})
+                declared_offscreen = any(alias in offscreen_names for alias in aliases)
+                declared_visible = any(alias in visible_names for alias in aliases)
+                physically_staged = any(_name_occurs(alias, staged_text) for alias in aliases)
+                if declared_visible or (physically_staged and not declared_offscreen):
+                    result["characters"].append(card)
+                    active_ids.add(card["id"])
             speaking_character_ids = speaker_cards
             result["voices"] = [card for card in production["cards"]["voices"]
                                 if card.get("character_card_id") in speaking_character_ids]
@@ -3376,7 +3440,8 @@ class ProductionManager:
             for card in illustrated:
                 if image_budget <= 0:
                     break
-                asset_id = card["asset_ids"][0]
+                asset_id = (self._ensure_character_identity(production, card)
+                            if kind == "characters" else card["asset_ids"][0])
                 owner = subject_for_card.get(card["id"] if kind == "characters" else card.get("owner_card_id"))
                 asset = self._asset_in_project(project, asset_id, kind, owner)
                 for key in ("reference_overview", "reference_card_kind", "reference_card_names",
@@ -3627,6 +3692,37 @@ class ProductionManager:
         if production["task_state"] == "paused":
             raise ValueError("This production is paused. Resume it before starting another task.")
         return production
+
+    def assert_video_project_current(self, production, project):
+        """Reject stale or visually ungrounded production snapshots.
+
+        A browser can keep an old one-click queue in memory across a server
+        restart. Admission must therefore be enforced by the server, not only
+        by disabled UI buttons. Standalone Studio projects are unaffected.
+        """
+        link = project.get("production_link")
+        if not isinstance(link, dict) or link.get("production_id") != production.get("id"):
+            return
+        segment_id = link.get("segment_id")
+        segment = next((item for item in production.get("segments", [])
+                        if item.get("id") == segment_id), None)
+        if segment is None:
+            raise ValueError("This production clip no longer exists. Rebuild its video prompt before rendering.")
+        strategy = link.get("reference_strategy") if isinstance(link.get("reference_strategy"), dict) else {}
+        if (strategy.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or
+                segment.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or
+                segment.get("project_id") != project.get("id")):
+            raise ValueError(
+                "This clip uses an outdated character-reference assignment. Regenerate this clip prompt before generating video.")
+        missing = [str(name).strip() for name in strategy.get("missing_visual_identity_names", [])
+                   if str(name).strip()]
+        if missing:
+            raise ValueError(
+                "Visible character identity references are missing: " + ", ".join(missing) +
+                ". Add or generate those character-card images, then regenerate this clip prompt.")
+        if segment.get("status") == "stale":
+            raise ValueError(
+                "This production clip is stale. Regenerate this clip prompt before generating video.")
 
     def has_inherited_clip_directions(self, production, project):
         """Recognise prompts made before materialisation stopped copying old clips."""

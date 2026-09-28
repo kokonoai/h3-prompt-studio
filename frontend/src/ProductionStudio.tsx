@@ -1598,6 +1598,24 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         }
       }
 
+      const requiredCharacterNames=new Set(current.segments.flatMap(segment=>segment.card_selection.characters)
+        .map(name=>name.trim().toLocaleLowerCase()).filter(Boolean));
+      const missingCharacterImages=current.cards.characters.filter(card=>
+        !card.asset_ids.length&&requiredCharacterNames.has(card.name.trim().toLocaleLowerCase()));
+      if(missingCharacterImages.length){
+        if(!models.includes(imageModel))throw new Error(t(
+          "本集有出场角色缺少身份图（"+missingCharacterImages.map(card=>card.name).join("、")+"），且本地生图模型不可用。请在设置连接生图工作流，或先到角色资料库上传/生成角色图。",
+          "Visible characters are missing identity images ("+missingCharacterImages.map(card=>card.name).join(", ")+") and the local image model is unavailable. Connect the image workflow in Settings, or upload/generate those character images first.",
+          "登場キャラクターの参照画像がありません（"+missingCharacterImages.map(card=>card.name).join("、")+"）。ローカル画像モデルも利用できません。設定で画像ワークフローを接続するか、先にキャラクター画像を追加してください。",
+          "本集有出場角色缺少身份圖（"+missingCharacterImages.map(card=>card.name).join("、")+"），且本地生圖模型不可用。請在設定連接生圖工作流，或先到角色資料庫上傳/生成角色圖。"));
+        for(let i=0;i<missingCharacterImages.length;i++){
+          const card=current.cards.characters.find(item=>item.id===missingCharacterImages[i].id)||missingCharacterImages[i];
+          setBusy(t("一键生成 · 补角色身份图 "+(i+1)+"/"+missingCharacterImages.length,"One-click · character identity "+(i+1)+"/"+missingCharacterImages.length,"一括制作・キャラクター画像 "+(i+1)+"/"+missingCharacterImages.length,"一鍵生成 · 補角色身份圖 "+(i+1)+"/"+missingCharacterImages.length));
+          current=await produceCardImage(current,"characters",card);
+        }
+      }
+
+      const staleVideoSegmentIds=new Set(current.segments.filter(segment=>segment.status==="stale").map(segment=>segment.id));
       const promptTargets=current.segments.filter(segmentNeedsVideoPrompt);
       for(let i=0;i<promptTargets.length;i++){
         const target=current.segments.find(item=>item.id===promptTargets[i].id)||promptTargets[i];
@@ -1607,10 +1625,11 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       }
 
       overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
-      const videoTargets=current.segments.filter(segment=>!segmentHasCompletedVideo(segment,overview));
+      const videoTargets=current.segments.filter(segment=>
+        staleVideoSegmentIds.has(segment.id)||!segmentHasCompletedVideo(segment,overview));
       for(let i=0;i<videoTargets.length;i++){
         const target=current.segments.find(item=>item.id===videoTargets[i].id)||videoTargets[i];
-        if(segmentHasCompletedVideo(target,overview))continue;
+        if(!staleVideoSegmentIds.has(target.id)&&segmentHasCompletedVideo(target,overview))continue;
         setBusy(full?t("全流程 · 第 5/6 步：提交视频 "+(i+1)+"/"+videoTargets.length,"Full run · Step 5/6: submit video "+(i+1)+"/"+videoTargets.length,"全工程・ステップ5/6：映像を送信 "+(i+1)+"/"+videoTargets.length,"全流程 · 第 5/6 步：提交影片 "+(i+1)+"/"+videoTargets.length):t("一键生成 · 第 2/3 步：提交视频 "+(i+1)+"/"+videoTargets.length,"One-click production · Step 2/3: submit video "+(i+1)+"/"+videoTargets.length,"一括制作・ステップ2/3：映像を送信 "+(i+1)+"/"+videoTargets.length,"一鍵生成 · 第 2/3 步：提交影片 "+(i+1)+"/"+videoTargets.length));
         const submitted=await submitVideoWithPromptRepair(current,target);
         current=submitted.production;setProduction(current);setDraft(current);
@@ -1932,7 +1951,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           {keyframeSuggestions.map(item=><div className="storyboard-keyframe-suggestion" key={item.segment_id}><div><strong>{t("第 "+item.index+" 段","Clip "+item.index,"クリップ "+item.index,"第 "+item.index+" 段")}</strong><small>{item.reason}</small><button className="icon" title={t("删除此建议","Remove suggestion","候補を削除","刪除此建議")} onClick={()=>setKeyframeSuggestions(rows=>rows.filter(row=>row.segment_id!==item.segment_id))}><X size={16}/></button></div><textarea rows={3} value={item.prompt} onChange={e=>setKeyframeSuggestions(rows=>rows.map(row=>row.segment_id===item.segment_id?{...row,prompt:e.target.value}:row))}/></div>)}
         </section>}
         {!!production.segments.length&&<div className="storyboard-batch-bar card"><div className="storyboard-batch-copy"><span className="eyebrow">EPISODE AUTOMATION</span><strong>{t("整集制作控制台","Episode production console","エピソード制作コンソール","整集製作控制台")}</strong><span>{t("中断后可从缺失处续跑；“全部重做”才会建立新版本，旧提示词与视频仍然保留。","Interrupted runs resume from missing work. Only Rebuild all creates new versions; earlier prompts and video takes remain available.","中断後は不足分から再開できます。「すべて再作成」のみ新しい版を作り、以前のプロンプトと映像を保持します。","中斷後可從缺失處續跑；「全部重做」才會建立新版本，舊提示詞與影片仍然保留。")}</span><div className="storyboard-batch-progress"><span className={ready===production.segments.length?"complete":""}>{t("H3 工程","H3 projects","H3プロジェクト","H3 專案")} <b>{ready}/{production.segments.length}</b></span><span className={(outputs?.ready_count||0)===production.segments.length?"complete":""}>{t("视频","Videos","映像","影片")} <b>{outputs?.ready_count||0}/{production.segments.length}</b></span><span className={outputs?.final_ready?"complete":""}>{t("最终成片","Final film","最終映像","最終成片")} <b>{outputs?.final_ready?t("已完成","Ready","完成","已完成"):t("待合并","Pending","未結合","待合併")}</b></span></div></div>
-          <button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm()}><Film size={18}/>{bulkAction==="all"?t("正在续跑本集…","Resuming this episode…","この話を再開中…","正在續跑本集…"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
+          <button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm()}><Film size={18}/>{bulkAction==="all"?t("正在续跑本集…","Resuming this episode…","この話を再開中…","正在續跑本集…"):production.segments.some(segment=>segment.status==="stale")?t("更新并重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段","Update and remake "+production.segments.filter(segment=>segment.status==="stale").length+" clips",production.segments.filter(segment=>segment.status==="stale").length+" 件を更新して再制作","更新並重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
           <div className="storyboard-batch-actions">
             <div className="batch-action-group batch-action-primary"><span>{t("补齐缺失","Fill missing","不足分を補完","補齊缺失")}</span><div>
               <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts()}><Sparkles size={16}/>{bulkAction==="prompts"?t("生成中…","Generating…","生成中…","生成中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>
