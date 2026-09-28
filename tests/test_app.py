@@ -92,6 +92,15 @@ def auth(module):
     return {"X-H3-Token": module.TOKEN, "Origin": "http://127.0.0.1:8766"}
 
 
+def test_production_video_job_counts_keep_lost_requests_separate(server):
+    module, _client, _fake = server
+    counts = module._production_video_job_counts([
+        {'candidates': [{'status': 'succeeded'}, {'status': 'uncertain'}]},
+        {'candidates': [{'status': 'queued'}, {'status': 'running'}, {'status': 'failed'}]},
+    ])
+    assert counts == {'active_jobs': 2, 'uncertain_jobs': 1}
+
+
 def test_production_auto_continuation_uses_only_verified_preceding_take(server, monkeypatch):
     module, _client, _fake = server
     from backend import compiler

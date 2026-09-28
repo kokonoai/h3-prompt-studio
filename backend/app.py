@@ -1035,6 +1035,14 @@ def production_materialize_all(production_id: str, body: dict):
             'prepared': prepared, 'skipped': skipped}
 
 
+def _production_video_job_counts(segments):
+    jobs = [run for row in segments for run in row.get('candidates', [])]
+    return {
+        'active_jobs': sum(run.get('status') in ('preparing', 'queued', 'running') for run in jobs),
+        'uncertain_jobs': sum(run.get('status') == 'uncertain' for run in jobs),
+    }
+
+
 def production_outputs(production_id, runs=None):
     """Join production clips to their local video runs without trusting client file paths."""
     production = production_manager().get(safe_id(production_id))
@@ -1066,8 +1074,7 @@ def production_outputs(production_id, runs=None):
     final_ready = bool(output and output.is_file() and output.stat().st_size)
     adopted_video_seconds = round(sum(float((row['selected'] or {}).get('elapsed_seconds') or 0)
                                       for row in segments), 3)
-    active_jobs = sum(run.get('status') in ('preparing', 'queued', 'running', 'uncertain')
-                      for row in segments for run in row['candidates'])
+    job_counts = _production_video_job_counts(segments)
     return {
         'production_id': production['id'], 'auto_merge': production.get('auto_merge', True),
         'segments': segments, 'selected_run_ids': selected_ids, 'all_ready': all_ready,
@@ -1075,7 +1082,7 @@ def production_outputs(production_id, runs=None):
         'estimated_seconds': round(sum(float((row['selected'] or {}).get('new_seconds') or
                                               (row['selected'] or {}).get('duration') or 0)
                                        for row in segments), 3),
-        'active_jobs': active_jobs,
+        **job_counts,
         'timings': {
             'episode_plan_seconds': production.get('timings', {}).get('episode_plan_seconds'),
             'storyboard_plan_seconds': production.get('timings', {}).get('storyboard_plan_seconds'),
@@ -1118,7 +1125,7 @@ def production_select_video(production_id: str, segment_id: str, body: dict):
 
 def build_production_film(production_id):
     overview = production_outputs(production_id)
-    if overview['active_jobs']:
+    if overview['active_jobs'] or overview['uncertain_jobs']:
         raise ValueError('Wait for the current ComfyUI video task to finish or stop it before assembling the final film.')
     if not overview['all_ready']:
         raise ValueError('Every storyboard clip needs a completed adopted take before the final film can be assembled.')
@@ -1256,13 +1263,14 @@ def series_outputs(series_id):
                               'ready_count': output['ready_count'], 'segment_count': output['segment_count'],
                               'all_ready': output['all_ready'], 'final_ready': output['final_ready'],
                               'signature': output['signature'], 'final_url': output['final_url'],
-                              'active_jobs': output['active_jobs']})
+                              'active_jobs': output['active_jobs'], 'uncertain_jobs': output['uncertain_jobs']})
             except (ValueError, OSError, KeyError):
                 parts.append({'production_id': production_id, 'title': 'Missing project',
                               'ready_count': 0, 'segment_count': 0, 'all_ready': False,
                               'final_ready': False, 'signature': None, 'final_url': None,
-                              'active_jobs': 0, 'missing': True})
-        ready = bool(parts) and all(part['all_ready'] and not part['active_jobs'] for part in parts)
+                              'active_jobs': 0, 'uncertain_jobs': 0, 'missing': True})
+        ready = bool(parts) and all(part['all_ready'] and not part['active_jobs'] and not part['uncertain_jobs']
+                                    for part in parts)
         signature_parts = [episode['index'], [part['production_id'] for part in parts],
                            [part['signature'] for part in parts]]
         signatures.append(signature_parts)

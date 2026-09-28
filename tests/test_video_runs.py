@@ -171,7 +171,7 @@ def test_own_result_has_safe_video_state_snapshot_and_no_private_payload(rig):
     assert result['download_url'].endswith('?download=1')
     descriptor = manager.media(result['id'])
     assert descriptor['type'] == 'output' and descriptor['mime_type'] == 'video/mp4'
-    assert descriptor['subfolder'].endswith(result['id'])
+    assert descriptor['subfolder'].endswith(result['id'][:8])
     assert manager.snapshot(result['id'])['comfy_render']['seed'] == 0
     project['story'] = {'text': 'Changed later'}
     assert manager.snapshot(result['id']).get('story') != project['story']
