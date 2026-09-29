@@ -461,6 +461,19 @@ def timed_clip_groups(story):
     return groups
 
 
+def timed_group_story(group):
+    """Rebuild one authored timing block without losing its timecode.
+
+    Storyboard planning sends explicit source groups to the local model one at
+    a time.  Keeping the header is essential: it lets the per-call schema,
+    timing payload and locked-dialogue roster describe the same source block.
+    """
+    start = int(group["start"])
+    end = int(group["end"])
+    return (f"{start // 60}:{start % 60:02d}-{end // 60}:{end % 60:02d}\n"
+            f"{str(group['text']).strip()}")
+
+
 def _authored_action_cue(text, character_names):
     """Remove quoted speech while retaining authored physical action."""
     names = {name.strip().casefold() for name in character_names if name.strip()}
@@ -700,8 +713,16 @@ def episode_timing_targets(production, chunk_index=1, chunk_total=1, story=None)
     source_story = story if story is not None else current_episode_story(production)
     timed_beats = timed_story_beats(source_story)
     timed_groups = timed_clip_groups(source_story)
+    # A long authored screenplay is planned one explicit timing block per
+    # local-model call.  For those calls the block's own duration is the part
+    # target; dividing the episode target by the number of calls would turn a
+    # 12-second authored block into an unrelated nominal 10-second request.
+    if timed_groups:
+        part = sum(group["duration"] for group in timed_groups)
+        minimum = max(1, math.ceil(part / MAX_SECONDS))
+        maximum = max(minimum, part // PLANNED_MIN_SECONDS)
     recommended = recommended_clip_count(part)
-    if chunk_total == 1 and timed_groups and minimum <= len(timed_groups) <= min(maximum, MAX_SEGMENTS):
+    if timed_groups and minimum <= len(timed_groups) <= min(maximum, MAX_SEGMENTS):
         recommended = len(timed_groups)
     return {
         "episode_target_seconds": whole,
@@ -715,7 +736,7 @@ def episode_timing_targets(production, chunk_index=1, chunk_total=1, story=None)
             {"clip": index + 1, "start_seconds": group["start"],
              "end_seconds": group["end"], "duration_seconds": group["duration"]}
             for index, group in enumerate(timed_groups)
-        ] if chunk_total == 1 else [],
+        ] if timed_groups else [],
     }
 
 
@@ -1621,6 +1642,17 @@ def fit_planned_durations(segments, target_seconds, language="en", source_story=
     if timed_groups and len(timed_groups) == count:
         preferred = [group["duration"] for group in timed_groups]
         durations = [min(MAX_SECONDS, max(PLANNED_MIN_SECONDS, value)) for value in preferred]
+    elif timed_groups:
+        # A timed parent block may be split into several generation clips, but
+        # its authored start/end remains exact.  Dialogue estimates help an
+        # untimed plan grow naturally; they must not silently expand a 10s
+        # authored block to 20s and break the parent/child mapping.
+        preferred = [max(before, estimate_seconds(
+            " ".join(x for x in (str(item.get("action", "")).strip(),
+                                  " ".join(str(line.get("text", "")).strip()
+                                           for line in item.get("dialogue", []))) if x)))
+                     for item, before in zip(result, original)]
+        durations = [PLANNED_MIN_SECONDS] * count
     else:
         speech_floors = [dialogue_minimum_seconds(item) for item in result]
         # Episode length is an editorial target, while authored dialogue is an
@@ -2526,39 +2558,110 @@ class ProductionManager:
                 actual_line["voiceover"] = bool(source_line.get("voiceover", False))
             return actual
 
-        if locked_groups and len(locked_groups) == len(planned):
-            for item, locked in zip(planned, locked_groups):
-                # The local model may improve staging, but the authored
-                # dialogue track is byte-for-byte authority. An empty authored
-                # track is also a lock: never let the model move later dialogue
-                # into an earlier silent beat or invent a line there.
-                if locked.get("requires_translation"):
-                    item["dialogue"] = translated_dialogue(item, locked)
-                else:
-                    item["dialogue"] = copy.deepcopy(locked["dialogue"])
-        elif locked_groups:
-            # A dense authored time block may legitimately become two generation
-            # clips. In that case the line can move to either child clip, but the
-            # exact source words and speaker must still appear once and in order.
-            expected = [line for group in locked_groups
-                        for line in group.get("source_dialogue", group.get("dialogue", []))]
-            actual = [line for item in planned for line in item.get("dialogue", [])]
-            if len(actual) != len(expected):
-                raise ValueError(
-                    "A subdivided plan omitted, changed, reassigned or reordered locked source dialogue.")
-            for source_line, actual_line in zip(expected, actual):
-                same_speaker = speaker_key(source_line.get("speaker")) == speaker_key(actual_line.get("speaker"))
-                exact_required = _dialogue_already_matches_language(
-                    source_line.get("text", ""), current["language"])
-                same_text = str(source_line.get("text", "")).strip() == str(actual_line.get("text", "")).strip()
-                if not same_speaker or (exact_required and not same_text) or not str(actual_line.get("text", "")).strip():
+        def planned_children_by_locked_group():
+            """Map AI subdivisions back to each authored timing block."""
+            if len(locked_groups) == len(planned):
+                return [[item] for item in planned]
+            markers = [item.get("_source_timed_group") for item in planned]
+            if any(marker is not None for marker in markers):
+                if not all(type(marker) is int for marker in markers):
+                    raise ValueError("A planned timing block lost its source-group binding.")
+                grouped = []
+                cursor = 0
+                for group_index, locked in enumerate(locked_groups, 1):
+                    children = []
+                    while cursor < len(planned) and markers[cursor] == group_index:
+                        children.append(planned[cursor])
+                        cursor += 1
+                    if not children or sum(item["duration"] for item in children) != (
+                            locked["end_seconds"] - locked["start_seconds"]):
+                        raise ValueError(
+                            "A subdivided plan no longer covers its authored timing block exactly.")
+                    grouped.append(children)
+                if cursor != len(planned):
+                    raise ValueError("A subdivided plan reordered its authored timing blocks.")
+                return grouped
+
+            # Compatibility for callers and saved plans created before source
+            # group tags existed: fitted child durations still identify the
+            # ordered parent block without relying on model prose.
+            grouped, cursor = [], 0
+            for locked in locked_groups:
+                required = locked["end_seconds"] - locked["start_seconds"]
+                children, covered = [], 0
+                while cursor < len(planned) and covered < required:
+                    children.append(planned[cursor])
+                    covered += planned[cursor]["duration"]
+                    cursor += 1
+                if not children or covered != required:
                     raise ValueError(
-                        "A subdivided plan omitted, changed, reassigned or reordered locked source dialogue.")
-                if exact_required:
-                    actual_line["text"] = source_line["text"]
-                actual_line["speaker"] = source_line["speaker"]
-                actual_line["language"] = PRODUCTION_LANGUAGES[current["language"]]
-                actual_line["voiceover"] = bool(source_line.get("voiceover", False))
+                        "A subdivided plan no longer covers its authored timing block exactly.")
+                grouped.append(children)
+            if cursor != len(planned):
+                raise ValueError("A subdivided plan reordered its authored timing blocks.")
+            return grouped
+
+        def exact_dialogue_child(children, line_index, line_count):
+            """Choose a stable child for a source line the model forgot."""
+            total = sum(item["duration"] for item in children)
+            point = total * (line_index + .5) / max(1, line_count)
+            covered = 0
+            for child_index, child in enumerate(children):
+                covered += child["duration"]
+                # A line exactly on a subdivision boundary belongs to the
+                # following child, after the preceding visible setup.
+                if point < covered or child_index == len(children) - 1:
+                    return child_index
+            return len(children) - 1
+
+        def restore_exact_dialogue(children, locked):
+            """Discard model dialogue drift and reattach source-exact lines."""
+            expected = locked.get("source_dialogue", locked.get("dialogue", []))
+            actual = [(child_index, line) for child_index, child in enumerate(children)
+                      for line in child.get("dialogue", [])]
+            for child in children:
+                child["dialogue"] = []
+            search_from, previous_child = 0, 0
+            for line_index, source_line in enumerate(expected):
+                selected, selected_position = None, None
+                for position in range(search_from, len(actual)):
+                    child_index, actual_line = actual[position]
+                    if (child_index >= previous_child and
+                            speaker_key(source_line.get("speaker")) == speaker_key(actual_line.get("speaker")) and
+                            str(source_line.get("text", "")).strip() ==
+                            str(actual_line.get("text", "")).strip()):
+                        selected, selected_position = child_index, position
+                        break
+                if selected is None:
+                    selected = max(previous_child, exact_dialogue_child(
+                        children, line_index, len(expected)))
+                else:
+                    search_from = selected_position + 1
+                previous_child = selected
+                children[selected]["dialogue"].append(copy.deepcopy(source_line))
+
+        if locked_groups:
+            for children, locked in zip(planned_children_by_locked_group(), locked_groups):
+                # The local model chooses staging and subdivision boundaries;
+                # authored dialogue remains server-owned source material.  For
+                # same-language scripts, repair omissions/paraphrases instead
+                # of rejecting the entire storyboard.  Invented dialogue is
+                # discarded, including in authored silent blocks.
+                if not locked.get("requires_translation"):
+                    restore_exact_dialogue(children, locked)
+                    continue
+
+                # Translation still needs the language model's words, but its
+                # line count, speaker order and child placement are validated
+                # per authored block rather than across the whole episode.
+                counts = [len(child.get("dialogue", [])) for child in children]
+                translated = translated_dialogue(
+                    {"dialogue": [line for child in children for line in child.get("dialogue", [])]},
+                    locked)
+                offset = 0
+                for child, count in zip(children, counts):
+                    child["dialogue"] = translated[offset:offset + count]
+                    offset += count
         departed_characters, continuity_corrections = set(), []
         for index, item in enumerate(planned):
             item = copy.deepcopy(item)

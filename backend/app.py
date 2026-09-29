@@ -932,7 +932,7 @@ def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
-                              timed_clip_groups)
+                              timed_clip_groups, timed_group_story)
     started = time.monotonic()
     production = production_manager().assert_active(production_id)
     story = current_episode_story(production)
@@ -950,7 +950,7 @@ def production_plan(production_id: str, body: dict):
                 # each merged 5-15 second group independently so a local model
                 # cannot pull dialogue or action across an authored boundary.
                 source_groups = timed_clip_groups(story)
-                pieces = ([group['text'] for group in source_groups]
+                pieces = ([timed_group_story(group) for group in source_groups]
                           if source_groups else storyboard_planning_chunks(story))
                 segments, previous_ending = [], ''
                 for index, piece in enumerate(pieces):
@@ -959,10 +959,22 @@ def production_plan(production_id: str, body: dict):
                         model, PLANNER_SYSTEM,
                         planning_payload(production, piece, index + 1, len(pieces), previous_ending),
                         production_schema_for_story(piece), max_tokens=4096, temperature=0.25)
-                    segments.extend(answer['segments'])
+                    new_segments = answer['segments']
+                    if source_groups:
+                        # Fit and tag each authored block before joining the
+                        # whole episode.  The tag is internal and is discarded
+                        # by normalise_segment after dialogue restoration.
+                        new_segments = fit_planned_durations(
+                            new_segments, source_groups[index]['duration'],
+                            production['language'], piece)
+                        for segment in new_segments:
+                            segment['_source_timed_group'] = index + 1
+                    segments.extend(new_segments)
                     if len(segments) > 64:
                         raise ValueError('This story needs more than 64 H3 clips. Split it into episodes before planning.')
                     previous_ending = segments[-1]['ending'] if segments else previous_ending
+                if source_groups:
+                    return segments
                 target = episode_timing_targets(production, story=story)['episode_target_seconds']
                 return fit_planned_durations(segments, target, production['language'], story)
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)

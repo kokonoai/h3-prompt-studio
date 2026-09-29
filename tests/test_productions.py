@@ -16,7 +16,7 @@ from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, 
                                  production_schema_for_story, render_character_identity,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash,
-                                 timed_clip_groups)
+                                 timed_clip_groups, timed_group_story)
 from backend.projects import merge_plan, new_project, shot
 from backend.video_workflows import VideoWorkflowManager
 
@@ -546,6 +546,15 @@ Pokke:
     schema = production_schema_for_story(screenplay)["properties"]["segments"]
     assert schema["minItems"] == 1
     assert schema["maxItems"] == 2
+    piece = timed_group_story(timed_clip_groups(screenplay)[0])
+    timing = episode_timing_targets(production, 1, 3, piece)
+    assert timing["part_target_seconds"] == 10
+    assert timing["recommended_clip_count"] == 1
+    assert timing["timed_clip_groups"] == [{
+        "clip": 1, "start_seconds": 0, "end_seconds": 10, "duration_seconds": 10,
+    }]
+    assert locked_timed_dialogue(production, piece)[0]["source_dialogue"][0]["text"] == (
+        "Keep your side clear.")
     empty_cards = {kind: [] for kind in ("characters", "wardrobe", "props", "environments", "voices")}
     planned = [
         {"title": "Approach", "story": "Pokke crosses the platform.", "setting": "platform",
@@ -569,8 +578,17 @@ Pokke:
 
     broken = copy.deepcopy(fitted)
     broken[1]["dialogue"][0]["text"] = "Paraphrased."
-    with pytest.raises(ValueError, match="omitted, changed, reassigned or reordered"):
-        manager.apply_plan(production["id"], broken, "local_ai")
+    repaired = manager.apply_plan(production["id"], broken, "local_ai")
+    assert repaired["segments"][0]["dialogue"] == []
+    assert repaired["segments"][1]["dialogue"][0]["text"] == "Keep your side clear."
+
+    omitted = copy.deepcopy(fitted)
+    omitted[0]["dialogue"] = [{"speaker": "Bokka", "text": "Invented.",
+                                "language": "English", "voiceover": False}]
+    omitted[1]["dialogue"] = []
+    repaired = manager.apply_plan(production["id"], omitted, "local_ai")
+    assert repaired["segments"][0]["dialogue"] == []
+    assert repaired["segments"][1]["dialogue"][0]["text"] == "Keep your side clear."
 
 
 def test_markdown_speaker_cues_keep_exact_dialogue_and_strip_acting_notes(tmp_path):
