@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import re
+import threading
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,7 @@ DIRECTOR_LOCK_FIELDS = frozenset({
     'transition', 'setting', 'visible_subject_ids', 'offscreen_subject_ids', 'final_state', 'scene_contract',
 })
 PROJECT_LANGUAGES = frozenset({'zh-CN', 'zh-TW', 'en', 'ja'})
+_ATOMIC_JSON_LOCK = threading.Lock()
 TIME_ONLY_STATE = re.compile(
     r'^\s*(?:at\s+)?\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)\s*$',
     re.IGNORECASE,
@@ -174,10 +176,18 @@ def check_project(project):
     return project
 
 def atomic_json(path: Path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-    temp.replace(path)
+    # Windows can reject two simultaneous replacements of the same destination
+    # even when each writer owns a unique temporary file.  The write itself is
+    # tiny; serialize it in-process, retain a unique sibling for crash safety,
+    # then atomically replace the destination.
+    with _ATOMIC_JSON_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+        try:
+            temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
 
 ALLOWED_SHOT_FIELDS = {'action', 'setting', 'camera', 'performance', 'final_state', 'sound', 'transition', 'visible_subject_ids', 'offscreen_subject_ids', 'scene_contract'}
 
