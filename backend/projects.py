@@ -5,6 +5,7 @@ import json
 import math
 import re
 import threading
+import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -185,7 +186,20 @@ def atomic_json(path: Path, value):
         temp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
         try:
             temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-            temp.replace(path)
+            # Antivirus, search indexing and cloud backup tools can briefly
+            # open the destination without Windows delete-sharing.  Replacing
+            # an existing file then raises WinError 5 even though neither the
+            # new JSON nor the destination is invalid.  Retry only that narrow
+            # transient failure; all other filesystem errors still surface
+            # immediately and the original destination remains untouched.
+            for attempt in range(8):
+                try:
+                    temp.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 7:
+                        raise
+                    time.sleep(min(0.4, 0.025 * (2 ** attempt)))
         finally:
             temp.unlink(missing_ok=True)
 

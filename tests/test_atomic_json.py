@@ -3,6 +3,7 @@ import threading
 import time
 from pathlib import Path
 
+import backend.projects as projects
 from backend.projects import atomic_json
 
 
@@ -50,4 +51,29 @@ def test_concurrent_atomic_json_writers_use_independent_temporary_files(tmp_path
     assert max_active_writes == 1
     assert len(set(temporary_names)) == 2
     assert json.loads(target.read_text(encoding='utf-8')) in values
+    assert not list(tmp_path.glob('*.tmp'))
+
+
+def test_atomic_json_retries_transient_windows_destination_lock(tmp_path, monkeypatch):
+    target = tmp_path / 'state.json'
+    target.write_text('{"old": true}', encoding='utf-8')
+    original_replace = Path.replace
+    attempts = 0
+    waits = []
+
+    def locked_then_available(path, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 4:
+            raise PermissionError(5, 'destination is temporarily locked', str(destination))
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, 'replace', locked_then_available)
+    monkeypatch.setattr(projects.time, 'sleep', waits.append)
+
+    atomic_json(target, {'saved': True})
+
+    assert attempts == 4
+    assert waits == [0.025, 0.05, 0.1]
+    assert json.loads(target.read_text(encoding='utf-8')) == {'saved': True}
     assert not list(tmp_path.glob('*.tmp'))
