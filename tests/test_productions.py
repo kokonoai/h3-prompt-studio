@@ -1529,6 +1529,32 @@ def test_identity_repair_marks_only_the_affected_saved_clip_stale(tmp_path):
     assert repaired["segments"][1]["status"] == "ready"
 
 
+def test_voice_card_with_canonical_character_name_does_not_mark_clip_stale(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    hero = _card("Mimi", [_image(store_asset, "mimi", "red")["id"]])
+    # Real card libraries commonly give the voice card the same display name
+    # as its character while keeping a distinct synthesis ID.
+    voice = _card("Mimi", character_card_id=hero["id"], voice_id="Mimi_Voice",
+                  language="en", pace="steady")
+    hero["voice_card_id"] = voice["id"]
+    production = manager.create({"source_project": source, "brief": "Mimi speaks."})
+    production["cards"]["characters"] = [hero]
+    production["cards"]["voices"] = [voice]
+    production = manager.save(production)
+    timeline = {"visible_start": ["Mimi"], "visible_end": ["Mimi"], "enters": [],
+                "exits": [], "offscreen": [], "mentioned_only": []}
+    clip = _planned_clip("Mimi reports", ["Mimi"], timeline)
+    clip["dialogue"] = [{"speaker": "Mimi", "text": "Ready.",
+                         "language": "English", "voiceover": False}]
+    production = manager.apply_plan(production["id"], [clip], "local_ai")
+
+    prepared = manager.materialise(
+        production["id"], production["segments"][0]["id"])["production"]
+
+    assert prepared["segments"][0]["status"] == "ready"
+    assert prepared["segments"][0]["stale_reasons"] == []
+
+
 def test_character_name_does_not_fuzzily_select_all_owned_props(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "Pokke crosses the room."})

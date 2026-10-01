@@ -1658,8 +1658,17 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       const videoTargets=current.segments.filter(segment=>
         staleVideoSegmentIds.has(segment.id)||!segmentHasCompletedVideo(segment,overview));
       for(let i=0;i<videoTargets.length;i++){
-        const target=current.segments.find(item=>item.id===videoTargets[i].id)||videoTargets[i];
+        let target=current.segments.find(item=>item.id===videoTargets[i].id)||videoTargets[i];
         if(!staleVideoSegmentIds.has(target.id)&&segmentHasCompletedVideo(target,overview))continue;
+        // Re-check immediately before submission. A preceding prompt repair can
+        // legitimately change downstream continuity and make a later clip
+        // stale after the initial prompt-target snapshot was calculated.
+        if(segmentNeedsVideoPrompt(target)){
+          setBusy(full?t("全流程 · 第 4/6 步：提交前同步第 "+target.index+" 段提示词","Full run · Step 4/6: sync clip "+target.index+" prompt before submission","全工程・ステップ4/6：送信前にクリップ "+target.index+" のプロンプトを同期","全流程 · 第 4/6 步：提交前同步第 "+target.index+" 段提示詞"):t("一键生成 · 提交前同步第 "+target.index+" 段提示词","One-click production · sync clip "+target.index+" prompt before submission","一括制作・送信前にクリップ "+target.index+" のプロンプトを同期","一鍵生成 · 提交前同步第 "+target.index+" 段提示詞"));
+          const repaired=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as {production:Production};
+          current=repaired.production;setProduction(current);setDraft(current);
+          target=current.segments.find(item=>item.id===target.id)||target;
+        }
         setBusy(full?t("全流程 · 第 5/6 步：提交视频 "+(i+1)+"/"+videoTargets.length,"Full run · Step 5/6: submit video "+(i+1)+"/"+videoTargets.length,"全工程・ステップ5/6：映像を送信 "+(i+1)+"/"+videoTargets.length,"全流程 · 第 5/6 步：提交影片 "+(i+1)+"/"+videoTargets.length):t("一键生成 · 第 2/3 步：提交视频 "+(i+1)+"/"+videoTargets.length,"One-click production · Step 2/3: submit video "+(i+1)+"/"+videoTargets.length,"一括制作・ステップ2/3：映像を送信 "+(i+1)+"/"+videoTargets.length,"一鍵生成 · 第 2/3 步：提交影片 "+(i+1)+"/"+videoTargets.length));
         const submitted=await submitVideoWithPromptRepair(current,target);
         current=submitted.production;setProduction(current);setDraft(current);

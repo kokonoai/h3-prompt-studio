@@ -1182,11 +1182,23 @@ def segment_identity_repair_reasons(production, segment):
     }
     voice_aliases = voice_character_aliases(production)
     reasons = []
-    legacy_voice_labels = sorted({
-        str(line.get("speaker", "")).strip()
-        for line in segment.get("dialogue", [])
-        if str(line.get("speaker", "")).strip().casefold() in voice_aliases
-    })
+    legacy_voice_labels = []
+    for line in segment.get("dialogue", []):
+        label = str(line.get("speaker", "")).strip()
+        key = label.casefold()
+        voice_owner = voice_aliases.get(key)
+        character_owner = aliases.get(key)
+        # A voice card is commonly named after its owning character (for
+        # example both the character card and voice card are named ``Mimi``).
+        # That overlap is a valid canonical screenplay speaker, not a legacy
+        # voice-ID leak.  Only diagnose labels which resolve through the voice
+        # library without resolving to the same character through the normal
+        # character alias table (for example ``MIMI_V1``).
+        if (voice_owner is not None and
+                (character_owner is None or
+                 character_owner.get("id") != voice_owner.get("id"))):
+            legacy_voice_labels.append(label)
+    legacy_voice_labels = sorted(dict.fromkeys(legacy_voice_labels))
     if legacy_voice_labels:
         reasons.append(
             "本段对白把声线卡 ID 当成了画面角色（" + ", ".join(legacy_voice_labels) +
