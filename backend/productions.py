@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -1961,15 +1962,20 @@ class ProductionManager:
         self.collection_archive_directory.mkdir(parents=True, exist_ok=True)
         self.load_project, self.save_project, self.load_asset = load_project, save_project, load_asset
         self.store_asset = store_asset
+        # Production planning and prompt generation can outlive the request that
+        # started them.  Serialize file reads/writes so an explicit pause cannot
+        # be lost when one of those older requests eventually saves its result.
+        self.lock = threading.RLock()
 
     def _path(self, ident):
         return self.directory / (safe_id(ident) + ".json")
 
     def get(self, ident):
-        path = self._path(ident)
-        if not path.is_file():
-            raise ValueError("Production not found.")
-        return self.validate(json.loads(path.read_text(encoding="utf-8")))
+        with self.lock:
+            path = self._path(ident)
+            if not path.is_file():
+                raise ValueError("Production not found.")
+            return self.validate(json.loads(path.read_text(encoding="utf-8")))
 
     def list(self):
         values = []
@@ -2151,11 +2157,20 @@ class ProductionManager:
             upstream_changed = upstream_changed or source_changed
         return result
 
-    def save(self, value):
-        result = self.validate(value)
-        result["updated_at"] = time.time()
-        atomic_json(self._path(result["id"]), result)
-        return result
+    def save(self, value, *, allow_task_state_transition=False):
+        with self.lock:
+            result = self.validate(value)
+            path = self._path(result["id"])
+            if path.is_file() and not allow_task_state_transition:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+                # A long-running request may hold an older active snapshot.  Once
+                # the user pauses the production, only the explicit task-state
+                # update below is allowed to resume it.
+                if persisted.get("task_state") == "paused" and result["task_state"] == "active":
+                    result["task_state"] = "paused"
+            result["updated_at"] = time.time()
+            atomic_json(path, result)
+            return result
 
     def delete(self, ident):
         ident = safe_id(ident)
@@ -2235,7 +2250,7 @@ class ProductionManager:
         for key in allowed:
             if key in body:
                 current[key] = copy.deepcopy(body[key])
-        return self.save(current)
+        return self.save(current, allow_task_state_transition="task_state" in body)
 
     def apply_episode_plan(self, ident, planned, planner, warning=None):
         current = self.get(ident)

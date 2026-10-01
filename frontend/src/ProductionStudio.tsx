@@ -115,6 +115,7 @@ export function productionDialogueExport(value:Production){
   return `${value.title}\n${tx("项目语言","Project language","プロジェクト言語","專案語言")}：${languageName}\n\n${lines.join("\n")||tx("（无对白）","(no dialogue)","（台詞なし）","（無對白）")}\n`;
 }
 const CARD_KINDS:CardKind[]=["characters","wardrobe","props","environments","voices","styles"];
+const QUEUE_PAUSE_SIGNAL="__H3_PRODUCTION_PAUSE_REQUESTED__";
 const OVERVIEW_CARD_KINDS:OverviewCardKind[]=["characters","wardrobe","props","environments"];
 const CARD_META:Record<CardKind,{title:Record<UiLanguage,string>;hint:Record<UiLanguage,string>;upload:Record<UiLanguage,string>}>= {
   characters:{
@@ -1029,6 +1030,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const [draft,setDraft]=useState(()=>blank(project));
   const [busy,setBusy]=useState("");
   const busyRef=useRef(false);
+  const pauseRequestedRef=useRef(false);
+  const [taskStateBusy,setTaskStateBusy]=useState(false);
   const [error,setError]=useState("");
   const [notice,setNotice]=useState("");
   const [models,setModels]=useState<string[]>([]);
@@ -1085,6 +1088,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const chooseImageModel=(value:string)=>{setImageModel(value);localStorage.setItem("h3.production.imageModel",value);};
   useEffect(()=>{void refreshList();void refreshCollections();void refreshImageModels().catch(()=>{});void refreshVideoWorkflows();},[]);
   useEffect(()=>{if(!production)setDraft(blank(project));},[project.id]);
+  useEffect(()=>{pauseRequestedRef.current=production?.task_state==="paused";},[production?.id,production?.task_state]);
 
   const run=async(label:string,fn:()=>Promise<void>)=>{
     if(busyRef.current)return;busyRef.current=true;setBusy(label);setError("");setNotice("");
@@ -1104,7 +1108,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     if(!value)return create();
     const next=await apiPatch("/productions/"+value.id,{
       title:value.title,brief:value.brief,style_bible:value.style_bible,
-       language:value.language,prompt_version:value.prompt_version,auto_merge:value.auto_merge,auto_continue_previous:value.auto_continue_previous,task_state:value.task_state,
+       language:value.language,prompt_version:value.prompt_version,auto_merge:value.auto_merge,auto_continue_previous:value.auto_continue_previous,
       video_aspect_ratio:value.video_aspect_ratio,video_resolution:value.video_resolution,video_quality:value.video_quality,video_steps:value.video_steps,
       auto_keyframes_enabled:value.auto_keyframes_enabled,auto_keyframe_model:value.auto_keyframe_model,
       character_bible:value.character_bible,continuity_notes:value.continuity_notes,
@@ -1416,12 +1420,32 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     try{const value=await apiPatch("/productions/"+production.id,{auto_merge:enabled}) as Production;setProduction(value);autoMergeAttempt.current="";}
     catch(e){setError((e as Error).message);}
   };
-  const setTaskState=(state:"active"|"paused")=>run(state==="paused"?t("暂停后续任务","Pause queued work","後続タスクを一時停止","暫停後續任務"):t("继续制作任务","Resume production","制作タスクを再開","繼續製作任務"),async()=>{
-    if(!production)return;
-    const value=await apiPatch("/productions/"+production.id,{task_state:state}) as Production;
-    setProduction(value);setDraft(value);
-    setNotice(state==="paused"?t("已暂停新的规划、提示词、生成和合片任务。已经进入 ComfyUI 的当前渲染不会被强行中断。","New planning, prompting, renders and assembly are paused. A render already inside ComfyUI is not interrupted.","新しい計画・プロンプト・生成・結合を一時停止しました。ComfyUIで実行中のレンダーは中断しません。","已暫停新的規劃、提示詞、生成和合片任務。已進入 ComfyUI 的目前渲染不會被強制中斷。"):t("制作任务已继续，可以提交下一项工作。","Production resumed; new work can be submitted.","制作タスクを再開しました。新しい処理を送信できます。","製作任務已繼續，可以提交下一項工作。"));
-  });
+  const queuePausedNotice=()=>t(
+    "本集已暂停。当前正在保存、分析或渲染的这一项会安全完成，后续片段不再提交；下次恢复后点“继续完成本集”即可从缺失处接着做。",
+    "This episode is paused. The item currently saving, analysing or rendering may finish safely, but no later clips will be submitted. Resume later and choose Resume episode to continue from missing work.",
+    "この話を一時停止しました。現在保存・分析・レンダー中の1件は安全に完了しますが、後続クリップは送信しません。後で再開し、「この話を続行」で不足分から続けられます。",
+    "本集已暫停。目前正在儲存、分析或渲染的這一項會安全完成，後續片段不再提交；下次恢復後點「繼續完成本集」即可從缺失處接著做。"
+  );
+  const stopIfPauseRequested=()=>{if(pauseRequestedRef.current)throw new Error(QUEUE_PAUSE_SIGNAL);};
+  const isPauseRequestError=(error:unknown)=>pauseRequestedRef.current||(error as Error).message===QUEUE_PAUSE_SIGNAL;
+  const setTaskState=async(state:"active"|"paused")=>{
+    if(!production||taskStateBusy)return;
+    if(state==="paused")pauseRequestedRef.current=true;
+    setTaskStateBusy(true);setError("");
+    try{
+      const value=await apiPatch("/productions/"+production.id,{task_state:state}) as Production;
+      pauseRequestedRef.current=state==="paused";
+      setProduction(value);setDraft(value);await refreshList();
+      setNotice(state==="paused"?queuePausedNotice():t(
+        "制作任务已恢复。已完成内容仍然保留；点“继续完成本集”即可只处理缺失部分。",
+        "Production resumed. Completed work is still preserved; choose Resume episode to process only missing work.",
+        "制作タスクを再開しました。完成済み内容は保持されています。「この話を続行」で不足分だけを処理できます。",
+        "製作任務已恢復。已完成內容仍然保留；點「繼續完成本集」即可只處理缺失部分。"));
+    }catch(e){
+      if(state==="paused")pauseRequestedRef.current=false;
+      setError((e as Error).message);
+    }finally{setTaskStateBusy(false);}
+  };
   const exportStory=()=>{if(!production)return;downloadText(safeDownloadName(production.title)+"-story.md",productionStoryExport(production),"text/markdown;charset=utf-8");};
   const exportDialogue=()=>{if(!production)return;downloadText(safeDownloadName(production.title)+"-dialogue.txt",productionDialogueExport(production),"text/plain;charset=utf-8");};
   const deleteProduction=()=>run(t("删除片段","Delete part","パートを削除","刪除片段"),async()=>{
@@ -1515,6 +1539,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   });
   const generateAllPrompts=async(force=false)=>{
     if(busyRef.current||!production?.segments.length)return;
+    pauseRequestedRef.current=false;
     busyRef.current=true;setBulkAction(force?"redo-prompts":"prompts");setError("");setNotice("");
     try{
       let current=await save();
@@ -1524,6 +1549,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         return;
       }
       for(let i=0;i<targets.length;i++){
+        stopIfPauseRequested();
         const target=current.segments.find(item=>item.id===targets[i].id)||targets[i];
         setBusy(t("批量生成视频提示词：第 "+(i+1)+"/"+targets.length+" 段","Generating video prompts: "+(i+1)+"/"+targets.length,"映像プロンプトを一括生成："+(i+1)+"/"+targets.length,"批量生成影片提示詞：第 "+(i+1)+"/"+targets.length+" 段"));
         const result=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as any;
@@ -1532,11 +1558,12 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       await refreshList();
       setNotice(force?t("已重新生成全部 "+targets.length+" 段视频提示词；旧视频记录保留，可按需重做视频。","Regenerated all "+targets.length+" prompts. Existing video history is retained; regenerate videos as needed.","全"+targets.length+"件のプロンプトを再生成しました。以前の映像履歴は保持されます。","已重新生成全部 "+targets.length+" 段影片提示詞；舊影片紀錄保留，可按需重做影片。"):
         t("已生成 "+targets.length+" 段视频提示词；已有有效提示词保持不变。","Generated "+targets.length+" video prompts; valid existing prompts were kept.",targets.length+"件の映像プロンプトを生成しました。既存の有効なプロンプトは保持しました。","已生成 "+targets.length+" 段影片提示詞；已有有效提示詞保持不變。"));
-    }catch(e){setError((e as Error).message);}finally{busyRef.current=false;setBulkAction("");setBusy("");}
+    }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}finally{busyRef.current=false;setBulkAction("");setBusy("");}
   };
   const generateAllVideos=async(force=false)=>{
     if(busyRef.current||!production?.segments.length)return;
     if(force&&!window.confirm(t("将顺序重新渲染本集全部 "+production.segments.length+" 段视频，可能耗时较长；旧视频版本会保留。继续吗？","Regenerate all "+production.segments.length+" clips in order? This may take a while; old takes will be kept.","全"+production.segments.length+"件の映像を順番に再生成します。時間がかかる場合があります。旧テイクは保持されます。続けますか？","將依序重新渲染本集全部 "+production.segments.length+" 段影片，可能耗時較長；舊影片版本會保留。繼續嗎？")))return;
+    pauseRequestedRef.current=false;
     busyRef.current=true;setBulkAction(force?"redo-videos":"videos");setError("");setNotice("");
     try{
       let current=await save();
@@ -1550,6 +1577,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         return;
       }
       for(let i=0;i<targets.length;i++){
+        stopIfPauseRequested();
         let target=current.segments.find(item=>item.id===targets[i].id)||targets[i];
         if(!force&&segmentHasCompletedVideo(target,overview))continue;
         if(segmentNeedsVideoPrompt(target)){
@@ -1568,40 +1596,46 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           job=await api("/video/runs/"+job.id) as ProductionVideoJob;
           overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
         }
+        stopIfPauseRequested();
         if(job.status!=="succeeded")throw new Error(t("批量生成停在第 "+target.index+" 段：","Batch generation stopped at clip "+target.index+": ","一括生成はクリップ "+target.index+" で停止しました：","批量生成停在第 "+target.index+" 段：")+(job.error||job.stage||job.status));
         overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
       }
       await refreshList();
       setNotice(force?t("已按顺序重新生成全部 "+targets.length+" 段视频；旧版本仍在生成记录中。","Regenerated all "+targets.length+" clips in order; old takes remain in the history.","全"+targets.length+"件の映像を順番に再生成しました。以前のテイクは履歴に残ります。","已依序重新生成全部 "+targets.length+" 段影片；舊版本仍保留在紀錄中。"):
         t("缺失的 "+targets.length+" 段视频已全部完成；原有完成版本未重复生成。","All "+targets.length+" missing videos are complete; existing takes were not regenerated.","不足していた "+targets.length+" 件の映像が完了しました。既存テイクは再生成していません。","缺失的 "+targets.length+" 段影片已全部完成；原有完成版本未重複生成。"));
-    }catch(e){setError((e as Error).message);}finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production?.id,true);}
+    }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production?.id,true);}
   };
   const generateEpisodeFilm=async(options:{full?:boolean}={})=>{
     const full=!!options.full;
     if(busyRef.current||!production||(!full&&!production.segments.length))return;
     if(full&&!production.brief.trim()){setError(t("请先填写并保存故事原文 / 剧本。","Add and save the source story or screenplay first.","先に原作ストーリー／脚本を入力して保存してください。","請先填寫並儲存故事原文／劇本。"));return;}
     if(full&&!window.confirm(t("将为当前集依次补全文字卡、规划缺失分镜、生成缺失提示词和视频，并合并成片。已有成果不会重复覆盖；视频生成可能耗时较长。继续吗？","Run the current episode from text-card completion through missing storyboard, prompts, videos and final assembly? Existing work is kept; video rendering can take a long time.","現在話について文章カード補完、未作成の絵コンテ、プロンプト、映像、最終結合を順番に実行します。既存成果は保持され、映像生成には時間がかかります。続けますか？","將為目前集依序補全文字卡、規劃缺失分鏡、生成缺失提示詞和影片，並合併成片。已有成果不會重複覆蓋；影片生成可能耗時較長。繼續嗎？")))return;
+    pauseRequestedRef.current=false;
     busyRef.current=true;setBulkAction(full?"full":"all");setError("");setNotice("");
     let currentId=production.id;
     try{
       if(full)setBusy(t("全流程 · 第 1/6 步：保存并检查项目","Full run · Step 1/6: save and check project","全工程・ステップ1/6：保存と確認","全流程 · 第 1/6 步：儲存並檢查專案"));
       let current=await save();currentId=current.id;
+      stopIfPauseRequested();
       if(full){
         if(current.task_state==="paused")throw new Error(t("当前任务已暂停，请先恢复后再运行全流程。","This task is paused. Resume it before starting the full run.","このタスクは一時停止中です。再開してから全工程を実行してください。","目前任務已暫停，請先恢復後再執行全流程。"));
 
         setBusy(t("全流程 · 第 2/6 步：补全文字卡","Full run · Step 2/6: complete text cards","全工程・ステップ2/6：文章カードを補完","全流程 · 第 2/6 步：補全文字卡"));
         current=await api("/productions/"+current.id+"/cards/plan",{force:false},undefined,"POST",{timeoutMs:900000}) as Production;
         setProduction(current);setDraft(current);
+        stopIfPauseRequested();
 
         if(!current.episodes.length){
           setBusy(t("全流程 · 第 3/6 步：规划剧集","Full run · Step 3/6: plan episode","全工程・ステップ3/6：エピソード計画","全流程 · 第 3/6 步：規劃劇集"));
           current=await api("/productions/"+current.id+"/episodes/plan",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as Production;
           setProduction(current);setDraft(current);setOpenEpisodeId(current.episodes[0]?.id||null);
+          stopIfPauseRequested();
         }
         if(!current.segments.length){
           setBusy(t("全流程 · 第 3/6 步：拆分当前集分镜","Full run · Step 3/6: plan current episode clips","全工程・ステップ3/6：現在話をクリップ化","全流程 · 第 3/6 步：拆分目前集分鏡"));
           current=await api("/productions/"+current.id+"/plan",{use_ai:true},undefined,"POST",{timeoutMs:480000}) as Production;
           setProduction(current);setDraft(current);setKeyframeSuggestions([]);
+          stopIfPauseRequested();
         }
         if(!current.segments.length)throw new Error(t("没有生成可制作的分镜，请先检查剧本内容和剧集规划。","No producible storyboard clips were created. Check the screenplay and episode plan.","制作可能なクリップが作成されませんでした。脚本とエピソード計画を確認してください。","沒有生成可製作的分鏡，請先檢查劇本內容和劇集規劃。"));
         setProductionPage("storyboard");await refreshList();
@@ -1615,6 +1649,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         if(!models.includes(current.auto_keyframe_model))throw new Error(t("已开启自动补关键帧，但选定的本地生图模型当前不可用。请先在设置检查 ComfyUI 和模型。","Automatic keyframes are on, but the selected local image model is unavailable. Check ComfyUI and the model in Settings.","自動キーフレームが有効ですが、選択した画像モデルを利用できません。設定でComfyUIとモデルを確認してください。","已開啟自動補關鍵影格，但選定的本地生圖模型目前不可用。請先在設定檢查 ComfyUI 和模型。"));
         const review=await api("/productions/"+current.id+"/keyframe-suggestions") as {suggestions:{segment_id:string;index:number;prompt:string}[]};
         for(let i=0;i<review.suggestions.length;i++){
+          stopIfPauseRequested();
           const suggestion=review.suggestions[i];
           setBusy(full?t("全流程 · 第 4/6 步：补环境关键帧 "+(i+1)+"/"+review.suggestions.length,"Full run · Step 4/6: environment keyframe "+(i+1)+"/"+review.suggestions.length,"全工程・ステップ4/6：背景キーフレーム "+(i+1)+"/"+review.suggestions.length,"全流程 · 第 4/6 步：補環境關鍵影格 "+(i+1)+"/"+review.suggestions.length):t("一键生成 · 补环境关键帧 "+(i+1)+"/"+review.suggestions.length,"One-click · environment keyframe "+(i+1)+"/"+review.suggestions.length,"一括制作・背景キーフレーム "+(i+1)+"/"+review.suggestions.length,"一鍵生成 · 補環境關鍵影格 "+(i+1)+"/"+review.suggestions.length));
           await api("/productions/"+current.id+"/segments/"+suggestion.segment_id+"/image",{
@@ -1629,6 +1664,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
             await sleep(1500);
           }
           if(!completed)throw new Error(t("自动关键帧仍在运行；已暂停一键流程，请稍后刷新项目。","The keyframe is still running. One-click production stopped; refresh the project later.","キーフレームは処理中です。一括制作を停止したので後で更新してください。","自動關鍵影格仍在執行；已暫停一鍵流程，請稍後重新整理專案。"));
+          stopIfPauseRequested();
         }
       }
 
@@ -1639,6 +1675,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       if(missingCharacterImages.length){
         const activeImageModel=await resolveImageModel();
         for(let i=0;i<missingCharacterImages.length;i++){
+          stopIfPauseRequested();
           const card=current.cards.characters.find(item=>item.id===missingCharacterImages[i].id)||missingCharacterImages[i];
           setBusy(t("一键生成 · 补角色身份图 "+(i+1)+"/"+missingCharacterImages.length,"One-click · character identity "+(i+1)+"/"+missingCharacterImages.length,"一括制作・キャラクター画像 "+(i+1)+"/"+missingCharacterImages.length,"一鍵生成 · 補角色身份圖 "+(i+1)+"/"+missingCharacterImages.length));
           current=await produceCardImage(current,"characters",card,activeImageModel);
@@ -1648,6 +1685,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       const staleVideoSegmentIds=new Set(current.segments.filter(segment=>segment.status==="stale").map(segment=>segment.id));
       const promptTargets=current.segments.filter(segmentNeedsVideoPrompt);
       for(let i=0;i<promptTargets.length;i++){
+        stopIfPauseRequested();
         const target=current.segments.find(item=>item.id===promptTargets[i].id)||promptTargets[i];
         setBusy(full?t("全流程 · 第 4/6 步：视频提示词 "+(i+1)+"/"+promptTargets.length,"Full run · Step 4/6: video prompts "+(i+1)+"/"+promptTargets.length,"全工程・ステップ4/6：映像プロンプト "+(i+1)+"/"+promptTargets.length,"全流程 · 第 4/6 步：影片提示詞 "+(i+1)+"/"+promptTargets.length):t("一键生成 · 第 1/3 步：提示词 "+(i+1)+"/"+promptTargets.length,"One-click production · Step 1/3: prompts "+(i+1)+"/"+promptTargets.length,"一括制作・ステップ1/3：プロンプト "+(i+1)+"/"+promptTargets.length,"一鍵生成 · 第 1/3 步：提示詞 "+(i+1)+"/"+promptTargets.length));
         const result=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as any;
@@ -1658,6 +1696,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       const videoTargets=current.segments.filter(segment=>
         staleVideoSegmentIds.has(segment.id)||!segmentHasCompletedVideo(segment,overview));
       for(let i=0;i<videoTargets.length;i++){
+        stopIfPauseRequested();
         let target=current.segments.find(item=>item.id===videoTargets[i].id)||videoTargets[i];
         if(!staleVideoSegmentIds.has(target.id)&&segmentHasCompletedVideo(target,overview))continue;
         // Re-check immediately before submission. A preceding prompt repair can
@@ -1679,12 +1718,14 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           job=await api("/video/runs/"+job.id) as ProductionVideoJob;
           overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
         }
+        stopIfPauseRequested();
         if(job.status!=="succeeded")throw new Error(t("一键生成停在第 "+target.index+" 段：","One-click production stopped at clip "+target.index+": ","一括制作はクリップ "+target.index+" で停止しました：","一鍵生成停在第 "+target.index+" 段：")+(job.error||job.stage||job.status));
         overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
       }
 
       overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
       if(!overview.all_ready)throw new Error(t("仍有片段没有可采用的视频，一键生成已在合片前停止。","Some clips still have no adoptable video. One-click production stopped before assembly.","採用できる映像がないクリップが残っているため、結合前に一括制作を停止しました。","仍有片段沒有可採用的影片，一鍵生成已在合片前停止。"));
+      stopIfPauseRequested();
       setBusy(full?t("全流程 · 第 6/6 步：合并最终成片","Full run · Step 6/6: assembling final film","全工程・ステップ6/6：最終映像を結合","全流程 · 第 6/6 步：合併最終成片"):t("一键生成 · 第 3/3 步：合并最终成片","One-click production · Step 3/3: assembling final film","一括制作・ステップ3/3：最終映像を結合","一鍵生成 · 第 3/3 步：合併最終成片"));
       setMerging(true);
       overview=await api("/productions/"+current.id+"/film",{},undefined,"POST",{timeoutMs:1800000}) as ProductionOutputs;
@@ -1693,7 +1734,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       setNotice(full?t("全流程完成：文字卡、剧集规划、分镜、提示词、视频和最终成片均已处理。","Full run complete: text cards, episode plan, storyboard, prompts, videos and final assembly are ready.","全工程が完了しました。文章カード、エピソード計画、絵コンテ、プロンプト、映像、最終結合を処理しました。","全流程完成：文字卡、劇集規劃、分鏡、提示詞、影片和最終成片均已處理。"):t("整集已完成：提示词、视频和最终成片均已按分镜顺序生成。","The episode is complete: prompts, videos and the final film were produced in storyboard order.","全話が完成しました。プロンプト・映像・最終映像を絵コンテ順に生成しました。","整集已完成：提示詞、影片和最終成片均已按分鏡順序生成。"));
     }catch(e){
       const reason=(e as Error).message;
-      setError(t(
+      if(isPauseRequestError(e)){setNotice(queuePausedNotice());}
+      else setError(t(
         "一键流程已暂停，已经完成的提示词和视频均已保存。请确认 H3 Studio 与 ComfyUI 正在运行，再点“继续完成本集”即可从缺失处接着做。原因：",
         "One-click production paused. Completed prompts and videos are saved. Make sure H3 Studio and ComfyUI are running, then choose Resume episode to continue only the missing work. Reason: ",
         "一括制作を中断しました。完了済みのプロンプトと映像は保存されています。H3 Studio と ComfyUI を起動し、「この話を続行」で不足分から再開してください。理由：",
@@ -1792,9 +1834,11 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       </div>
       <div className="production-full-runner-actions">
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
-        <button className="primary" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
+        <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
           {bulkAction==="full"?<LoaderCircle className="spin" size={18}/>:<Sparkles size={18}/>}<span>{bulkAction==="full"?t("全流程运行中…","Full run in progress…","全工程を実行中…","全流程執行中…"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
-        </button>
+        </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy||(production.task_state==="paused"&&!!busy)} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
+          {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存状态…","Saving state…","状態を保存中…","正在儲存狀態…"):production.task_state==="paused"?t("恢复任务","Resume task","タスクを再開","恢復任務"):busy?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
+        </button></div>
       </div>
     </section>}
     {(error||notice)&&<div className={error?"production-alert error":"production-alert"}>{error||notice}</div>}
@@ -1859,7 +1903,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     </section>}{production&&<>
       <section className="production-bible card" id="production-bible" hidden={productionPage!=="script"}>
         <div className="section-title"><div><span className="eyebrow">PRODUCTION BIBLE</span><h2>{t("全片约束","Film-wide constraints","作品全体の制約","全片約束")}</h2></div>
-          <div className="production-title-actions"><button className={production.task_state==="paused"?"primary":""} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>{production.task_state==="paused"?<><Play size={17}/>{t("继续任务","Resume","再開","繼續任務")}</>:<><Pause size={17}/>{t("暂停任务","Pause","一時停止","暫停任務")}</>}</button><button onClick={exportStory}><Download size={17}/>{t("导出整体剧情","Export story","物語を書き出す","匯出整體劇情")}</button><button onClick={exportDialogue}><Download size={17}/>{t("导出对白","Export dialogue","台詞を書き出す","匯出對白")}</button><button onClick={()=>void run(t("保存片段","Save part","パートを保存","儲存片段"),async()=>{await save();setNotice(t("片段已保存。","Part saved.","パートを保存しました。","片段已儲存。"))})}><Save size={17}/> {t("保存片段","Save part","パートを保存","儲存片段")}</button><button className="danger" onClick={()=>void deleteProduction()}><Trash2 size={17}/>{t("删除片段","Delete part","パートを削除","刪除片段")}</button></div></div>
+          <div className="production-title-actions"><button className={production.task_state==="paused"?"primary":""} disabled={taskStateBusy||(production.task_state==="paused"&&!!busy)} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>{production.task_state==="paused"?<><Play size={17}/>{t("恢复任务","Resume task","タスクを再開","恢復任務")}</>:<><Pause size={17}/>{busy?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停任务","Pause task","一時停止","暫停任務")}</>}</button><button onClick={exportStory}><Download size={17}/>{t("导出整体剧情","Export story","物語を書き出す","匯出整體劇情")}</button><button onClick={exportDialogue}><Download size={17}/>{t("导出对白","Export dialogue","台詞を書き出す","匯出對白")}</button><button onClick={()=>void run(t("保存片段","Save part","パートを保存","儲存片段"),async()=>{await save();setNotice(t("片段已保存。","Part saved.","パートを保存しました。","片段已儲存。"))})}><Save size={17}/> {t("保存片段","Save part","パートを保存","儲存片段")}</button><button className="danger" onClick={()=>void deleteProduction()}><Trash2 size={17}/>{t("删除片段","Delete part","パートを削除","刪除片段")}</button></div></div>
         {production.task_state==="paused"&&<div className="production-paused"><Pause size={18}/><div><strong>{t("项目已暂停后续调度","Production scheduling is paused","制作スケジュールは一時停止中","專案已暫停後續調度")}</strong><span>{t("仍可编辑和导出。新的规划、提示词、关键帧、视频和合片任务暂不提交；已经进入 ComfyUI 的渲染继续运行。","Editing and export remain available. New planning, prompt, keyframe, video and assembly jobs are held; an existing ComfyUI render keeps running.","編集と書き出しは可能です。新しい計画・プロンプト・キーフレーム・映像・結合は保留され、ComfyUIで実行中のレンダーは継続します。","仍可編輯和匯出。新的規劃、提示詞、關鍵影格、影片和合片任務暫不提交；已進入 ComfyUI 的渲染繼續執行。")}</span></div></div>}
         <div className="production-grid"><label>{t("片名","Title","作品名","片名")}<input value={production.title} onChange={e=>updateField("title",e.target.value)}/></label>
           <label>{t("项目输出语言","Project output language","プロジェクト出力言語","專案輸出語言")}<select value={production.language} onChange={e=>updateField("language",e.target.value)}>{LANGUAGE_OPTIONS.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select><small>{t("原剧本可用任意语言；本地 LLM 会把分镜、对白和提示词统一输出为这里选择的语言。","The source may use any language. The local LLM writes storyboards, dialogue and prompts in the selected language.","入力言語は自由です。ローカルLLMは絵コンテ・台詞・プロンプトを選択した言語で出力します。","原劇本可用任意語言；本地 LLM 會把分鏡、對白和提示詞統一輸出為這裡選擇的語言。")}</small></label></div>
@@ -1990,7 +2034,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           {keyframeSuggestions.map(item=><div className="storyboard-keyframe-suggestion" key={item.segment_id}><div><strong>{t("第 "+item.index+" 段","Clip "+item.index,"クリップ "+item.index,"第 "+item.index+" 段")}</strong><small>{item.reason}</small><button className="icon" title={t("删除此建议","Remove suggestion","候補を削除","刪除此建議")} onClick={()=>setKeyframeSuggestions(rows=>rows.filter(row=>row.segment_id!==item.segment_id))}><X size={16}/></button></div><textarea rows={3} value={item.prompt} onChange={e=>setKeyframeSuggestions(rows=>rows.map(row=>row.segment_id===item.segment_id?{...row,prompt:e.target.value}:row))}/></div>)}
         </section>}
         {!!production.segments.length&&<div className="storyboard-batch-bar card"><div className="storyboard-batch-copy"><span className="eyebrow">EPISODE AUTOMATION</span><strong>{t("整集制作控制台","Episode production console","エピソード制作コンソール","整集製作控制台")}</strong><span>{t("中断后可从缺失处续跑；“全部重做”才会建立新版本，旧提示词与视频仍然保留。","Interrupted runs resume from missing work. Only Rebuild all creates new versions; earlier prompts and video takes remain available.","中断後は不足分から再開できます。「すべて再作成」のみ新しい版を作り、以前のプロンプトと映像を保持します。","中斷後可從缺失處續跑；「全部重做」才會建立新版本，舊提示詞與影片仍然保留。")}</span><div className="storyboard-batch-progress"><span className={ready===production.segments.length?"complete":""}>{t("H3 工程","H3 projects","H3プロジェクト","H3 專案")} <b>{ready}/{production.segments.length}</b></span><span className={(outputs?.ready_count||0)===production.segments.length?"complete":""}>{t("视频","Videos","映像","影片")} <b>{outputs?.ready_count||0}/{production.segments.length}</b></span><span className={outputs?.final_ready?"complete":""}>{t("最终成片","Final film","最終映像","最終成片")} <b>{outputs?.final_ready?t("已完成","Ready","完成","已完成"):t("待合并","Pending","未結合","待合併")}</b></span></div></div>
-          <button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm()}><Film size={18}/>{bulkAction==="all"?t("正在续跑本集…","Resuming this episode…","この話を再開中…","正在續跑本集…"):production.segments.some(segment=>segment.status==="stale")?t("更新并重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段","Update and remake "+production.segments.filter(segment=>segment.status==="stale").length+" clips",production.segments.filter(segment=>segment.status==="stale").length+" 件を更新して再制作","更新並重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
+          <div className="storyboard-batch-main-actions"><button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm()}><Film size={18}/>{bulkAction==="all"?t("正在续跑本集…","Resuming this episode…","この話を再開中…","正在續跑本集…"):production.segments.some(segment=>segment.status==="stale")?t("更新并重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段","Update and remake "+production.segments.filter(segment=>segment.status==="stale").length+" clips",production.segments.filter(segment=>segment.status==="stale").length+" 件を更新して再制作","更新並重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
+            <button className={production.task_state==="paused"?"batch-task-toggle resume":"batch-task-toggle pause"} disabled={taskStateBusy||(production.task_state==="paused"&&!!busy)} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>{production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存…","Saving…","保存中…","正在儲存…"):production.task_state==="paused"?t("恢复任务","Resume task","タスクを再開","恢復任務"):busy?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span></button></div>
           <div className="storyboard-batch-actions">
             <div className="batch-action-group batch-action-primary"><span>{t("补齐缺失","Fill missing","不足分を補完","補齊缺失")}</span><div>
               <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts()}><Sparkles size={16}/>{bulkAction==="prompts"?t("生成中…","Generating…","生成中…","生成中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>

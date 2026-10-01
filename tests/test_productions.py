@@ -1647,6 +1647,23 @@ def test_automatic_continuation_is_opt_in_and_keeps_the_source_project_untouched
         manager.update(production["id"], {"auto_continue_previous": "yes"})
 
 
+def test_stale_long_running_save_cannot_clear_an_explicit_pause(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A crosses the library."})
+    stale_active_snapshot = copy.deepcopy(production)
+
+    paused = manager.update(production["id"], {"task_state": "paused"})
+    assert paused["task_state"] == "paused"
+
+    stale_active_snapshot["style_bible"] = "A late planning result."
+    saved = manager.save(stale_active_snapshot)
+    assert saved["task_state"] == "paused"
+    assert manager.get(production["id"])["task_state"] == "paused"
+
+    resumed = manager.update(production["id"], {"task_state": "active"})
+    assert resumed["task_state"] == "active"
+
+
 def test_classic_voice_style_does_not_import_the_full_series_voice_roster(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "language": "en",
