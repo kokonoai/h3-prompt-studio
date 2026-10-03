@@ -1749,6 +1749,11 @@ def segment_identity_repair_reasons(production, segment):
         raw = re.split(r"[|｜]", str(line.get("speaker", "")).strip().casefold(), maxsplit=1)[0].strip()
         character = aliases.get(raw) or voice_aliases.get(raw)
         canonical = str(character.get("name", "")).strip() if character else ""
+        # A remote/display speaker can be audible without occupying the local
+        # physical cast timeline.  The visual-plane role is authoritative here;
+        # only a genuinely physical speaker must be added to visible_start/end.
+        if character and roles.get(character.get("id")) != "physical":
+            continue
         if canonical and canonical.casefold() not in visible_timeline:
             missing_visible_speakers.append(canonical)
     if missing_visible_speakers:
@@ -4420,6 +4425,14 @@ class ProductionManager:
         # silently assembled as though it matched the new prompt.
         segment["selected_video_run_id"] = None
         if project_id:
+            # Materialisation can repair an unsafe planner timeline (for
+            # example, a remote caller incorrectly staged as a second body in
+            # the local room).  Persist that effective physical/off-screen
+            # timeline when the rebuilt prompt is accepted.  Otherwise
+            # validation immediately diagnoses the old planner timeline again
+            # and flips the freshly rebuilt clip back to ``stale``.
+            segment["cast_timeline"] = effective_cast_timeline(production, segment)
+            segment["cast_timeline_version"] = CAST_TIMELINE_VERSION
             segment["project_id"] = safe_id(project_id)
             segment["status"] = "ready"
             segment["source_hash"] = segment_hash(segment)

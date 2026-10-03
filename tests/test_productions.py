@@ -277,6 +277,20 @@ def test_online_only_canon_repairs_planner_colocation_and_survives_final_prompt(
     assert "Visible at opening: Koko" in compiled["prompt"]
     assert "Off-screen for the entire clip: Besi" in compiled["prompt"]
 
+    # Accepting the rebuilt prompt must migrate the repaired timeline back to
+    # the production clip.  Without this write-back, normalisation would see
+    # the planner's old co-located cast again and immediately mark the clip
+    # stale, causing one-click production to stop in a repair loop.
+    production = manager.set_segment_prompt(
+        production["id"], production["segments"][0]["id"], compiled["prompt"],
+        "compiled", 1.0, project["id"])
+    segment = production["segments"][0]
+    assert segment["status"] == "ready", segment.get("stale_reasons")
+    assert segment["stale_reasons"] == []
+    assert segment["cast_timeline"]["visible_start"] == ["Koko"]
+    assert segment["cast_timeline"]["visible_end"] == ["Koko"]
+    assert segment["cast_timeline"]["offscreen"] == ["Besi"]
+
 
 @pytest.mark.parametrize(("action", "image_prompt", "expected", "rejected"), [
     ("Koko looks at the phone and hesitates.", "Medium close-up on Koko's face.",
