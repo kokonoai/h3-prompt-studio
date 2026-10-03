@@ -9,11 +9,12 @@ from backend.compiler import compile_project
 from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
                                  authored_internal_timing,
                                  card_plan_source_hash, character_aliases, current_episode_story,
-                                 continuity_visual_lock,
+                                 character_presence_roles,
+                                 continuity_visual_lock, device_screen_geometry_lock,
                                  episode_timing_targets, fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
-                                 production_schema_for_story, render_character_identity,
+                                 normalise_segment, production_schema_for_story, render_character_identity,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash,
                                  timed_clip_groups, timed_group_story)
@@ -172,7 +173,124 @@ def test_local_ai_visible_action_recovers_omitted_character_but_keeps_voice_offs
 
     relevant = manager._relevant_cards(production, segment)
 
-    assert [card["name"] for card in relevant["characters"]] == ["Anchor-Worm", "CJ"]
+    assert {card["name"] for card in relevant["characters"]} == {"CJ", "Rick Park", "Anchor-Worm"}
+    roles = character_presence_roles(production, segment)
+    assert roles[cj["id"]] == "physical"
+    assert roles[rick["id"]] == "offscreen"
+    assert roles[creature["id"]] == "physical"
+
+
+def test_materialise_separates_local_actor_phone_actor_and_mentioned_recipient(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    koko = _card("Koko", [_image(store_asset, "Koko", "pink")["id"]])
+    besi = _card("Besi", [_image(store_asset, "Besi", "blue")["id"]])
+    production = manager.create({"source_project": source, "brief": "Koko calls Besi.", "language": "en"})
+    production["cards"]["characters"] = [koko, besi]
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Call", "story": "Koko calls Besi.", "setting": "Koko's room during a video call",
+        "action": "Koko holds her phone. Besi's face appears only on the phone screen.",
+        "ending": "Koko smiles at the screen.", "duration": 5, "duration_reason": "one reaction",
+        "image_prompt": "Koko watches Besi on the phone screen", "dialogue": [],
+        "card_selection": {"characters": ["Koko", "Besi"]},
+    }], "local_ai")
+
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    names = {subject["id"]: subject["name"] for subject in project["subjects"]}
+    scene = project["shots"][0]
+    assert [names[ident] for ident in scene["visible_subject_ids"]] == ["Koko"]
+    assert [names[ident] for ident in scene["display_subject_ids"]] == ["Besi"]
+    assert scene["imagined_subject_ids"] == []
+    assert "DEVICE INTERACTION LOCK" in scene["action"]
+    assert "SCREEN-VIEW GEOMETRY LOCK" in scene["action"]
+    assert "do not also show the holder's unobstructed frontal face" in scene["action"]
+    assert "The only person permitted inside the display is Besi" in scene["action"]
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+    assert "REMOTE DISPLAY CAST" in compiled["prompt"]
+    assert "Principal cast in this shot: exactly 1" in compiled["prompt"]
+
+    # Merely naming the recipient of a private message must not recruit that
+    # person's image or body into the writer's room.
+    segment = production["segments"][0]
+    segment.update(
+        story="Koko writes a private love note to Besi.",
+        action="Koko writes 'Besi, I love you' on a card and smiles.",
+        image_prompt="Koko writing alone at her desk",
+        card_selection={"characters": ["Koko"], "wardrobe": [], "props": [],
+                        "environments": [], "voices": []},
+        cast_timeline={"visible_start": ["Koko"], "visible_end": ["Koko"],
+                       "enters": [], "exits": [], "offscreen": [],
+                       "mentioned_only": ["Besi"]},
+        card_selection_source="local_ai")
+    production = manager.save(production)
+    project = manager.materialise(production["id"], segment["id"])["project"]
+    scene = project["shots"][0]
+    assert [subject["name"] for subject in project["subjects"]] == ["Koko"]
+    assert len(scene["visible_subject_ids"]) == 1
+    assert scene["display_subject_ids"] == []
+    assert "EMOTIONAL SUBTEXT LOCK" in scene["action"]
+
+
+@pytest.mark.parametrize(("action", "image_prompt", "expected", "rejected"), [
+    ("Koko looks at the phone and hesitates.", "Medium close-up on Koko's face.",
+     "PERFORMANCE-VIEW GEOMETRY LOCK", "SCREEN-VIEW GEOMETRY LOCK"),
+    ("Insert shot: the phone screen shows the cream card.", "Over-the-shoulder phone screen.",
+     "SCREEN-VIEW GEOMETRY LOCK", "PERFORMANCE-VIEW GEOMETRY LOCK"),
+    ("Koko holds the smartphone to her ear.", "Koko listens on the phone.",
+     "PHONE-TO-EAR GEOMETRY LOCK", "SCREEN-VIEW GEOMETRY LOCK"),
+    ("Koko looks directly into the phone camera and speaks.", "Phone-camera POV.",
+     "FRONT-CAMERA GEOMETRY LOCK", "PERFORMANCE-VIEW GEOMETRY LOCK"),
+])
+def test_phone_composition_chooses_one_physically_possible_screen_view(
+        action, image_prompt, expected, rejected):
+    lock = device_screen_geometry_lock({
+        "story": "A private phone moment.", "setting": "bedroom",
+        "action": action, "ending": "Koko pauses.", "image_prompt": image_prompt})
+
+    assert expected in lock
+    assert rejected not in lock
+    assert "one front screen and one back" in lock
+    assert "no transparent, mirrored, floating, detached, rear-facing or double-sided screen" in lock
+
+
+def test_remote_call_split_uses_separate_location_panels_not_a_phone_inside_a_phone():
+    lock = device_screen_geometry_lock({
+        "story": "Koko and Besi speak over a video call.",
+        "setting": "Split screen: Koko's room and Besi's apartment.",
+        "action": "They look toward each other and smile.",
+        "ending": "They share a quiet laugh.",
+        "image_prompt": "Two remote locations."}, ["Koko", "Besi"])
+
+    assert "REMOTE-CALL PANEL GEOMETRY LOCK" in lock
+    assert "never occupy the same room" in lock
+    assert "appear again inside a phone" in lock
+    assert "SCREEN-VIEW GEOMETRY LOCK" not in lock
+
+
+def test_manual_device_view_overrides_conflicting_automatic_phone_framing():
+    segment = {
+        "device_view": "performance",
+        "story": "Koko receives Besi's video call.", "setting": "Koko's room",
+        "action": "Besi's face appears on the phone screen while Koko reacts.",
+        "ending": "Koko smiles.", "image_prompt": "Koko holding a phone."}
+
+    lock = device_screen_geometry_lock(segment, ["Besi"])
+
+    assert "PERFORMANCE-VIEW GEOMETRY LOCK" in lock
+    assert "SCREEN-VIEW GEOMETRY LOCK" not in lock
+    assert "DIRECTOR OVERRIDE" in lock
+
+
+def test_segment_device_view_defaults_to_auto_and_invalid_legacy_values_are_safe():
+    base = _planned_clip("Phone beat", [], {key: [] for key in
+                         ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")})
+
+    assert normalise_segment(base, 0)["device_view"] == "auto"
+    base["device_view"] = "transparent_magic_phone"
+    assert normalise_segment(base, 0)["device_view"] == "auto"
+    base["device_view"] = "screen"
+    assert normalise_segment(base, 0)["device_view"] == "screen"
 
 
 def test_video_admission_rejects_old_or_missing_character_identity_strategy(tmp_path):

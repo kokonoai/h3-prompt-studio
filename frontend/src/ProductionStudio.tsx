@@ -8,6 +8,7 @@ import VideoLibrary from "./VideoLibrary";
 import "./ProductionStudio.css";
 
 type Dialogue = { speaker:string; text:string; language:string; voiceover:boolean };
+type DeviceViewMode = "auto"|"performance"|"screen"|"front_camera"|"phone_to_ear"|"remote_panel";
 type CardKind = "characters"|"wardrobe"|"props"|"environments"|"voices"|"styles";
 type SelectableCardKind = Exclude<CardKind,"styles">;
 type OverviewCardKind = "characters"|"wardrobe"|"props"|"environments";
@@ -29,6 +30,7 @@ type Segment = {
   prompt_direction?:string; video_prompt?:string; video_prompt_source?:"local_ai"|"compiled"|"";
   prompt_seconds?:number|null; prompt_updated_at?:number|null; prepare_seconds?:number|null;
   workflow_profile_id?:string;
+  device_view?:DeviceViewMode;
   selected_video_run_id?:string|null; last_video_run_id?:string|null;
   card_selection?:Record<SelectableCardKind,string[]>; card_selection_source?:"local_ai"|"heuristic";
 };
@@ -1179,6 +1181,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       duration_reason:t("人工新增；请按动作和对白需要调整为 5–15 秒。","Added manually; set 5–15 seconds to fit the action and dialogue.","手動追加。動作と台詞に合わせて5〜15秒に調整してください。","人工新增；請按動作和對白需要調整為 5–15 秒。"),
       dialogue:[],image_prompt:"",status:"unprepared",stale_reasons:[],keyframe_asset_ids:[],image_run_ids:[],
       prompt_direction:"",video_prompt:"",video_prompt_source:"",workflow_profile_id:"builtin",
+      device_view:"auto",
       card_selection:{characters:[],wardrobe:[],props:[],environments:[],voices:[]},card_selection_source:"heuristic",
       selected_video_run_id:null,last_video_run_id:null,project_id:null,
     };
@@ -2062,6 +2065,14 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
               <div>{(Object.entries(segment.card_selection) as [SelectableCardKind,string[]][]).flatMap(([kind,names])=>names.map(name=><span key={kind+name}>{selectionLabels[kind]} · {name}</span>))}</div>:
               <em>{t("本段没有指定额外资产卡；准备工程时会按分镜内容安全匹配。","No extra card is specified; safe matching is applied when the project is prepared.","追加カードの指定はありません。プロジェクト準備時に安全な照合を行います。","本段沒有指定額外資產卡；準備專案時會按分鏡內容安全匹配。")}</em>}
           </div>
+          <div className="segment-device-view"><div><strong>{t("设备镜头模式","Device shot mode","デバイス撮影モード","裝置鏡頭模式")}</strong><small>{t("仅控制手机、平板、监视器和远程通话的空间朝向；默认自动。手动更改后需要重建本段提示词和视频。","Controls the spatial view of phones, tablets, monitors and remote calls only. Auto is the default; after a manual change, rebuild this clip's prompt and video.","スマートフォン・タブレット・モニター・遠隔通話の画面方向だけを制御します。通常は自動です。手動変更後はこのクリップのプロンプトと映像を再生成してください。","僅控制手機、平板、螢幕和遠端通話的空間朝向；預設自動。手動變更後需要重建本段提示詞和影片。")}</small></div><select value={segment.device_view||"auto"} onChange={e=>updateSegment(segment.id,"device_view",e.target.value as DeviceViewMode)}>
+            <option value="auto">{t("自动判断（推荐）","Auto (recommended)","自動判定（推奨）","自動判斷（推薦）")}</option>
+            <option value="performance">{t("人物反应 · 屏幕背向观众","Performance · screen faces away","人物の反応・画面は観客に見せない","人物反應 · 螢幕背向觀眾")}</option>
+            <option value="screen">{t("屏幕特写 · 过肩/插入镜头","Screen view · over-shoulder/insert","画面アップ・肩越し／インサート","螢幕特寫 · 過肩／插入鏡頭")}</option>
+            <option value="front_camera">{t("前置摄像头 · 手机视角","Front camera · phone POV","前面カメラ・スマホ視点","前置攝影機 · 手機視角")}</option>
+            <option value="phone_to_ear">{t("贴耳通话 · 屏幕隐藏","Phone to ear · screen hidden","耳元通話・画面を隠す","貼耳通話 · 螢幕隱藏")}</option>
+            <option value="remote_panel">{t("远程分屏 · 双方独立空间","Remote split · separate locations","遠隔分割・別々の空間","遠端分割 · 雙方獨立空間")}</option>
+          </select></div>
           <div className="production-grid"><label>{t("场景地点","Setting","場所","場景地點")}<input value={segment.setting} onChange={e=>updateSegment(segment.id,"setting",e.target.value)}/></label>
             <label>{t("结束画面 / 衔接状态","Ending frame / continuity state","終了画面 / 継続状態","結束畫面 / 銜接狀態")}<input value={segment.ending} onChange={e=>updateSegment(segment.id,"ending",e.target.value)}/></label></div>
           <label>{t("本段故事事实","Story facts for this clip","このクリップの物語上の事実","本段故事事實")}<textarea rows={3} value={segment.story} onChange={e=>updateSegment(segment.id,"story",e.target.value)}/></label>

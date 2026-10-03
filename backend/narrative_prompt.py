@@ -188,7 +188,11 @@ def _voice_and_dialogue(project, shots, names, speaker_ids):
             if delivery.lower().startswith('follow locked voice card'):
                 delivery = ''
             prefix = names[sid] + ' ' + speaker_ids.get(sid, '')
-            if line.get('voiceover') or sid in shot.get('offscreen_subject_ids', []):
+            if sid in shot.get('display_subject_ids', []):
+                prefix += ' (voice from the bounded device/remote display only)'
+            elif sid in shot.get('imagined_subject_ids', []):
+                prefix += ' (voice tied only to the non-diegetic thought or memory image)'
+            elif line.get('voiceover') or sid in shot.get('offscreen_subject_ids', []):
                 prefix += ' (off-screen voice)'
             lines.append(prefix + ': <d>[' + tag + '] ' + words + '</d>'
                          + (' Delivery: ' + _sentence(delivery) if delivery else ''))
@@ -213,6 +217,8 @@ def render_narrative_prompt(*, project, references, active, bound,
         visual.append(_sentence(story_text))
     for index, shot in enumerate(shots, 1):
         cast = [subject_names[sid] for sid in shot.get('visible_subject_ids', []) if sid in subject_names]
+        display_cast = [subject_names[sid] for sid in shot.get('display_subject_ids', []) if sid in subject_names]
+        imagined_cast = [subject_names[sid] for sid in shot.get('imagined_subject_ids', []) if sid in subject_names]
         parts = []
         setting = _text(shot.get('setting'))
         if setting and setting.casefold() not in story_text.casefold():
@@ -229,6 +235,15 @@ def render_narrative_prompt(*, project, references, active, bound,
                 lambda ident: subject_names.get(ident, 'character'))
             if ensemble_direction:
                 parts.append(ensemble_direction)
+        if display_cast:
+            parts.append(
+                'Remote display cast: ' + ', '.join(display_cast) +
+                '; each appears once and only inside its explicitly described phone, monitor, recorded-video frame or remote-call panel. '
+                'No remote identity is physically present in the local room, reflected outside the display, or duplicated as a full-size body.')
+        if imagined_cast:
+            parts.append(
+                'Imagined or remembered cast: ' + ', '.join(imagined_cast) +
+                '; each is confined to one clearly non-diegetic thought or memory image and is physically absent from the real location.')
         action = _text(shot.get('action'))
         if action:
             parts.append(_sentence(action))

@@ -58,6 +58,8 @@ export function removeGameCharacter(config: StoryConfiguration, id: string): Sto
   next.project.subjects = next.project.subjects.filter(c => c.id !== id);
   for (const shot of next.project.shots) {
     shot.visible_subject_ids = shot.visible_subject_ids.filter(sid => sid !== id);
+    shot.display_subject_ids = (shot.display_subject_ids || []).filter(sid => sid !== id);
+    shot.imagined_subject_ids = (shot.imagined_subject_ids || []).filter(sid => sid !== id);
     shot.offscreen_subject_ids = shot.offscreen_subject_ids.filter(sid => sid !== id);
     pruneSceneActors(next.project, shot.id);
   }

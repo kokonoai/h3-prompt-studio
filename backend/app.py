@@ -2339,7 +2339,9 @@ def plan(body: dict):
 def assist(body: dict):
     from .compiler import compile_project
     project = check_project(body.get('project'))
-    if body.get('field') not in ALLOWED_SHOT_FIELDS - {'visible_subject_ids', 'offscreen_subject_ids', 'transition'}:
+    if body.get('field') not in ALLOWED_SHOT_FIELDS - {
+            'visible_subject_ids', 'display_subject_ids', 'imagined_subject_ids',
+            'offscreen_subject_ids', 'transition'}:
         raise ValueError('This field is protected from AI replacement.')
     if not any(s.get('id') == body.get('shot_id') for s in project['shots']):
         raise ValueError('The selected shot no longer exists.')

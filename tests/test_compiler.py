@@ -90,6 +90,48 @@ def test_classic_single_shot_removes_conflicting_camera_summary_and_consolidates
 
 
 @pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_remote_display_identity_never_becomes_a_second_physical_body(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    p["subjects"].append({"id": "remote", "name": "Remote friend",
+                          "asset_ids": ["remote-face"], "description": "Short dark hair."})
+    p["assets"].append(asset("remote-face"))
+    shot_value = p["shots"][0]
+    shot_value.update(
+        action="Visitor holds a phone. Remote friend's face appears only on its screen.",
+        setting="Visitor's room during a video call.",
+        visible_subject_ids=["s"], display_subject_ids=["remote"],
+        imagined_subject_ids=[], offscreen_subject_ids=[])
+
+    result = compile_project(p)
+
+    assert result["valid"], result["issues"]
+    text = result["prompt"]
+    assert "Remote friend" in text
+    assert "Remote display cast" in text or "REMOTE DISPLAY CAST" in text
+    assert "not physically present" in text or "No remote identity is physically present" in text
+    assert "Principal cast in this shot: exactly 2" not in text
+    assert "Visible cast: Visitor, Remote friend" not in text
+
+
+def test_imagined_identity_is_confined_to_non_diegetic_memory_plane():
+    p = project()
+    p["subjects"].append({"id": "memory", "name": "Absent partner",
+                          "asset_ids": ["memory-face"], "description": "A familiar calm face."})
+    p["assets"].append(asset("memory-face"))
+    p["shots"][0].update(
+        action="Visitor pauses while a soft-edged memory image of Absent partner appears.",
+        visible_subject_ids=["s"], display_subject_ids=[],
+        imagined_subject_ids=["memory"], offscreen_subject_ids=[])
+
+    result = compile_project(p)
+
+    assert result["valid"], result["issues"]
+    assert "IMAGINED OR REMEMBERED CAST" in result["prompt"]
+    assert "absent from the physical location" in result["prompt"]
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
 def test_all_prompt_versions_repeat_compact_one_to_one_cast_bindings(prompt_version):
     p = project()
     p["prompt_version"] = prompt_version

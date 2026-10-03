@@ -401,7 +401,9 @@ def compile_project(project: dict) -> dict:
             for key in ("framing", "movement", "height", "speed", "focus", "amplitude"):
                 string(camera.get(key, ""), path + ".camera." + key)
         roster = {}
-        for key in ("visible_subject_ids", "offscreen_subject_ids"):
+        roster_keys = ("visible_subject_ids", "display_subject_ids",
+                       "imagined_subject_ids", "offscreen_subject_ids")
+        for key in roster_keys:
             values = shot.get(key, [])
             if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
                 issue("error", "invalid_subject_roster", path + "." + key, "Expected a list of subject IDs.")
@@ -412,8 +414,14 @@ def compile_project(project: dict) -> dict:
                     issue("error", "unknown_subject", path + "." + key, "A shot refers to an unknown subject ID.")
             if len(set(values)) != len(values):
                 issue("error", "duplicate_subject_roster", path + "." + key, "A subject is listed twice in the same roster.")
-        if set(roster["visible_subject_ids"]) & set(roster["offscreen_subject_ids"]):
-            issue("error", "conflicting_subject_roster", path, "A subject cannot be both visible and off-screen in the same shot roster.")
+        assigned = {}
+        for key in roster_keys:
+            for sid in roster[key]:
+                previous = assigned.get(sid)
+                if previous is not None:
+                    issue("error", "conflicting_subject_roster", path,
+                          f"A subject cannot be assigned to both {previous} and {key} in the same shot.")
+                assigned[sid] = key
         dialogue = collection(shot.get("dialogue", []), path + ".dialogue")
         word_count = 0
         for j, line in enumerate(dialogue):
@@ -432,7 +440,7 @@ def compile_project(project: dict) -> dict:
                 if members and any(member not in roster["visible_subject_ids"] for member in members):
                     issue("error", "collective_speaker_not_visible", dp + ".speaker_id",
                           "Every member of a collective spoken line must be visible in this shot.")
-                elif not members and sid not in roster["visible_subject_ids"] + roster["offscreen_subject_ids"]:
+                elif not members and sid not in sum((roster[key] for key in roster_keys), []):
                     issue("warning", "speaker_not_in_roster", dp + ".speaker_id", "Set whether this speaker is visible or off-screen in this shot.")
             text = string(line.get("text", ""), dp + ".text", required=True, dialogue=True)
             language = string(line.get("language", ""), dp + ".language")
@@ -548,6 +556,8 @@ def compile_project(project: dict) -> dict:
         ordered_ids = []
         for shot in shots:
             ordered_ids.extend(shot.get("visible_subject_ids", []))
+            ordered_ids.extend(shot.get("display_subject_ids", []))
+            ordered_ids.extend(shot.get("imagined_subject_ids", []))
             ordered_ids.extend(shot.get("offscreen_subject_ids", []))
         ordered_ids.extend(subject["id"] for subject in subjects)
         order = {subject_id: index for index, subject_id in enumerate(dict.fromkeys(ordered_ids))}
@@ -700,6 +710,8 @@ def compile_project(project: dict) -> dict:
             paragraphs.append(_sentence(shot["setting"]))
         cast_ids = [sid for sid in shot.get("visible_subject_ids", [])
                     if not (viewpoint == 'pov' and sid == project.get('game_player_id'))]
+        display_ids = list(dict.fromkeys(shot.get("display_subject_ids", [])))
+        imagined_ids = list(dict.fromkeys(shot.get("imagined_subject_ids", [])))
         if cast_ids:
             paragraphs.append(_sentence(
                 "Exact named visible roster: " + "; ".join(name(sid) for sid in cast_ids)
@@ -717,6 +729,14 @@ def compile_project(project: dict) -> dict:
             paragraphs.append(_sentence(name(sid) + " is visible" + (": " + desc if desc else "")))
         for sid in shot.get("offscreen_subject_ids", []):
             paragraphs.append(_sentence(name(sid) + " remains off-screen"))
+        if display_ids:
+            paragraphs.append(_sentence(
+                "REMOTE DISPLAY CAST: " + "; ".join(name(sid) for sid in display_ids)
+                + ". These identities are visible only as one bounded image each inside the explicitly described phone, monitor, recorded-video frame or remote-call panel. They are not physically present in the room: never give them a full-size body, floor contact, cast shadow, reflection, shared prop interaction or a second copy outside that display boundary"))
+        if imagined_ids:
+            paragraphs.append(_sentence(
+                "IMAGINED OR REMEMBERED CAST: " + "; ".join(name(sid) for sid in imagined_ids)
+                + ". These identities may appear only inside one clearly non-diegetic thought or memory image with an unmistakable soft boundary or editorial transition. They are absent from the physical location and cannot touch its people or props, cast a physical shadow, appear in a reflection, or gain a second body"))
         identity_lock = visible_identity_lock(subjects, cast_ids, name)
         if identity_lock:
             paragraphs.append(identity_lock)
@@ -734,10 +754,19 @@ def compile_project(project: dict) -> dict:
                 parts.append("at " + camera["height"] + " height")
             paragraphs.append(_sentence(" ".join(parts)))
         if i == 0 and len(shots) == 1:
-            paragraphs.append(
-                "Use one continuous camera setup for the complete clip. Do not create a reverse shot, cutaway, "
-                "split screen, inset, montage, contact sheet or repeated view of the cast. Camera movement, when "
-                "assigned above, occurs inside this same continuous take.")
+            remote_layout = bool(display_ids) and bool(re.search(
+                r"\b(?:split[- ]screen|video call|phone screen|smartphone screen|monitor|recorded video|video message)\b|"
+                r"分屏|分割画面|视频通话|視訊通話|画面分割|ビデオ通話|スマートフォン画面",
+                "\n".join(_text(shot.get(key)) for key in ("setting", "action", "final_state")),
+                re.IGNORECASE))
+            if remote_layout:
+                paragraphs.append(
+                    "Use one continuous editorial composition for the complete clip. A specifically requested device screen or remote-call panel is allowed, but every remote identity stays confined to exactly one such bounded display region. Do not add reverse angles, unrelated cutaways, extra insets, montage tiles, contact sheets or repeated views of either the local or remote cast.")
+            else:
+                paragraphs.append(
+                    "Use one continuous camera setup for the complete clip. Do not create a reverse shot, cutaway, "
+                    "split screen, inset, montage, contact sheet or repeated view of the cast. Camera movement, when "
+                    "assigned above, occurs inside this same continuous take.")
         focus = _text(camera.get("focus"))
         if focus:
             # Values such as `deep focus` already name the camera treatment;
@@ -759,9 +788,13 @@ def compile_project(project: dict) -> dict:
             delivery = _text(line.get("delivery"))
             voiceover = line.get("voiceover") is True
             offscreen = sid in shot.get("offscreen_subject_ids", [])
+            display_only = sid in display_ids
+            imagined_only = sid in imagined_ids
             collective = bool(subject_map[sid].get("collective_member_ids"))
             verb = ("say together in exact unison" if collective else
                     "says in an off-screen voiceover" if voiceover else
+                    "speaks only from the bounded device display" if display_only else
+                    "is heard only with the non-diegetic memory image" if imagined_only else
                     "speaks off-screen" if offscreen else "says")
             utterance = f"{name(sid)} {speaker_ids[sid]} {verb}"
             if delivery:
