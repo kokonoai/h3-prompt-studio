@@ -861,6 +861,14 @@ def compile_project(project: dict) -> dict:
         prompt = "\n\n".join(("integrated_multimodal_description: " + body, "overall_soundscape: " + sound, "non_diegetic_music: " + score))
         if preface:
             prompt = preface + "\n\n" + prompt
+    # Production materialisation stores a compact immutable render contract.
+    # Local prompt planning may improve editable action prose, but it cannot be
+    # allowed to paraphrase away remote-cast, device, mirror or written-prop
+    # safeguards.  Include this block in the source hash for the final language
+    # pass so the exact same guard is present when the video is submitted.
+    render_override = _text(project.get("production_render_override", ""))
+    if render_override:
+        prompt += "\n\nproduction_render_override:\n" + render_override
     # AI planning data remains editable in the project's language.  A saved,
     # source-bound delivery prompt may replace this raw multilingual rendering
     # only after the final language pass has verified English direction and the

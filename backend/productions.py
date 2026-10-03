@@ -18,7 +18,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 8
+REFERENCE_STRATEGY_VERSION = 9
 CAST_TIMELINE_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
 CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices", "styles")
@@ -588,6 +588,26 @@ def _speaker_marker(value):
     return (speaker, marker.group("inline").strip()) if speaker else None
 
 
+_EDITORIAL_SPEAKER_LABEL = re.compile(
+    r"^(?:part|scene|shot|segment|episode|act|chapter|section|beat|unit)\s*(?:no\.?\s*)?\d+[a-z]?$|"
+    r"^第\s*[一二三四五六七八九十百零〇0-9]+\s*(?:段|场|場|镜|鏡|集|幕|章|节|節|部分)$|"
+    r"^(?:パート|シーン|ショット|セグメント|エピソード|幕|章)\s*[0-9一二三四五六七八九十百零〇]+$",
+    re.IGNORECASE,
+)
+
+
+def editorial_speaker_label(value):
+    """Return true for screenplay headings that cannot be dialogue owners.
+
+    Markdown headings such as ``## Part 5: “I Love You”`` resemble an inline
+    speaker cue.  Treating them as speech creates a synthetic visible person
+    named ``Part 5`` and makes printed prop text audible.  Keep the rule narrow
+    so ordinary character names remain untouched.
+    """
+    value = _strip_script_markdown(str(value or "")).strip("*_#- ")
+    return bool(_EDITORIAL_SPEAKER_LABEL.fullmatch(value))
+
+
 def _dialogue_signal_count(text):
     """Count strong cue+quote signals independently from the main parser."""
     rows = [raw.strip() for raw in str(text or "").splitlines() if raw.strip()]
@@ -596,7 +616,9 @@ def _dialogue_signal_count(text):
         marker = _speaker_marker(raw)
         if not marker:
             continue
-        _speaker, inline = marker
+        speaker, inline = marker
+        if editorial_speaker_label(speaker):
+            continue
         candidate = _strip_script_markdown(inline)
         if candidate and candidate[0] in _DIALOGUE_OPENERS:
             count += 1
@@ -618,6 +640,9 @@ def script_dialogue(text):
         marker = _speaker_marker(line)
         if marker:
             speaker, inline = marker
+            if editorial_speaker_label(speaker):
+                pending = None
+                continue
             pending = speaker
             inline = _strip_script_markdown(inline)
             if inline and inline[0] in _DIALOGUE_OPENERS:
@@ -1177,6 +1202,71 @@ _SPLIT_LAYOUT_CUE = re.compile(
     r"分屏|分割画面|画面分割|スプリットスクリーン",
     re.IGNORECASE,
 )
+_REMOTE_SEPARATION_CUE = re.compile(
+    r"\b(?:only\s+(?:be\s+)?together\s+online|online[- ]only|long[- ]distance|"
+    r"remain\s+physically\s+separate|separate\s+(?:physical\s+)?locations?|"
+    r"never\s+(?:occupy|share|enter|meet\s+in)\s+(?:the\s+)?(?:same\s+)?(?:physical\s+)?(?:room|space|location)|"
+    r"do\s+not\s+(?:visit|touch|meet|share\s+(?:a\s+)?physical\s+location))\b|"
+    r"只能.{0,12}(?:线上|線上|网络|網路)|异地|異地|保持物理分离|保持物理分離|"
+    r"不(?:得|能|会|會|可).{0,18}(?:同处|同處|同一个房间|同一個房間|共享.{0,6}(?:空间|空間|地点|地點))|"
+    r"オンラインでのみ|遠距離|物理的に離れ|同じ(?:部屋|場所).{0,12}(?:いない|入らない)",
+    re.IGNORECASE,
+)
+_LOCATION_CUE = (
+    r"room|apartment|home|house|bedroom|office|studio|desk|workspace|kitchen|hallway|"
+    r"房间|房間|公寓|家中|卧室|臥室|办公室|辦公室|工作室|书桌|書桌|厨房|廚房|走廊|"
+    r"部屋|アパート|自宅|寝室|オフィス|スタジオ|机|台所|廊下"
+)
+
+
+def remote_separated_pairs(production, aliases_by_card=None):
+    """Extract canon pairs that must never share a physical location."""
+    cards = production.get("cards", {}).get("characters", [])
+    aliases_by_card = aliases_by_card or character_aliases(production)
+    canon_parts = [production.get("brief", ""), production.get("continuity_notes", "")]
+    canon_parts.extend(episode.get("continuity_notes", "")
+                       for episode in production.get("episodes", []) if isinstance(episode, dict))
+    canon = "\n".join(str(part or "") for part in canon_parts)
+    if not _REMOTE_SEPARATION_CUE.search(canon):
+        return set()
+    pairs = set()
+    contexts = [part for part in re.split(r"[\r\n]+|(?<=[.!?。！？])\s+", canon)
+                if _REMOTE_SEPARATION_CUE.search(part)]
+    for context in contexts:
+        mentioned = []
+        for card in cards:
+            aliases = aliases_by_card.get(card.get("id"), set())
+            if any(re.search(_alias_pattern(alias), context, re.IGNORECASE) for alias in aliases):
+                mentioned.append(card.get("id"))
+        for index, left in enumerate(mentioned):
+            for right in mentioned[index + 1:]:
+                if left and right:
+                    pairs.add(frozenset((left, right)))
+    # A two-character production commonly states the separation once with
+    # pronouns ("they remain physically separate") after introducing both
+    # names.  The unambiguous pair can safely inherit that global constraint.
+    ids = [card.get("id") for card in cards if card.get("id")]
+    if not pairs and len(ids) == 2:
+        pairs.add(frozenset(ids))
+    return pairs
+
+
+def _location_owner_ids(production, segment, aliases_by_card):
+    """Find named owners of the clip's real location, excluding screen text."""
+    setting = str(segment.get("setting", "") or "")
+    owners = set()
+    for card in production.get("cards", {}).get("characters", []):
+        for alias in aliases_by_card.get(card.get("id"), set()):
+            token = _alias_pattern(alias)
+            patterns = (
+                rf"{token}(?:'s|’s|的)\s*.{{0,60}}?(?:{_LOCATION_CUE})\b",
+                rf"(?:{_LOCATION_CUE})\s+(?:of|belonging\s+to)\s+{token}\b",
+                rf"{token}\s+(?:is|stands?|sits?|waits?)\s+(?:alone\s+)?(?:in|at)\s+(?:the\s+)?(?:{_LOCATION_CUE})\b",
+            )
+            if any(re.search(pattern, setting, re.IGNORECASE) for pattern in patterns):
+                owners.add(card.get("id"))
+                break
+    return owners
 _PHYSICAL_ACTIONS = (
     r"stands?|sits?|walks?|runs?|swims?|glides?|holds?|writes?|reads?|looks?|turns?|"
     r"smiles?|laughs?|cries?|opens?|closes?|picks?|places?|touches?|leans?|steps?|moves?|"
@@ -1219,8 +1309,8 @@ def _display_depiction(aliases, text, split_layout=False, declared_visible=False
                 rf"(?:face|image|portrait|photo|photograph|still|video)\s+(?:of\s+)?{token}",
                 rf"{token}(?:'s|’s)?\s+(?:face|image|portrait|photo|photograph|still|video)\b",
                 rf"{token}\s+(?:appears?|is\s+visible|smiles?|speaks?).{{0,60}}\b(?:on|inside|within|through)\s+(?:the\s+)?(?:phone\s+screen|screen|display|monitor|video)",
-                rf"\b(?:phone\s+screen|screen|display|monitor)\b[^.;]{{0,80}}\b(?:showing|shows?|displays?)\s+(?:(?:a|the|live)\s+)*(?:(?:view|image|video|face|still)\s+)*(?:of\s+)?{token}",
-                rf"\b(?:looks?|looking|watches?|watching|sees?|seeing)\s+(?:at\s+)?{token}\s+(?:on|inside|within|through)\s+(?:the\s+)?(?:phone\s+screen|screen|display|monitor|video)",
+                rf"\b(?:phone\s+screen|screen|display|monitor)\b[^.;]{{0,80}}\b(?:showing|shows?|displays?)\s+(?:(?:a|the|live)\s+)*(?:(?:view|image|video|face|still)\s+)*(?:of\s+)?{token}(?!['’]s\s+(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording))",
+                rf"\b(?:looks?|looking|watches?|watching|sees?|seeing)\s+(?:at\s+)?{token}(?!['’]s\s+(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording))\s+(?:on|inside|within|through)\s+(?:the\s+)?(?:phone\s+screen|screen|display|monitor|video)",
                 rf"\b(?:video|recording|message)\s+from\s+{token}",
             )
             if any(re.search(pattern, context, re.IGNORECASE) for pattern in patterns):
@@ -1259,6 +1349,8 @@ def _physically_staged(aliases, text):
                     rf"(?:{_PHYSICAL_ACTIONS})\b",
                     context, re.IGNORECASE):
                 return True
+            if re.search(rf"{token}\s+(?:is\s+)?(?:clearly\s+)?visible\b", context, re.IGNORECASE):
+                return True
             if re.search(rf"\b(?:close-up|medium shot|wide shot|camera|focus)\b.{{0,40}}\b(?:on|of|follows?)\b\s*{token}",
                          context, re.IGNORECASE):
                 return True
@@ -1292,6 +1384,12 @@ def character_presence_roles(production, segment):
     split_layout = bool(_SPLIT_LAYOUT_CUE.search(staged_text))
     roles = {}
     aliases_by_card = character_aliases(production, text)
+    separated_pairs = remote_separated_pairs(production, aliases_by_card)
+    location_owners = _location_owner_ids(production, segment, aliases_by_card)
+    remote_device_context = bool(_DEVICE_CUE.search(staged_text) or split_layout)
+    requested_view = str(segment.get("device_view", "auto") or "auto").strip().casefold()
+    front_camera_view = requested_view == "front_camera" or (
+        requested_view == "auto" and bool(_FRONT_CAMERA_CUE.search(staged_text)))
     for card in production.get("cards", {}).get("characters", []):
         aliases = aliases_by_card.get(card.get("id"), {str(card.get("name", "")).strip().casefold()})
         aliases = {alias for alias in aliases if alias}
@@ -1309,8 +1407,23 @@ def character_presence_roles(production, segment):
         voice_only = any(re.search(
             rf"(?:{_alias_pattern(alias)}(?:'s|’s)?\s+voice|voice\s+of\s+{_alias_pattern(alias)})",
             text, re.IGNORECASE) for alias in aliases)
+        remote_from_local_owner = (
+            remote_device_context and len(location_owners) == 1 and card.get("id") not in location_owners and
+            any(frozenset((card.get("id"), owner)) in separated_pairs for owner in location_owners)
+        )
 
-        if display and (split_layout or not physical):
+        # Canonical geography outranks a planner sentence that accidentally
+        # places a remote caller beside the local performer.  Front-camera POV
+        # cannot simultaneously show the phone display, so a remote face in
+        # that contradictory prose remains an off-screen participant.
+        if remote_from_local_owner:
+            if display and not front_camera_view:
+                role = "display"
+            elif speaking or voiceover or voice_only or in_visible or selected:
+                role = "offscreen"
+            else:
+                role = "absent"
+        elif display and (split_layout or not physical):
             role = "display"
         elif imagined and not physical:
             role = "imagined"
@@ -1394,7 +1507,13 @@ def device_screen_geometry_lock(segment, display_names=()):
     if requested == "auto" and not _DEVICE_CUE.search(text):
         return ""
     mode = requested
-    if mode == "auto":
+    corrected_phone_to_ear = bool(_PHONE_TO_EAR_CUE.search(text) and requested == "performance")
+    if corrected_phone_to_ear:
+        # A phone pressed to the ear has only one physically valid display
+        # orientation.  Planner-selected "performance" is descriptive, not a
+        # licence to put video or chat pixels on the outward phone back.
+        mode = "phone_to_ear"
+    elif mode == "auto":
         if _SPLIT_LAYOUT_CUE.search(text) and display_names:
             mode = "remote_panel"
         elif _PHONE_TO_EAR_CUE.search(text):
@@ -1407,8 +1526,11 @@ def device_screen_geometry_lock(segment, display_names=()):
             mode = "front_camera"
         else:
             mode = "performance"
-    override = (" DIRECTOR OVERRIDE: this manually selected view outranks conflicting automatic framing language."
-                if requested != "auto" else "")
+    override = (
+        " PHYSICAL GEOMETRY OVERRIDE: the authored phone-to-ear action outranks the conflicting performance-view label."
+        if corrected_phone_to_ear else
+        (" DIRECTOR OVERRIDE: this manually selected view outranks conflicting automatic framing language."
+         if requested != "auto" else ""))
     if mode == "remote_panel":
         return (
             "REMOTE-CALL PANEL GEOMETRY LOCK: use one clean editorial split with exactly one bounded panel for each remote location and one instance of each participant. "
@@ -1465,8 +1587,8 @@ def inscribed_prop_continuity_lock(cards):
         "Do not create floating text, subtitles, duplicate cards, extra notes or a second readable face of the prop.")
 
 
-def effective_temporal_cast_lock(production, segment, roles=None):
-    """Render the saved timeline after separating physical and visual planes."""
+def effective_cast_timeline(production, segment, roles=None):
+    """Return the physical/off-screen timeline after visual-plane repair."""
     roles = roles or character_presence_roles(production, segment)
     cards = production.get("cards", {}).get("characters", [])
     aliases_by_card = character_aliases(production)
@@ -1476,7 +1598,6 @@ def effective_temporal_cast_lock(production, segment, roles=None):
     def role_for(name):
         return alias_role.get(str(name or "").strip().casefold(), "absent")
 
-    effective = copy.deepcopy(segment)
     source = normalise_cast_timeline(
         segment.get("cast_timeline"), segment.get("card_selection", {}).get("characters", []))
     physical = {key: [name for name in source[key] if role_for(name) == "physical"]
@@ -1489,6 +1610,15 @@ def effective_temporal_cast_lock(production, segment, roles=None):
         [card["name"] for card in cards if roles.get(card.get("id")) == "absent" and
          any(alias in {str(value).strip().casefold() for value in source["mentioned_only"]}
              for alias in aliases_by_card.get(card.get("id"), set()))]))
+    return physical
+
+
+def effective_temporal_cast_lock(production, segment, roles=None):
+    """Render the saved timeline after separating physical and visual planes."""
+    roles = roles or character_presence_roles(production, segment)
+    cards = production.get("cards", {}).get("characters", [])
+    physical = effective_cast_timeline(production, segment, roles)
+    effective = copy.deepcopy(segment)
     effective["cast_timeline"] = physical
     display = [card["name"] for card in cards if roles.get(card.get("id")) == "display"]
     imagined = [card["name"] for card in cards if roles.get(card.get("id")) == "imagined"]
@@ -1512,6 +1642,31 @@ def effective_temporal_cast_lock(production, segment, roles=None):
         extra.append(
             "EMOTIONAL SUBTEXT LOCK: express longing, affection or thought about absent identities only through the physical actor's eyes, breath, pause, posture and an already scripted prop or screen cue. Do not materialize an absent person as a companion, ghost, silhouette, reflection, portrait or background extra unless that identity is explicitly listed in the display or memory roster above.")
     return temporal_cast_lock(effective) + "\n" + "\n".join(extra)
+
+
+def production_render_override(production, segment, relevant_cards=None, roles=None):
+    """Build the immutable guard appended after every generated H3 prompt.
+
+    Production context guides the local prompt model, but editable AI prose can
+    still paraphrase away a cast, mirror, device or written-prop constraint.
+    This final block is compiled after that prose and therefore remains the
+    render authority for both classic and narrative prompt versions.
+    """
+    roles = roles or character_presence_roles(production, segment)
+    if relevant_cards is None:
+        selected = {str(name).strip().casefold()
+                    for name in segment.get("card_selection", {}).get("props", [])}
+        props = [card for card in production.get("cards", {}).get("props", [])
+                 if card.get("name", "").strip().casefold() in selected]
+    else:
+        props = relevant_cards.get("props", [])
+    guard = effective_temporal_cast_lock(production, segment, roles)
+    prop_guard = inscribed_prop_continuity_lock(props)
+    return "\n\n".join(part for part in [
+        "FINAL PRODUCTION RENDER OVERRIDE — this block supersedes any conflicting earlier staging, cast, screen, reflection, prop or audio prose. Do not reinterpret it as story content.",
+        guard,
+        prop_guard,
+    ] if part)
 
 
 def segment_identity_repair_reasons(production, segment):
@@ -1554,6 +1709,31 @@ def segment_identity_repair_reasons(production, segment):
         reasons.append(
             "本段对白把声线卡 ID 当成了画面角色（" + ", ".join(legacy_voice_labels) +
             "），请只重新生成本段提示词和视频")
+
+    roles = character_presence_roles(production, segment)
+    timeline_labels = {
+        str(name).strip().casefold()
+        for key in ("visible_start", "visible_end", "enters", "exits")
+        for name in segment.get("cast_timeline", {}).get(key, [])
+        if str(name).strip()
+    }
+    misplaced_remote = [
+        card.get("name", "") for card in characters.values()
+        if roles.get(card.get("id")) in ("display", "offscreen", "imagined") and
+        any(alias in timeline_labels for alias in alias_sets.get(card.get("id"), set()))
+    ]
+    if misplaced_remote:
+        reasons.append(
+            "本段把远程屏幕、电话声音或回忆人物误列为现场角色（" +
+            ", ".join(misplaced_remote) + "），请重新生成本段提示词和视频")
+
+    render_text = "\n".join(str(segment.get(key, "")) for key in
+                              ("story", "setting", "action", "ending", "image_prompt"))
+    if (segment.get("project_id") and
+            segment.get("reference_strategy_version", 0) < REFERENCE_STRATEGY_VERSION and
+            (_DEVICE_CUE.search(render_text) or _MIRROR_CUE.search(render_text) or
+             len(timeline_labels) > 1 or _INSCRIBED_PROP_CUE.search(render_text))):
+        reasons.append("本段需要新的最终人物、屏幕、镜子与文字道具渲染保护，请重新生成提示词后再生成视频")
 
     timeline = segment.get("cast_timeline", {})
     visible_timeline = {
@@ -2297,6 +2477,11 @@ def normalise_segment(value, index, previous=None):
     for line in dialogue:
         if not isinstance(line, dict) or type(line.get("voiceover", False)) is not bool:
             raise ValueError("Dialogue entries must contain speaker, text, language and voiceover.")
+        # Repair projects created before editorial headings were excluded from
+        # screenplay dialogue.  A heading such as ``Part 5: “I Love You”`` is
+        # metadata plus printed prop copy, not a person or an audible line.
+        if editorial_speaker_label(line.get("speaker")):
+            continue
         result["dialogue"].append({
             "speaker": _text(line.get("speaker"), "dialogue speaker", 100),
             "text": _text(line.get("text"), "dialogue text", 1000),
@@ -3410,6 +3595,8 @@ class ProductionManager:
         presence_roles = character_presence_roles(production, segment)
         cast_lock = effective_temporal_cast_lock(production, segment, presence_roles)
         prop_lock = inscribed_prop_continuity_lock(relevant_cards["props"])
+        base["production_render_override"] = production_render_override(
+            production, segment, relevant_cards, presence_roles)
         character_by_subject = {
             subject["id"]: subject["name"] for subject in base["subjects"]
             if subject.get("id") and subject.get("name")}

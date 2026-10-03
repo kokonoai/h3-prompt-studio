@@ -1802,20 +1802,27 @@ def production_image_sync(production_id: str, segment_id: str):
 
 
 def _production_prompt_instructions(production, segment):
+    from .productions import character_presence_roles, effective_cast_timeline
     previous = next((item for item in production.get('segments', [])
                      if item.get('index') == segment['index'] - 1), None)
-    timeline = segment.get('cast_timeline') if isinstance(segment.get('cast_timeline'), dict) else {}
+    roles = character_presence_roles(production, segment)
+    timeline = effective_cast_timeline(production, segment, roles)
     visible_start = [str(name).strip() for name in timeline.get('visible_start', []) if str(name).strip()]
     visible_end = [str(name).strip() for name in timeline.get('visible_end', []) if str(name).strip()]
     stable_cast = bool(visible_start) and visible_start == visible_end
     dense_cast = len(visible_start) >= 4
+    remote_planes = any(role in ('display', 'offscreen', 'imagined') for role in roles.values())
     return '\n'.join([
         'Turn this production clip into one precise, filmable H3 scene plan.',
         f"Keep exactly one scene and exactly {segment['duration']} seconds.",
         'Preserve all story facts, declared people, card bindings, exact dialogue, output language and ending continuity.',
         'Use every selected character card\'s exact canonical name in action, staging and sound direction; never translate, shorten or replace that name with a role label.',
         'Improve only staging, visible performance, motivated camera and sound detail. Do not add plot events, people, dialogue or extra camera moves.',
-        'This materialised clip has one continuous camera setup. Do not propose a reverse shot, cutaway, split screen, inset, montage or repeated view of the cast. Keep all visible actors as separate, non-overlapping silhouettes in one coherent shared space.',
+        ('This materialised clip has one continuous render setup. Preserve the locked separation between physical cast, bounded display/memory cast and off-screen voices. '
+         'Never move a remote, recorded, remembered or off-screen identity into the local room. Keep only the declared physical cast as separate, non-overlapping bodies. '
+         'If the locked scene declares a remote-panel split, keep exactly that one stable split; otherwise do not add a split screen, inset, reverse shot, cutaway, montage or repeated view of the cast.'
+         if remote_planes else
+         'This materialised clip has one continuous camera setup. Do not propose a reverse shot, cutaway, split screen, inset, montage or repeated view of the cast. Keep all visible actors as separate, non-overlapping silhouettes in one coherent shared space.'),
         ('TEMPORAL CAST LOCK: the same visible cast remains on screen from opening through ending: '
          + ', '.join(visible_start)
          + '. Do not write any exit, entrance, move-out-of-frame, disappearance, re-entry, second reveal, replacement body or background duplicate for these identities.'
@@ -1824,6 +1831,7 @@ def _production_prompt_instructions(production, segment):
          'Do not start on a close-up and pull back to reveal the cast; do not pan, arc, track or reframe across them. '
          'Assign stable left-to-right screen lanes and move only one primary actor at a time while the others react inside their lanes.'
          if dense_cast else ''),
+        'When existing action prose conflicts with the locked physical/display/off-screen roster or device geometry, repair the action prose to obey the lock; never preserve the contradiction.',
         'When authored internal timing is supplied, preserve its relative phase boundaries inside the continuous scene.',
         'Fit action density to the duration: overlap compatible supporting reactions in parallel, while preserving causal order for dependent actions.',
         'Be concise: do not repeat the full Character Bible, card library, overview instructions or the same identity block inside action and performance.',

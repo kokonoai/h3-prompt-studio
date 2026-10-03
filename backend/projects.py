@@ -112,7 +112,8 @@ def check_project(project):
 
     text_fields(project, ('title', 'mode', 'aspect_ratio', 'profile', 'authoring_mode',
                           'production_language', 'soundscape', 'music', 'custom_instructions',
-                          'production_planning_context'), 'project', required=('title', 'mode'))
+                          'production_planning_context', 'production_render_override'),
+                'project', required=('title', 'mode'))
     if not isinstance(project.get('prompt_version', 'classic'), str) or project.get('prompt_version', 'classic') not in PROMPT_VERSIONS:
         raise ValueError('project.prompt_version must be classic, continuity_director or storyboard_narrative.')
     verbatim_blocks = project.get('h3_verbatim_blocks', [])

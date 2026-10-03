@@ -233,6 +233,51 @@ def test_materialise_separates_local_actor_phone_actor_and_mentioned_recipient(t
     assert "EMOTIONAL SUBTEXT LOCK" in scene["action"]
 
 
+def test_online_only_canon_repairs_planner_colocation_and_survives_final_prompt(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    koko = _card("Koko", [_image(store_asset, "Koko", "pink")["id"]])
+    besi = _card("Besi", [_image(store_asset, "Besi", "blue")["id"]])
+    production = manager.create({
+        "source_project": source, "language": "en",
+        "brief": ("Koko and Besi can only be together online. They remain physically separate "
+                  "and never share the same physical room."),
+    })
+    production["cards"]["characters"] = [koko, besi]
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Remote relief", "story": "They continue their phone call.",
+        "setting": "Koko's bright, minimal desk area",
+        # Deliberately reproduce the bad local-model plan: the remote caller is
+        # placed beside Koko and listed as physically visible.
+        "action": ("Koko holds her smartphone and smiles at the screen. "
+                   "Besi stands beside her and says he read the card three times."),
+        "ending": "Koko looks at the phone.", "duration": 5,
+        "duration_reason": "one remote reaction", "image_prompt": "Koko on a phone call",
+        "dialogue": [{"speaker": "Besi", "text": "I read it three times.",
+                      "language": "English", "voiceover": False}],
+        "card_selection": {"characters": ["Koko", "Besi"]},
+        "cast_timeline": {"visible_start": ["Koko", "Besi"],
+                          "visible_end": ["Koko", "Besi"], "enters": [], "exits": [],
+                          "offscreen": [], "mentioned_only": []},
+        "transition_mode": "continuous",
+    }], "local_ai")
+
+    roles = character_presence_roles(production, production["segments"][0])
+    assert roles[koko["id"]] == "physical"
+    assert roles[besi["id"]] == "offscreen"
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    names = {subject["id"]: subject["name"] for subject in project["subjects"]}
+    scene = project["shots"][0]
+    assert [names[ident] for ident in scene["visible_subject_ids"]] == ["Koko"]
+    assert [names[ident] for ident in scene["offscreen_subject_ids"]] == ["Besi"]
+    assert "FINAL PRODUCTION RENDER OVERRIDE" in project["production_render_override"]
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+    assert "production_render_override:" in compiled["prompt"]
+    assert "Visible at opening: Koko" in compiled["prompt"]
+    assert "Off-screen for the entire clip: Besi" in compiled["prompt"]
+
+
 @pytest.mark.parametrize(("action", "image_prompt", "expected", "rejected"), [
     ("Koko looks at the phone and hesitates.", "Medium close-up on Koko's face.",
      "PERFORMANCE-VIEW GEOMETRY LOCK", "SCREEN-VIEW GEOMETRY LOCK"),
@@ -779,6 +824,28 @@ __Mimi（认真，但没有生气）：__ “Don't make us guess again.”"""
     result = manager.apply_plan(production["id"], planned, "local_ai")
     assert result["segments"][0]["dialogue"] == locked[0]["dialogue"]
     assert result["segments"][1]["dialogue"] == locked[1]["dialogue"]
+
+
+def test_editorial_part_heading_and_written_card_copy_are_not_dialogue():
+    screenplay = """00:40-00:50
+## Part 5: “I Love You”
+**Characters appearing:** Besi
+**Speaking voice cards:** None
+
+**Action:** The card reads: “Besi, I love you. — Koko.”
+**No dialogue.**"""
+
+    assert script_dialogue(screenplay) == []
+    assert locked_timed_dialogue({
+        "language": "en", "brief": screenplay, "current_episode": 1, "episodes": [],
+        "cards": {"characters": []},
+    })[0]["dialogue_parse_failed"] is False
+    clip = _planned_clip("Printed message", [{
+        "speaker": "Part 5", "text": "I Love You", "language": "English",
+        "voiceover": False,
+    }], {key: [] for key in
+         ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")})
+    assert normalise_segment(clip, 0)["dialogue"] == []
 
 
 def test_translation_plan_cannot_be_cleared_by_empty_exact_language_lock(tmp_path):
