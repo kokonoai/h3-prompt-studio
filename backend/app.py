@@ -42,6 +42,7 @@ PRODUCTIONS = None
 SERIES = None
 VIDEO_WORKFLOWS = None
 VIDEO_FILE_LOCKS = {}
+FILM_ASSEMBLY_VERSION = 2
 DEFAULT_SETTINGS = {'lm_url': 'http://127.0.0.1:11434/v1', 'model': '', 'context_length': 8192,
                     'comfy_urls': ['http://127.0.0.1:8188', 'http://127.0.0.1:8000', 'http://127.0.0.1:8010'], 'persona': 'universal', 'last_project': '',
                     'ai_memory_mode': 'exclusive'}
@@ -1070,11 +1071,21 @@ def production_outputs(production_id, runs=None):
     for segment in production['segments']:
         candidates = by_project.get(segment.get('project_id'), [])
         ready = [run for run in candidates if run.get('status') == 'succeeded' and run.get('video_url')]
+        prompt_updated_at = segment.get('prompt_updated_at')
+        if type(prompt_updated_at) in (int, float) and prompt_updated_at > 0:
+            # A successful take made before the current prompt remains in the
+            # history list, but it is not eligible for automatic or manual
+            # adoption under the revised render contract.
+            compatible_ready = [run for run in ready
+                                if type(run.get('created_at')) in (int, float)
+                                and run['created_at'] >= prompt_updated_at]
+        else:
+            compatible_ready = ready
         manual_id = segment.get('selected_video_run_id')
-        selected = next((run for run in ready if run['id'] == manual_id), None)
+        selected = next((run for run in compatible_ready if run['id'] == manual_id), None)
         selection = 'manual' if selected else 'latest'
-        if selected is None and ready:
-            selected = ready[0]
+        if selected is None and compatible_ready:
+            selected = compatible_ready[0]
         if selected:
             selected_ids.append(selected['id'])
         segments.append({
@@ -1083,7 +1094,9 @@ def production_outputs(production_id, runs=None):
             'candidates': candidates[:24], 'selected': selected, 'selection': selection,
         })
     all_ready = bool(segments) and len(selected_ids) == len(segments)
-    signature = hashlib.sha256(json.dumps(selected_ids, separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
+    signature = hashlib.sha256(json.dumps(
+        {'assembly_version': FILM_ASSEMBLY_VERSION, 'run_ids': selected_ids},
+        separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
     output = DATA / 'production_films' / production['id'] / (signature + '.mp4') if signature else None
     final_ready = bool(output and output.is_file() and output.stat().st_size)
     adopted_video_seconds = round(sum(float((row['selected'] or {}).get('elapsed_seconds') or 0)
@@ -1163,16 +1176,9 @@ def build_production_film(production_id):
             run = row['selected']
             path = folder / (run['id'] + f'-{width}x{height}-a1.mp4')
             normalized.append(_normalize_series_file(scene_video_path(run['id']), path, width, height))
-        listing = folder / (overview['signature'] + '.txt')
-        listing.write_text('\n'.join("file '" + path.name + "'" for path in normalized), encoding='utf-8')
-        temporary = output.with_name(output.stem + '-building.mp4')
-        result = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '1',
-            '-i', str(listing), '-c', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', str(temporary)],
-            capture_output=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
-            temporary.unlink(missing_ok=True)
-            raise ValueError('The final production film could not be assembled. Individual videos remain available.')
-        temporary.replace(output)
+        _concat_series_files(
+            normalized, output,
+            'The final production film could not be assembled. Individual videos remain available.')
     return output
 
 
@@ -1277,7 +1283,8 @@ def series_outputs(series_id):
                               'ready_count': output['ready_count'], 'segment_count': output['segment_count'],
                               'all_ready': output['all_ready'], 'final_ready': output['final_ready'],
                               'signature': output['signature'], 'final_url': output['final_url'],
-                              'active_jobs': output['active_jobs'], 'uncertain_jobs': output['uncertain_jobs']})
+                              'active_jobs': output.get('active_jobs', 0),
+                              'uncertain_jobs': output.get('uncertain_jobs', 0)})
             except (ValueError, OSError, KeyError):
                 parts.append({'production_id': production_id, 'title': 'Missing project',
                               'ready_count': 0, 'segment_count': 0, 'all_ready': False,
@@ -1358,17 +1365,32 @@ def _parse_series_indices(value):
         raise ValueError('Episode numbers must be comma-separated integers.') from exc
 
 
-def _concat_series_files(files, destination):
-    """Concat only generated files with internal UUID-derived paths."""
+def _concat_series_files(files, destination,
+                         error_message='A series film could not be assembled. Every source project video remains available.'):
+    """Concat generated files and apply one consistent final audio master."""
     listing = destination.with_suffix('.txt')
     listing.write_text('\n'.join("file '" + path.name + "'" for path in files), encoding='utf-8')
+    joined = destination.with_name(destination.stem + '-joined.mp4')
     temporary = destination.with_name(destination.stem + '-building.mp4')
     result = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '1',
-        '-i', str(listing), '-c', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', str(temporary)],
+        '-i', str(listing), '-c', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', str(joined)],
         capture_output=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if result.returncode or not joined.is_file() or not joined.stat().st_size:
+        joined.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        raise ValueError(error_message)
+    result = subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(joined),
+        '-map', '0:v:0', '-map', '0:a:0', '-map_metadata', '-1',
+        '-c:v', 'copy', '-c:a', 'aac', '-ar', '32000', '-ac', '2',
+        # Dynamic normalization remains well-defined for silent ambience-only
+        # clips, unlike a loudness target pass which can emit NaN on silence.
+        '-af', 'dynaudnorm=f=500:g=15:p=0.9:m=10', '-movflags', '+faststart', str(temporary)],
+        capture_output=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    joined.unlink(missing_ok=True)
     if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
         temporary.unlink(missing_ok=True)
-        raise ValueError('A series film could not be assembled. Every source project video remains available.')
+        raise ValueError(error_message)
     temporary.replace(destination)
 
 
@@ -1432,7 +1454,9 @@ def _video_library_signature(value):
 
 def build_video_library_film(run_ids):
     clean, records = _video_library_runs(run_ids)
-    signature = hashlib.sha256(json.dumps(clean, separators=(',', ':')).encode()).hexdigest()[:20]
+    signature = hashlib.sha256(json.dumps(
+        {'assembly_version': FILM_ASSEMBLY_VERSION, 'run_ids': clean},
+        separators=(',', ':')).encode()).hexdigest()[:20]
     folder = DATA / 'video_library_films' / signature
     folder.mkdir(parents=True, exist_ok=True)
     output = folder / 'selection.mp4'

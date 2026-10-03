@@ -18,7 +18,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 7
+REFERENCE_STRATEGY_VERSION = 8
 CAST_TIMELINE_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
 CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices", "styles")
@@ -1364,6 +1364,17 @@ _FRONT_CAMERA_CUE = re.compile(
     r"(?:スマートフォン|携帯).{0,12}(?:カメラ|レンズ).{0,16}(?:見る|話す)",
     re.IGNORECASE,
 )
+_MIRROR_CUE = re.compile(
+    r"\b(?:mirror|reflection|reflected|looking glass)\b|"
+    r"镜子|鏡子|镜中|鏡中|倒影|反射|ミラー|鏡|反射",
+    re.IGNORECASE,
+)
+_INSCRIBED_PROP_CUE = re.compile(
+    r"\b(?:card|letter|note|envelope|label|sign|document|paper|ticket|postcard|photograph|photo)\b|"
+    r"卡片|贺卡|賀卡|信件|信封|纸条|紙條|便签|便箋|标签|標籤|标牌|標牌|文件|照片|"
+    r"カード|手紙|封筒|メモ|ラベル|標識|書類|写真",
+    re.IGNORECASE,
+)
 
 
 def device_screen_geometry_lock(segment, display_names=()):
@@ -1430,6 +1441,30 @@ def device_screen_geometry_lock(segment, display_names=()):
         "Do not rotate the display toward the audience while the holder remains front-facing. " + common + override)
 
 
+def inscribed_prop_continuity_lock(cards):
+    """Keep authored cards, letters and similar written props visually stable.
+
+    Generative video cannot reliably typeset long exact copy.  The safest
+    production contract is therefore to preserve one physical prop and one
+    inscription layout, use only authored wording, and reserve a readable
+    hero insert for post-composited typography.
+    """
+    selected = []
+    for card in cards or ():
+        text = "\n".join(str(card.get(key, "")) for key in ("name", "description", "notes"))
+        if _INSCRIBED_PROP_CUE.search(text):
+            selected.append(str(card.get("name", "")).strip())
+    selected = list(dict.fromkeys(name for name in selected if name))
+    if not selected:
+        return ""
+    return (
+        "INSCRIBED-PROP CONTINUITY LOCK: " + ", ".join(selected) +
+        " must remain the same continuing physical prop across the clip. Preserve its size, material, colour, folds, wear, orientation and inscription layout; never replace it with a newly designed copy. "
+        "Use only wording explicitly authored in the selected prop card or current screenplay and never invent, paraphrase, translate, extend or mutate its text between shots. "
+        "If exact words must be readable, use one stable front-facing insert with typography composited in post; otherwise keep the writing naturally too small or oblique to read. "
+        "Do not create floating text, subtitles, duplicate cards, extra notes or a second readable face of the prop.")
+
+
 def effective_temporal_cast_lock(production, segment, roles=None):
     """Render the saved timeline after separating physical and visual planes."""
     roles = roles or character_presence_roles(production, segment)
@@ -1469,6 +1504,9 @@ def effective_temporal_cast_lock(production, segment, roles=None):
         extra.append(
             "DEVICE INTERACTION LOCK: use exactly one local phone/device prop. Its screen content stays geometrically inside the bezel and never becomes a second real room or a second full-size body. For typing or sending, show a readable hand-to-device action and one deliberate tap with a simple non-verbal sent-state cue; do not invent extra chat messages, subtitles, captions, floating UI, extra hands or a second phone. Exact on-screen typography should be added in post rather than hallucinated by the video model.")
         extra.append(device_screen_geometry_lock(segment, display))
+    if _MIRROR_CUE.search(text):
+        extra.append(
+            "MIRROR GEOMETRY LOCK: each physically present identity may have at most one optically plausible reflection of that same identity, confined to the mirror surface and matching the real body's wardrobe, pose and action. A reflection is not another physical body. Display-only, imagined, off-screen and absent identities never appear in the mirror or elsewhere in the room. Do not add extra mirror panels, portraits, reflected phones or duplicate figures.")
     absent = [card["name"] for card in cards if roles.get(card.get("id")) == "absent"]
     if absent:
         extra.append(
@@ -3371,6 +3409,7 @@ class ProductionManager:
             collective["collective_member_ids"] = list(visible)
         presence_roles = character_presence_roles(production, segment)
         cast_lock = effective_temporal_cast_lock(production, segment, presence_roles)
+        prop_lock = inscribed_prop_continuity_lock(relevant_cards["props"])
         character_by_subject = {
             subject["id"]: subject["name"] for subject in base["subjects"]
             if subject.get("id") and subject.get("name")}
@@ -3390,7 +3429,7 @@ class ProductionManager:
                                    if sid in character_by_subject) or "none"
         scene = shot(segment["duration"])
         scene.update({"action": "\n\n".join(x for x in [
-                clip_text(segment["action"] or segment["story"]), cast_lock] if x),
+                clip_text(segment["action"] or segment["story"]), cast_lock, prop_lock] if x),
             "setting": clip_text(segment["setting"]),
             "final_state": "\n\n".join(x for x in [
                 clip_text(segment["ending"]),
@@ -3432,6 +3471,7 @@ class ProductionManager:
             f"Project output language: {PRODUCTION_LANGUAGES[production['language']]}. Keep all dialogue and generated text in this language.",
              card_context(production, relevant_cards, include_characters=False),
              cast_lock,
+             prop_lock,
              "Preserve exact dialogue. Stage only this clip. End in the declared visible state for continuity."] if x)
         # The local planner needs the complete production bible, but H3 should
         # receive only renderable scene direction. Keeping these channels
@@ -4188,6 +4228,10 @@ class ProductionManager:
         segment["video_prompt_source"] = source if source in ("local_ai", "compiled") else "compiled"
         segment["prompt_seconds"] = _seconds(seconds)
         segment["prompt_updated_at"] = time.time()
+        # A prompt revision changes the render contract. Keep every old take
+        # in history, but release a manual pin so an earlier video cannot be
+        # silently assembled as though it matched the new prompt.
+        segment["selected_video_run_id"] = None
         if project_id:
             segment["project_id"] = safe_id(project_id)
             segment["status"] = "ready"

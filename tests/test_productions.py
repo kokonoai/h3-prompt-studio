@@ -11,6 +11,7 @@ from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, 
                                  card_plan_source_hash, character_aliases, current_episode_story,
                                  character_presence_roles,
                                  continuity_visual_lock, device_screen_geometry_lock,
+                                 effective_temporal_cast_lock, inscribed_prop_continuity_lock,
                                  episode_timing_targets, fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
@@ -280,6 +281,41 @@ def test_manual_device_view_overrides_conflicting_automatic_phone_framing():
     assert "PERFORMANCE-VIEW GEOMETRY LOCK" in lock
     assert "SCREEN-VIEW GEOMETRY LOCK" not in lock
     assert "DIRECTOR OVERRIDE" in lock
+
+
+def test_mirror_lock_keeps_remote_and_absent_people_out_of_the_reflection():
+    koko, besi = _card("Koko"), _card("Besi")
+    production = {"brief": "Koko misses Besi.", "cards": {"characters": [koko, besi]}}
+    segment = {
+        "story": "Koko misses Besi while standing at the mirror.",
+        "setting": "Koko's bedroom mirror",
+        "action": "Koko looks at her own reflection while Besi appears only on the phone screen.",
+        "ending": "Koko lowers the phone.", "image_prompt": "Koko reflected in the mirror",
+        "card_selection": {"characters": ["Koko", "Besi"]},
+        "cast_timeline": {"visible_start": ["Koko"], "visible_end": ["Koko"],
+                          "enters": [], "exits": [], "offscreen": [],
+                          "mentioned_only": []},
+    }
+
+    lock = effective_temporal_cast_lock(
+        production, segment, {koko["id"]: "physical", besi["id"]: "display"})
+
+    assert "MIRROR GEOMETRY LOCK" in lock
+    assert "A reflection is not another physical body" in lock
+    assert "Display-only, imagined, off-screen and absent identities never appear in the mirror" in lock
+
+
+def test_written_prop_lock_preserves_one_authored_card_and_defers_exact_type():
+    lock = inscribed_prop_continuity_lock([{
+        "name": "Cream confession card",
+        "description": "A folded cream card handwritten with the authored confession.",
+        "notes": "Keep the ink and fold unchanged.",
+    }])
+
+    assert "INSCRIBED-PROP CONTINUITY LOCK" in lock
+    assert "Cream confession card" in lock
+    assert "never invent, paraphrase, translate, extend or mutate its text" in lock
+    assert "typography composited in post" in lock
 
 
 def test_segment_device_view_defaults_to_auto_and_invalid_legacy_values_are_safe():
@@ -1181,6 +1217,25 @@ def test_materialise_repairs_shared_legacy_subject_ids_and_isolates_clip_sound(t
     assert "LONG-FORM PRODUCTION CONTEXT" not in second["custom_instructions"]
     assert "h3_prompt_translation" not in second
     assert "Unrelated library footsteps" not in compile_project(second)["prompt"]
+
+
+def test_revised_prompt_releases_old_manually_selected_take(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "One short scene."})
+    production = manager.apply_plan(production["id"], [{
+        "title": "Beat", "story": "A waits.", "setting": "room", "action": "A waits.",
+        "ending": "A looks up.", "duration": 5, "duration_reason": "one beat",
+        "image_prompt": "A waiting", "dialogue": [], "card_selection": {},
+    }], "local_ai")
+    segment = production["segments"][0]
+    segment["selected_video_run_id"] = _id()
+    production = manager.save(production)
+
+    updated = manager.set_segment_prompt(
+        production["id"], segment["id"], "current prompt", "compiled", 1.2)
+
+    assert updated["segments"][0]["selected_video_run_id"] is None
+    assert updated["segments"][0]["video_prompt"] == "current prompt"
 
 
 def test_ref2va_materialise_excludes_non_card_source_people_and_assets(tmp_path):

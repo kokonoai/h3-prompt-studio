@@ -7,6 +7,7 @@ import json
 import sys
 import uuid
 import zipfile
+from pathlib import Path
 
 import httpx
 import pytest
@@ -99,6 +100,65 @@ def test_production_video_job_counts_keep_lost_requests_separate(server):
         {'candidates': [{'status': 'queued'}, {'status': 'running'}, {'status': 'failed'}]},
     ])
     assert counts == {'active_jobs': 2, 'uncertain_jobs': 1}
+
+
+def test_production_outputs_never_adopts_a_take_older_than_current_prompt(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id = (str(uuid.uuid4()) for _ in range(3))
+    old_id, current_id = str(uuid.uuid4()), str(uuid.uuid4())
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Phone insert',
+            'project_id': project_id, 'status': 'ready', 'prompt_updated_at': 200.0,
+            'selected_video_run_id': old_id,
+        }],
+    }
+    old = {'id': old_id, 'project_id': project_id, 'operation': 'video',
+           'status': 'succeeded', 'video_url': '/old.mp4', 'created_at': 100.0}
+    current = {'id': current_id, 'project_id': project_id, 'operation': 'video',
+               'status': 'succeeded', 'video_url': '/current.mp4', 'created_at': 201.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+
+    result = module.production_outputs(production_id, [old, current])
+
+    assert result['all_ready']
+    assert result['segments'][0]['selected']['id'] == current_id
+    assert [run['id'] for run in result['segments'][0]['candidates']] == [old_id, current_id]
+
+    missing = module.production_outputs(production_id, [old])
+    assert not missing['all_ready']
+    assert missing['segments'][0]['selected'] is None
+    assert missing['final_ready'] is False
+
+
+def test_concat_applies_one_final_loudness_master(server, monkeypatch, tmp_path):
+    module, _client, _fake = server
+    files = [tmp_path / 'one.mp4', tmp_path / 'two.mp4']
+    for path in files:
+        path.write_bytes(b'clip')
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        Path(command[-1]).write_bytes(b'video')
+        return type('Result', (), {'returncode': 0})()
+
+    monkeypatch.setattr(module.subprocess, 'run', fake_run)
+    output = tmp_path / 'film.mp4'
+
+    module._concat_series_files(files, output)
+
+    assert output.is_file()
+    assert len(calls) == 2
+    assert calls[0][calls[0].index('-c') + 1] == 'copy'
+    assert 'dynaudnorm=f=500:g=15:p=0.9:m=10' in calls[1]
+    assert calls[1][calls[1].index('-c:v') + 1] == 'copy'
 
 
 def test_production_auto_continuation_uses_only_verified_preceding_take(server, monkeypatch):
