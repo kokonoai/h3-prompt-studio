@@ -292,6 +292,59 @@ def test_online_only_canon_repairs_planner_colocation_and_survives_final_prompt(
     assert segment["cast_timeline"]["offscreen"] == ["Besi"]
 
 
+def test_display_only_split_call_keeps_an_explicit_empty_physical_timeline(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    koko = _card("Koko", [_image(store_asset, "Koko", "pink")["id"]])
+    besi = _card("Besi", [_image(store_asset, "Besi", "blue")["id"]])
+    production = manager.create({
+        "source_project": source, "language": "en",
+        "brief": ("Koko and Besi can only meet online. They remain physically separate "
+                  "and never share the same room."),
+    })
+    production["cards"]["characters"] = [koko, besi]
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Shared silence",
+        "story": "Koko and Besi share a quiet moment over a video call.",
+        "setting": "A stable split screen between Koko's room and Besi's room.",
+        "action": ("Split screen: Koko smiles at her display in her room while Besi "
+                   "leans back and smiles from his separate video panel."),
+        "ending": "Both remain inside their separate bounded panels.",
+        "duration": 5, "duration_reason": "one remote beat",
+        "image_prompt": "Stable split-screen video call between two separate rooms",
+        "dialogue": [
+            {"speaker": "Koko", "text": "Stay with me.", "language": "English", "voiceover": False},
+            {"speaker": "Besi", "text": "I'm here.", "language": "English", "voiceover": False},
+        ],
+        "card_selection": {"characters": ["Koko", "Besi"]},
+        # Reproduce the planner's unsafe legacy interpretation. Both people are
+        # visible in the composition, but neither is a body in one shared room.
+        "cast_timeline": {"visible_start": ["Koko", "Besi"],
+                          "visible_end": ["Koko", "Besi"], "enters": [], "exits": [],
+                          "offscreen": [], "mentioned_only": []},
+        "transition_mode": "hard_cut",
+    }], "local_ai")
+
+    roles = character_presence_roles(production, production["segments"][0])
+    assert roles[koko["id"]] == "display"
+    assert roles[besi["id"]] == "display"
+    materialised = manager.materialise(production["id"], production["segments"][0]["id"])
+    project = materialised["project"]
+    scene = project["shots"][0]
+    assert scene["visible_subject_ids"] == []
+    assert len(scene["display_subject_ids"]) == 2
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+
+    production = manager.set_segment_prompt(
+        production["id"], production["segments"][0]["id"], compiled["prompt"],
+        "compiled", 1.0, project["id"])
+    segment = production["segments"][0]
+    assert segment["status"] == "ready", segment.get("stale_reasons")
+    assert segment["stale_reasons"] == []
+    assert not any(segment["cast_timeline"].values())
+
+
 @pytest.mark.parametrize(("action", "image_prompt", "expected", "rejected"), [
     ("Koko looks at the phone and hesitates.", "Medium close-up on Koko's face.",
      "PERFORMANCE-VIEW GEOMETRY LOCK", "SCREEN-VIEW GEOMETRY LOCK"),

@@ -915,6 +915,14 @@ def normalise_cast_timeline(value, fallback_characters=()):
     as visible at both boundaries until the storyboard is replanned; new plans
     provide explicit entrances, exits and off-screen-only mentions.
     """
+    # ``None`` means this is a legacy clip which never authored a timeline, so
+    # selected characters are the safest backward-compatible fallback.  An
+    # explicit all-empty timeline is different: it is a valid contract for a
+    # display-only call, a memory insert, or a clip containing only off-screen
+    # audio.  Re-filling that explicit empty value makes remote identities
+    # physical again and causes a freshly rebuilt prompt to become stale as
+    # soon as it is saved.
+    legacy_missing = value is None
     if value is None:
         value = {}
     if not isinstance(value, dict) or set(value) - set(CAST_TIMELINE_KEYS):
@@ -927,7 +935,7 @@ def normalise_cast_timeline(value, fallback_characters=()):
         result[key] = list(dict.fromkeys(
             _text(name, f"cast_timeline.{key}", 120)
             for name in names if isinstance(name, str) and name.strip()))
-    if not any(result.values()):
+    if legacy_missing and not any(result.values()):
         fallback = list(dict.fromkeys(
             _text(name, "cast_timeline fallback", 120)
             for name in fallback_characters if isinstance(name, str) and name.strip()))[:16]
