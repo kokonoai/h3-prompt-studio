@@ -2672,8 +2672,18 @@ def test_source_coverage_and_adjacent_edit_contract_gate_video_prompt(tmp_path):
     compiled = compile_project(first_project)
     assert "SOURCE COVERAGE LOCK" in compiled["prompt"]
     assert "SHOT EDIT CONTRACT" in compiled["prompt"]
-    with pytest.raises(ValueError, match="failed shot preflight"):
-        manager.materialise(production["id"], production["segments"][1]["id"])
+    repaired = manager.materialise(
+        production["id"], production["segments"][1]["id"])["production"]
+    repaired_segment = repaired["segments"][1]
+    assert repaired_segment["transition_mode"] == "hard_cut"
+    assert repaired_segment["continue_previous"] is False
+    assert repaired_segment["continuity_state"]["mmh3_eligible"] is False
+    assert repaired_segment["shot_contract"]["relation_previous"] == "hard_cut"
+    assert repaired_segment["cast_timeline"] == second_timeline
+    assert not [row for row in repaired_segment["preflight_issues"]
+                if row["severity"] == "error"]
+    assert any("Auto-repaired" in warning
+               for warning in repaired_segment["continuity_warnings"])
 
 
 def test_shot_preflight_unifies_dialogue_camera_and_internal_cut_failures(tmp_path):

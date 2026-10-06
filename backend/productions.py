@@ -29,6 +29,16 @@ SELECTABLE_CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voi
 OVERVIEW_CARD_KINDS = ("characters", "wardrobe", "props", "environments")
 CAST_TIMELINE_KEYS = ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
 TRANSITION_MODES = ("continuous", "matched_cut", "hard_cut", "time_jump", "state_change", "insert")
+# These failures describe an unsafe *relationship between two adjacent clips*,
+# not a broken story beat.  The deterministic repair is therefore editorial:
+# keep both clips and their exact cast/story/dialogue, but stop treating the
+# boundary as one continuous MMH3 take.
+AUTO_HARD_CUT_CONTINUITY_CODES = frozenset({
+    "sudden_character_addition", "sudden_character_disappearance",
+    "remote_became_physical", "spatial_conflict", "movement_direction_conflict",
+    "eyeline_conflict", "prop_changed_hands", "prop_state_jump",
+    "wardrobe_jump", "axis_crossing", "invalid_mmh3_continuation",
+})
 SHOT_ROLES = ("master", "reaction", "close_up", "insert", "establishing", "over_shoulder", "cutaway")
 SHOT_SIZES = ("extreme_wide", "wide", "medium", "medium_close", "close_up", "extreme_close_up")
 EDIT_REASONS = ("dialogue_reaction", "action_match", "eyeline_match", "information_reveal",
@@ -4646,6 +4656,7 @@ class ProductionManager:
         segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
         if not segment:
             raise ValueError("Production clip not found.")
+        self._repair_recoverable_preflight(production, segment)
         self.assert_storyboard_contract_current(production, segment)
         if segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION:
             raise ValueError(
@@ -5770,6 +5781,46 @@ class ProductionManager:
                 f"Clip {segment.get('index')} failed shot preflight. Fix or replan it before generating video: " +
                 " ".join(preflight_errors[:5]))
         return True
+
+    def _repair_recoverable_preflight(self, production, segment):
+        """Downgrade an unsafe adjacent continuation to a normal hard cut.
+
+        Cast, dialogue, source coverage and shot content are deliberately left
+        untouched.  Only the editorial boundary and MMH3 continuation switch
+        are changed.  All other preflight errors remain blocking after the
+        audit is rebuilt, so this cannot conceal missing dialogue, internal
+        cuts or an overloaded/unfilmable shot.
+        """
+        errors = [row for row in segment.get("preflight_issues", [])
+                  if row.get("severity") == "error"]
+        codes = {str(row.get("code") or "") for row in errors}
+        repaired_codes = sorted(codes & AUTO_HARD_CUT_CONTINUITY_CODES)
+        changed = False
+
+        if "cut_relation_conflict" in codes:
+            segment.setdefault("shot_contract", {})["relation_previous"] = (
+                segment.get("transition_mode") or "hard_cut")
+            changed = True
+
+        if repaired_codes and (segment.get("transition_mode") == "continuous" or
+                               segment.get("continue_previous")):
+            segment["transition_mode"] = "hard_cut"
+            segment["continue_previous"] = False
+            segment.setdefault("continuity_state", {})["mmh3_eligible"] = False
+            segment.setdefault("shot_contract", {})["relation_previous"] = "hard_cut"
+            warning = (
+                "Auto-repaired an unsafe continuous boundary as a normal hard cut; "
+                "story, dialogue and cast were preserved (" + ", ".join(repaired_codes) + ").")
+            segment["continuity_warnings"] = list(dict.fromkeys(
+                [*segment.get("continuity_warnings", []), warning]))[:16]
+            changed = True
+
+        if changed:
+            # Rebuild all derived reports in memory. materialise() will persist
+            # the repaired boundary together with the fresh clip project, so a
+            # harmless cut change does not mark every later adopted take stale.
+            audit_storyboard_contract(production, backfill_legacy=True)
+        return changed
 
     def assert_video_project_current(self, production, project):
         """Reject stale or visually ungrounded production snapshots.

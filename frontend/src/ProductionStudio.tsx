@@ -43,7 +43,7 @@ type Segment = {
   ending_continuity_asset_id?:string|null;
 };
 type Production = {
-  id:string; title:string; language:"zh-CN"|"zh-TW"|"en"|"ja"; brief:string; style_bible:string; character_bible:string;
+  id:string; title:string; language:"zh-CN"|"zh-TW"|"en"|"ja"; brief:string; style_bible:string; character_bible:string; updated_at:number;
   prompt_version:"classic"|"continuity_director"|"storyboard_narrative";
   continuity_notes:string; series_voice_style:string; source_project_id:string; source_mode?:string; planner?:string|null; auto_merge:boolean; auto_continue_previous:boolean; auto_quality_review:boolean; task_state:"active"|"paused"; automation?:ProductionAutomation;
   planner_warning?:string|null; cards:CardLibrary; segments:Segment[];
@@ -94,6 +94,18 @@ export const qualityAcceptanceTargets=(outputs:ProductionOutputs|null|undefined)
       job.quality_review?.status==="failed"&&!job.quality_review.accepted);
     return take?[{segment_id:row.segment_id,run_id:take.id,index:row.index,title:row.title}]:[];
   })||[];
+
+export type TimeoutRecoveryKind="ai"|"automation"|"video"|"quality"|"idle";
+export const timeoutRecoveryKind=(
+  connection:{busy?:boolean}|null|undefined,
+  overview:Pick<ProductionOutputs,"automation"|"active_jobs"|"quality_batch">|null|undefined,
+):TimeoutRecoveryKind=>{
+  if(overview?.automation&&["running","retrying"].includes(overview.automation.status))return "automation";
+  if((overview?.active_jobs||0)>0)return "video";
+  if(overview?.quality_batch?.status==="running")return "quality";
+  if(connection?.busy)return "ai";
+  return "idle";
+};
 
 const blank = (project:Project) => ({
   // A new episode/part is deliberately empty. The current Scene Studio
@@ -1155,10 +1167,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   useEffect(()=>{pauseRequestedRef.current=production?.task_state==="paused";},[production?.id,production?.task_state]);
 
   const timeoutMessage=()=>t(
-    "Studio 的连接等待超时，但不代表任务失败；服务器可能仍在继续。项目状态已经重新核对，请不要连续重复点击。若仍显示处理中，等待片刻后刷新即可。",
-    "The Studio connection timed out, but the task may still be running. The project state has been checked again. Do not submit the same action repeatedly; if it still shows as active, wait briefly and refresh.",
-    "Studioへの接続待機がタイムアウトしましたが、処理は継続中の場合があります。プロジェクト状態を再確認しました。同じ操作を連打せず、処理中なら少し待って更新してください。",
-    "Studio 連線等待逾時，但不代表任務失敗；伺服器可能仍在繼續。專案狀態已重新核對，請勿連續重複點擊。若仍顯示處理中，稍候再重新整理。"
+    "Studio 的连接等待超时，自动核对暂时无法确认最终状态。请保持 H3 Studio 运行；项目已重新读取，稍后可安全地从缺失处继续。",
+    "The Studio connection timed out and automatic reconciliation could not confirm a final state. Keep H3 Studio running; the project was reloaded and can later resume safely from missing work.",
+    "Studioへの接続がタイムアウトし、自動照合でも最終状態を確認できませんでした。H3 Studioを起動したままにしてください。プロジェクトは再読込済みで、後から不足分だけ安全に再開できます。",
+    "Studio 連線等待逾時，自動核對暫時無法確認最終狀態。請保持 H3 Studio 執行；專案已重新讀取，稍後可安全地從缺失處繼續。"
   );
   const reconcileAfterTimeout=async(id=production?.id)=>{
     if(!id)return null;
@@ -1168,13 +1180,70 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         api("/productions/"+id+"/outputs") as Promise<ProductionOutputs>,
       ]);
       setProduction(current);setDraft(current);setOutputs(overview);
-      return overview;
+      return {production:current,overview};
     }catch{return null;}
+  };
+  const monitorTimedOutRequest=async(id=production?.id)=>{
+    if(!id)return {kind:"idle" as TimeoutRecoveryKind,snapshot:null,error:""};
+    let failedChecks=0;
+    for(let attempt=0;attempt<200;attempt++){
+      const snapshot=await reconcileAfterTimeout(id);
+      let connection:{busy?:boolean;stage?:string;error?:string|null}|null=null;
+      try{
+        connection=await api("/connections",undefined,undefined,"GET",{timeoutMs:15000}) as typeof connection;
+        failedChecks=0;
+      }catch{failedChecks+=1;}
+      const kind=timeoutRecoveryKind(connection,snapshot?.overview);
+      if(kind==="automation"||kind==="video"||kind==="quality")return {kind,snapshot,error:""};
+      if(kind==="idle"){
+        if(connection||failedChecks>=4){
+          await refreshList().catch(()=>{});
+          return {kind,snapshot,error:connection?.stage==="needs attention"?connection.error||"":""};
+        }
+      }else{
+        setBusy(t(
+          "连接已超时，但服务器仍在处理 · "+(connection?.stage||"AI 正在工作"),
+          "Connection timed out, but the server is still working · "+(connection?.stage||"AI is working"),
+          "接続はタイムアウトしましたが、サーバーは処理中です・"+(connection?.stage||"AI処理中"),
+          "連線已逾時，但伺服器仍在處理 · "+(connection?.stage||"AI 正在工作")
+        ));
+      }
+      await sleep(3000);
+    }
+    return {kind:"idle" as TimeoutRecoveryKind,snapshot:await reconcileAfterTimeout(id),error:""};
   };
   const run=async(label:string,fn:()=>Promise<void>)=>{
     if(busyRef.current)return;busyRef.current=true;setBusy(label);setError("");setNotice("");
     try{await fn();}catch(e){
-      if(e instanceof ApiTimeoutError){await reconcileAfterTimeout();setNotice(timeoutMessage());}
+      if(e instanceof ApiTimeoutError){
+        setBusy(t("正在自动核对后台任务…","Reconciling the background task…","バックグラウンド処理を自動確認中…","正在自動核對背景任務…"));
+        const recovered=await monitorTimedOutRequest();
+        if(recovered.error)setError(t(
+          "后台任务结束，但服务器报告失败：",
+          "The background task ended with a server error: ",
+          "バックグラウンド処理は終了しましたが、サーバーエラーが報告されました：",
+          "背景任務已結束，但伺服器回報失敗："
+        )+recovered.error);
+        else if(recovered.kind==="automation")setNotice(t(
+          "前端等待超时，但后台一键任务已确认运行；无需重按，页面会继续自动刷新进度。",
+          "The browser wait timed out, but the background episode run is confirmed active. Do not submit it again; progress will continue refreshing automatically.",
+          "画面の待機はタイムアウトしましたが、バックグラウンド処理は実行中です。再送は不要で、進捗は自動更新されます。",
+          "前端等待逾時，但背景一鍵任務已確認執行；無需重按，頁面會繼續自動重新整理進度。"
+        ));
+        else if(recovered.kind==="video"||recovered.kind==="quality")setNotice(t(
+          "请求已进入后台处理，页面会自动更新结果，无需重复点击。",
+          "The request is running in the background. Results will refresh automatically; do not submit it again.",
+          "処理はバックグラウンドで進行中です。結果は自動更新されるため、再送は不要です。",
+          "請求已進入背景處理，頁面會自動更新結果，無需重複點擊。"
+        ));
+        else if(recovered.snapshot)setNotice(t(
+          "服务器后台处理已经结束，项目与结果已自动刷新。",
+          "The server-side work has finished, and the project and results were refreshed automatically.",
+          "サーバー側の処理が終了し、プロジェクトと結果を自動更新しました。",
+          "伺服器背景處理已結束，專案與結果已自動重新整理。"
+        ));
+        else setNotice(timeoutMessage());
+      }
       else setError((e as Error).message);
     }finally{busyRef.current=false;setBusy("");}
   };
@@ -1905,14 +1974,34 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       const reason=(e as Error).message;
       if(isPauseRequestError(e)){setNotice(queuePausedNotice());}
       else if(e instanceof ApiTimeoutError){
-        const reconciled=await reconcileAfterTimeout(currentId);
-        if(reconciled?.automation&&["running","retrying"].includes(reconciled.automation.status)){
+        setBusy(t("正在自动核对后台任务…","Reconciling the background task…","バックグラウンド処理を自動確認中…","正在自動核對背景任務…"));
+        const recovered=await monitorTimedOutRequest(currentId);
+        const reconciled=recovered.snapshot?.overview;
+        if(recovered.error)setError(t(
+          "一键流程的后台步骤失败，已完成内容仍然保留。原因：",
+          "A background step in one-click production failed; completed work remains saved. Reason: ",
+          "一括制作のバックグラウンド処理が失敗しました。完了済み内容は保持されています。理由：",
+          "一鍵流程的背景步驟失敗，已完成內容仍然保留。原因："
+        )+recovered.error);
+        else if(recovered.kind==="automation"&&reconciled?.automation&&["running","retrying"].includes(reconciled.automation.status)){
           setNotice(t(
             "前端等待超时，但后台一键任务已经确认在运行。无需重按；页面会继续刷新进度。",
             "The browser wait timed out, but the background one-click run is confirmed active. Do not submit it again; this page will keep refreshing its progress.",
             "画面の待機はタイムアウトしましたが、バックグラウンドの一括処理は実行中です。再送せず、このページの進捗更新を待ってください。",
             "前端等待逾時，但背景一鍵任務已確認正在執行。無需重按；頁面會繼續重新整理進度。"));
-        }else setNotice(timeoutMessage());
+        }else if(recovered.kind==="video"||recovered.kind==="quality")setNotice(t(
+          "长请求已经进入后台处理，页面会自动更新后续进度，无需重新启动。",
+          "The long request is now running in the background. This page will update subsequent progress automatically; do not restart it.",
+          "長い処理はバックグラウンドへ移行しました。以後の進捗は自動更新されるため、再起動は不要です。",
+          "長請求已進入背景處理，頁面會自動更新後續進度，無需重新啟動。"
+        ));
+        else if(recovered.snapshot)setNotice(t(
+          "超时后的服务器处理已结束，项目状态已自动刷新；如仍有缺失，点“继续完成本集”会从缺失处接着做。",
+          "The timed-out server work has finished and the project was refreshed automatically. If anything is still missing, Resume episode continues from that point.",
+          "タイムアウト後のサーバー処理が終了し、プロジェクトを自動更新しました。不足が残る場合は「この話を続行」で続きから再開できます。",
+          "逾時後的伺服器處理已結束，專案狀態已自動重新整理；如仍有缺失，點「繼續完成本集」會從缺失處接著做。"
+        ));
+        else setNotice(timeoutMessage());
       }
       else setError(t(
         "一键流程已暂停，已经完成的提示词和视频均已保存。请确认 H3 Studio 与 ComfyUI 正在运行，再点“继续完成本集”即可从缺失处接着做。原因：",

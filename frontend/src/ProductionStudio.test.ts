@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { productionDialogueExport, productionKeyframeSize, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { productionDialogueExport, productionKeyframeSize, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -28,6 +28,14 @@ describe("production text exports",()=>{
 });
 
 describe("episode batch production",()=>{
+  it("keeps timed-out work attached to durable server progress",()=>{
+    expect(timeoutRecoveryKind({busy:true},null)).toBe("ai");
+    expect(timeoutRecoveryKind({busy:false},{automation:{status:"running"},active_jobs:0} as any)).toBe("automation");
+    expect(timeoutRecoveryKind({busy:false},{automation:{status:"idle"},active_jobs:1} as any)).toBe("video");
+    expect(timeoutRecoveryKind({busy:false},{automation:{status:"idle"},active_jobs:0,quality_batch:{status:"running"}} as any)).toBe("quality");
+    expect(timeoutRecoveryKind({busy:false},{automation:{status:"completed"},active_jobs:0} as any)).toBe("idle");
+  });
+
   it("targets only checked clips and keeps storyboard order",()=>{
     const clips:any[]=[{id:"clip-1"},{id:"clip-2"},{id:"clip-3"}];
     expect(selectedClipTargets(clips,["clip-3","clip-1"]).map(item=>item.id)).toEqual(["clip-1","clip-3"]);

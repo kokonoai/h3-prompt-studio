@@ -19,6 +19,20 @@ PROMPT_REPAIR_MARKERS = (
     "outdated character-reference assignment",
     "production clip is stale",
     "shot_contract.relation_previous disagrees with transition_mode",
+    # Adjacent-state failures can be repaired without changing story/cast: the
+    # materialiser converts the unsafe continuation to a hard cut, rebuilds the
+    # prompt, and this worker continues from the same clip.
+    "continuous clip adds characters at its opening",
+    "continuous clip loses characters at its opening",
+    "remote/off-screen identities entered the real space without a cut",
+    "changes position/facing across a continuous cut",
+    "reverses movement direction across a continuous cut",
+    "eyeline direction flips across a continuous cut",
+    "changes holder from",
+    "changes visible state across a continuous boundary",
+    "wardrobe-card selection changes across a continuous boundary",
+    "camera axis changes during continuous action",
+    "previous-ending continuation is enabled but this transition is not mmh3-safe",
 )
 TRANSIENT_MARKERS = (
     "timeout", "timed out", "readtimeout", "connecttimeout", "connection",

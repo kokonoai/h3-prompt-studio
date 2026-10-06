@@ -130,9 +130,28 @@ def test_failure_classification_is_narrow_and_safe():
     assert is_prompt_repairable("This production clip is stale. Regenerate it.")
     assert is_prompt_repairable(
         "shot_contract.relation_previous disagrees with transition_mode.")
+    assert is_prompt_repairable(
+        "Continuous clip adds characters at its opening: Nox")
+    assert is_prompt_repairable(
+        "Continuous clip loses characters at its opening: Mr. Tsukiguma")
     assert is_transient_failure("ReadTimeout contacting ComfyUI")
     assert is_transient_failure("A video request is already active.")
     assert not is_transient_failure("Visible character identity references are missing")
+
+
+def test_unsafe_continuation_rebuilds_prompt_once_then_continues():
+    manager, state, submitted_ids, merged = fake_manager(submit_failures=[
+        "Clip 2 failed shot preflight. Fix or replan it before generating video: "
+        "Continuous clip adds characters at its opening: Nox "
+        "Continuous clip loses characters at its opening: Mr. Tsukiguma"
+    ])
+
+    manager.start(state["id"])
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    assert len(submitted_ids) == 2
+    assert merged == [state["id"]]
+    assert state["automation"]["last_error"] == ""
 
 
 def test_failed_quality_review_stops_without_rerendering_or_merging():
