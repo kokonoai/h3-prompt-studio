@@ -1,4 +1,10 @@
-from backend.lmstudio import LMStudioClient
+import io
+from unittest.mock import Mock
+from urllib.error import HTTPError
+
+import pytest
+
+from backend.lmstudio import LMStudioClient, LMStudioError
 
 
 SIMPLE_SCHEMA = {
@@ -41,3 +47,17 @@ def test_lm_studio_without_off_capability_keeps_model_default(monkeypatch):
     monkeypatch.setattr(client, "_request", request)
     assert client.complete_json("local-model", "Return JSON.", "Do the task.", SIMPLE_SCHEMA) == {"ok": True}
     assert "reasoning_effort" not in captured
+
+
+def test_ollama_http_error_names_provider_and_preserves_safe_reason():
+    client = LMStudioClient("http://127.0.0.1:11434/v1")
+    body = b'{"error":"runner process terminated unexpectedly"}'
+    client._opener.open = Mock(side_effect=HTTPError(
+        'http://127.0.0.1:11434/v1/chat/completions', 500, '', {}, io.BytesIO(body)))
+
+    with pytest.raises(LMStudioError) as failure:
+        client._request('POST', '/v1/chat/completions', {})
+
+    assert failure.value.code == 'http_error'
+    assert str(failure.value) == 'Ollama returned HTTP 500: runner process terminated unexpectedly'
+    assert failure.value.detail == body.decode()

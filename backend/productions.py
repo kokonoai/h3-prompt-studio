@@ -20,12 +20,19 @@ MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
 REFERENCE_STRATEGY_VERSION = 9
 CAST_TIMELINE_VERSION = 1
+STORY_CONTRACT_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
+AUTOMATION_STATUSES = ("idle", "running", "retrying", "paused", "needs_attention", "completed")
+AUTOMATION_STAGES = ("idle", "scan", "prompts", "videos", "quality", "merge", "paused", "completed")
 CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices", "styles")
 SELECTABLE_CARD_KINDS = ("characters", "wardrobe", "props", "environments", "voices")
 OVERVIEW_CARD_KINDS = ("characters", "wardrobe", "props", "environments")
 CAST_TIMELINE_KEYS = ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
 TRANSITION_MODES = ("continuous", "matched_cut", "hard_cut", "time_jump", "state_change", "insert")
+SHOT_ROLES = ("master", "reaction", "close_up", "insert", "establishing", "over_shoulder", "cutaway")
+SHOT_SIZES = ("extreme_wide", "wide", "medium", "medium_close", "close_up", "extreme_close_up")
+EDIT_REASONS = ("dialogue_reaction", "action_match", "eyeline_match", "information_reveal",
+                "time_jump", "scene_change", "continuity", "emphasis")
 DEVICE_VIEW_MODES = ("auto", "performance", "screen", "front_camera", "phone_to_ear", "remote_panel")
 PRODUCTION_LANGUAGES = {
     "zh-CN": "Simplified Chinese", "zh-TW": "Traditional Chinese",
@@ -44,7 +51,7 @@ PRODUCTION_SCHEMA = {
             "type": "object", "additionalProperties": False,
             "required": ["title", "story", "setting", "action", "ending", "duration",
                          "duration_reason", "dialogue", "image_prompt", "card_selection",
-                         "cast_timeline", "transition_mode"],
+                         "cast_timeline", "transition_mode", "source_refs", "continuity_state", "shot_contract"],
             "properties": {
                 "title": {"type": "string", "maxLength": 120},
                 "story": {"type": "string", "maxLength": 3000},
@@ -73,6 +80,74 @@ PRODUCTION_SCHEMA = {
                     }},
                 "transition_mode": {"type": "string", "enum": list(TRANSITION_MODES)},
                 "device_view": {"type": "string", "enum": list(DEVICE_VIEW_MODES)},
+                "source_refs": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["scene_ids", "paragraph_ids", "dialogue_ids", "event_ids"],
+                    "properties": {
+                        key: {"type": "array", "maxItems": 64,
+                              "items": {"type": "string", "maxLength": 32}}
+                        for key in ("scene_ids", "paragraph_ids", "dialogue_ids", "event_ids")
+                    }},
+                "continuity_state": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["opening_state", "ending_state", "positions_start", "positions_end",
+                                 "prop_holders_start", "prop_holders_end", "mmh3_eligible"],
+                    "properties": {
+                        "opening_state": {"type": "string", "maxLength": 1200},
+                        "ending_state": {"type": "string", "maxLength": 1200},
+                        "positions_start": {"type": "array", "maxItems": 16, "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["character", "position", "facing", "movement_direction",
+                                         "eyeline_target", "eyeline_direction"],
+                            "properties": {
+                                "character": {"type": "string", "maxLength": 120},
+                                "position": {"type": "string", "maxLength": 160},
+                                "facing": {"type": "string", "maxLength": 120},
+                                "movement_direction": {"type": "string", "maxLength": 120},
+                                "eyeline_target": {"type": "string", "maxLength": 120},
+                                "eyeline_direction": {"type": "string", "maxLength": 120}}}},
+                        "positions_end": {"type": "array", "maxItems": 16, "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["character", "position", "facing", "movement_direction",
+                                         "eyeline_target", "eyeline_direction"],
+                            "properties": {
+                                "character": {"type": "string", "maxLength": 120},
+                                "position": {"type": "string", "maxLength": 160},
+                                "facing": {"type": "string", "maxLength": 120},
+                                "movement_direction": {"type": "string", "maxLength": 120},
+                                "eyeline_target": {"type": "string", "maxLength": 120},
+                                "eyeline_direction": {"type": "string", "maxLength": 120}}}},
+                        "prop_holders_start": {"type": "array", "maxItems": 24, "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["prop", "holder", "state"],
+                            "properties": {"prop": {"type": "string", "maxLength": 120},
+                                           "holder": {"type": "string", "maxLength": 120},
+                                           "state": {"type": "string", "maxLength": 240}}}},
+                        "prop_holders_end": {"type": "array", "maxItems": 24, "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["prop", "holder", "state"],
+                            "properties": {"prop": {"type": "string", "maxLength": 120},
+                                           "holder": {"type": "string", "maxLength": 120},
+                                           "state": {"type": "string", "maxLength": 240}}}},
+                        "mmh3_eligible": {"type": "boolean"},
+                    }},
+                "shot_contract": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["role", "shot_size", "opening_composition", "ending_composition",
+                                 "camera_axis", "allow_axis_cross", "edit_reason", "relation_previous",
+                                 "preserve_from_previous", "must_change"],
+                    "properties": {
+                        "role": {"type": "string", "enum": list(SHOT_ROLES)},
+                        "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
+                        "opening_composition": {"type": "string", "maxLength": 1000},
+                        "ending_composition": {"type": "string", "maxLength": 1000},
+                        "camera_axis": {"type": "string", "maxLength": 500},
+                        "allow_axis_cross": {"type": "boolean"},
+                        "edit_reason": {"type": "string", "enum": list(EDIT_REASONS)},
+                        "relation_previous": {"type": "string", "enum": list(TRANSITION_MODES)},
+                        "preserve_from_previous": {"type": "string", "maxLength": 1200},
+                        "must_change": {"type": "string", "maxLength": 1200},
+                    }},
                 "card_selection": {
                     "type": "object", "additionalProperties": False,
                     "required": list(SELECTABLE_CARD_KINDS),
@@ -215,6 +290,21 @@ CONTENT
 - Do not force dialogue into a visual beat. Protect reaction time, silence and emotional aftermath when they carry the scene.
 - Section headings, part-ending labels, broad time-range labels and planning notes are editorial metadata. Do not turn them into visible action, dialogue, props or spoken narration.
 
+SOURCE COVERAGE CONTRACT
+- The request supplies a source_manifest with stable scene, paragraph, dialogue and event IDs. Every ID must be assigned to exactly one clip in source_refs, except a scene ID may repeat across adjacent clips belonging to that scene.
+- Keep paragraph_ids, dialogue_ids and event_ids in their authored order. Never omit, duplicate, reassign or reorder them. source_refs is an editorial binding, not prose to show or speak.
+- The dialogue_ids selected for a clip must correspond exactly to that clip's structured dialogue, with the same speaker and order. A heading can appear in scene_ids or paragraph_ids but never in dialogue_ids or structured dialogue.
+- A clip may cover several consecutive source items, but it may not take an item from after an item assigned to a later clip.
+
+ADJACENT CONTINUITY CONTRACT
+- Fill continuity_state for every clip. opening_state and ending_state name the concrete visible state, not theme or mood alone.
+- positions_start/end record only physically present characters, using stable screen-space positions (left, centre, right, foreground/background), facing, movement direction, eyeline target and eyeline direction. Do not put screen, memory or off-screen identities there.
+- prop_holders_start/end record important handheld or continuity-critical props. Use holder="environment" when placed down and holder="none" only when deliberately absent. state records visible continuity facts such as phone orientation, screen direction/on-off state, open/closed state, or the hand holding it; use an empty string only when no visible state matters.
+- mmh3_eligible is true only when this clip can safely inherit the immediately preceding saved motion/audio tail: uninterrupted time and place, compatible opening cast/positions/props, and no insert, time jump, state change, remote panel or memory transition.
+- transition_mode is the cut relation to the previous clip. The first clip is hard_cut. Do not mark a clip continuous merely because the story is related.
+- Fill shot_contract without asking the user. Choose the clip's editorial responsibility, shot size, opening/ending composition, camera axis, whether a motivated axis crossing is allowed, the edit reason, relation to the previous clip, what must be preserved and what must visibly change.
+- Avoid accidental jump cuts: adjacent clips should not repeat nearly identical composition and performance unless an intentional matched cut or continuous action requires it. For dialogue, keep reciprocal eyelines and the established axis. For inserts/cutaways, make the information purpose explicit and do not duplicate the preceding action.
+
 COMPACT STRUCTURED OUTPUT
 - Keep the JSON production-usable but concise so local models can finish it. Use a short title; one or two sentences for story; one sentence for setting; one to three sentences for action; one sentence for ending; one short clause for duration_reason; and one or two sentences for image_prompt.
 - Never repeat the character bible, voice cards, visual-style bible, card descriptions or these instructions inside a segment. Refer to cards only by their exact names in card_selection.
@@ -236,6 +326,7 @@ ENSEMBLE GENERATION SAFETY
 - If both a readable phone display and the holder's facial reaction are dramatically important, split them into adjacent generation clips or choose one as the visible priority. Do not ask one generated frame to establish both incompatible views.
 - device_view is an optional director override: auto, performance, screen, front_camera, phone_to_ear or remote_panel. Normally return auto and let the application infer a safe view. Use a specific value only when the source clearly requires that geometry; never use it to invent a device absent from the story.
 - transition_mode describes the editorial relationship to the previous clip: continuous only for unbroken time/place/action suitable for saved-motion continuation; matched_cut for a deliberate same-scene reframing; hard_cut for an ordinary new shot or location; time_jump for montage or elapsed time; state_change for reset, teleport, transformation or discontinuous world-state change; insert for a detail/cutaway. The first clip is hard_cut.
+- transition_mode and shot_contract.relation_previous describe the edit AT THE BOUNDARY before this clip. Do not repeat that boundary as an internal "cut to", match cut, transition or second setup inside story, setting, action, ending or image_prompt. Those fields describe only the new clip's side of the boundary and one uninterrupted filmable camera setup. If the source truly requires another setup, allocate it to an adjacent generation clip while preserving source order, locked dialogue and total duration.
 
 REFERENCE CARD SELECTION
 - For every clip, fill card_selection using exact card names copied only from available_asset_cards.
@@ -413,6 +504,38 @@ _SHOT_TIMECODE_RANGE = re.compile(
 )
 
 
+_INTER_SHOT_SECTION_HEADING = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"#{1,2}[ \t]+\S[^\r\n]*|"
+    r"(?:part|chapter|act|section)[ \t]+[A-Za-z0-9一二三四五六七八九十._-]+[^\r\n]*|"
+    r"第[ \t]*[A-Za-z0-9一二三四五六七八九十._-]+[ \t]*(?:部分|章|幕|节|節)[^\r\n]*"
+    r")$"
+)
+
+
+def _trim_inter_shot_section_metadata(body):
+    """Keep the next section header out of the preceding authored shot.
+
+    Shot timecodes are the narrowest editorial authority.  A storyboard often
+    places a new ``Part`` heading, its duration, cast roster and production
+    notes after the last shot of the previous part but before the next shot
+    heading.  Because shot matches delimit the raw body, those notes otherwise
+    become fake plot events owned by the previous clip.
+    """
+    heading = _INTER_SHOT_SECTION_HEADING.search(body)
+    if heading is None:
+        return body.strip()
+    cut = heading.start()
+    prefix = body[:cut]
+    separator = re.search(
+        r"(?ms)(?:^|\n)[ \t]*(?:-{3,}|_{3,}|\*{3,})[ \t]*(?:\r?\n[ \t]*)*$",
+        prefix,
+    )
+    if separator is not None:
+        cut = separator.start()
+    return body[:cut].strip()
+
+
 def timed_story_beats(story):
     """Read explicit screenplay time ranges without interpreting prose."""
     if not isinstance(story, str):
@@ -427,7 +550,11 @@ def timed_story_beats(story):
         if end <= start or start < previous_end:
             return []
         text_end = matches[index + 1].start() if index + 1 < len(matches) else len(story)
-        body = story[match.end():text_end].strip()
+        body = story[match.end():text_end]
+        if shot_matches:
+            body = _trim_inter_shot_section_metadata(body)
+        else:
+            body = body.strip()
         if not body:
             return []
         beats.append({"start": start, "end": end, "duration": end - start, "text": body})
@@ -710,6 +837,206 @@ def locked_timed_dialogue(production, story=None):
     return groups
 
 
+_SOURCE_SCENE_HEADING = re.compile(
+    r"^(?:int\.?|ext\.?|int\.?/ext\.?|i/e\.?|scene|shot|chapter|episode|act|part)\b|"
+    r"^(?:场景|場景|第\s*[一二三四五六七八九十百零〇0-9]+\s*(?:场|場|幕|章|节|節|段))|"
+    r"^(?:シーン|ショット|第\s*[0-9一二三四五六七八九十百零〇]+\s*(?:話|幕|章))",
+    re.IGNORECASE,
+)
+_SOURCE_TIMECODE_ONLY = re.compile(
+    r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:[-–—~至到]\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\.\d+)?)?\s*$")
+
+
+def _source_blocks(text):
+    """Return auditable source rows without separating a cue from its quote."""
+    rows = [row.strip() for row in str(text or "").splitlines() if row.strip()]
+    blocks, index = [], 0
+    while index < len(rows):
+        row = rows[index]
+        marker = _speaker_marker(row)
+        if marker and not editorial_speaker_label(marker[0]):
+            inline = _strip_script_markdown(marker[1])
+            if not inline and index + 1 < len(rows):
+                following = _strip_script_markdown(rows[index + 1])
+                if following and following[0] in _DIALOGUE_OPENERS:
+                    blocks.append(row + "\n" + rows[index + 1])
+                    index += 2
+                    continue
+        blocks.append(row)
+        index += 1
+    return blocks
+
+
+def source_manifest_for_text(text, chunk_index=1):
+    """Build stable source IDs used by planning, UI review and render admission."""
+    prefix = f"C{int(chunk_index):02d}"
+    scenes, paragraphs, dialogue, events = [], [], [], []
+    scene_number, current_scene = 1, f"{prefix}-S001"
+    scenes.append({"id": current_scene, "title": "Scene 1"})
+    for block in _source_blocks(text):
+        clean = _strip_script_markdown(block).strip()
+        heading = bool(
+            _SOURCE_SCENE_HEADING.search(clean) or _SOURCE_TIMECODE_ONLY.fullmatch(clean) or
+            editorial_speaker_label(clean.split(":", 1)[0].strip()))
+        if heading:
+            if paragraphs or scenes[0]["title"] != "Scene 1":
+                scene_number += 1
+                current_scene = f"{prefix}-S{scene_number:03d}"
+                scenes.append({"id": current_scene, "title": clean[:240]})
+            else:
+                scenes[0]["title"] = clean[:240]
+        paragraph_id = f"{prefix}-P{len(paragraphs) + 1:03d}"
+        parsed = script_dialogue(block)
+        paragraphs.append({"id": paragraph_id, "scene_id": current_scene,
+                           "kind": "heading" if heading else "dialogue" if parsed else "action",
+                           "text": block[:2000]})
+        for line in parsed:
+            dialogue.append({"id": f"{prefix}-D{len(dialogue) + 1:03d}",
+                             "scene_id": current_scene, "paragraph_id": paragraph_id,
+                             "speaker": line["speaker"], "text": line["text"]})
+        if not heading and not parsed:
+            events.append({"id": f"{prefix}-E{len(events) + 1:03d}",
+                           "scene_id": current_scene, "paragraph_id": paragraph_id,
+                           "text": block[:2000]})
+    return {"chunk": int(chunk_index), "source_hash": _hash(str(text or "")),
+            "scenes": scenes, "paragraphs": paragraphs, "dialogue": dialogue, "events": events}
+
+
+def production_source_manifest(production, story=None):
+    """Derive the complete current-episode manifest using planner boundaries."""
+    story = story if story is not None else current_episode_story(production)
+    timed = timed_clip_groups(story)
+    pieces = ([timed_group_story(group) for group in timed]
+              if timed else storyboard_planning_chunks(story))
+    chunks = [source_manifest_for_text(piece, index + 1) for index, piece in enumerate(pieces)]
+    return {"version": STORY_CONTRACT_VERSION, "story_hash": _hash(story), "chunks": chunks}
+
+
+SOURCE_REF_KEYS = ("scene_ids", "paragraph_ids", "dialogue_ids", "event_ids")
+
+
+def normalise_source_refs(value):
+    if value is None:
+        return {key: [] for key in SOURCE_REF_KEYS}
+    if not isinstance(value, dict) or set(value) - set(SOURCE_REF_KEYS):
+        raise ValueError("source_refs contains unsupported fields.")
+    result = {}
+    for key in SOURCE_REF_KEYS:
+        rows = value.get(key, [])
+        if not isinstance(rows, list) or len(rows) > 64:
+            raise ValueError(f"source_refs.{key} contains too many source IDs.")
+        result[key] = list(dict.fromkeys(
+            _text(row, f"source_refs.{key}", 32) for row in rows
+            if isinstance(row, str) and row.strip()))
+    return result
+
+
+def normalise_continuity_state(value, segment=None):
+    """Keep only compact, filmable state needed between adjacent clips."""
+    value = value if isinstance(value, dict) else {}
+    segment = segment or {}
+
+    def positions(key):
+        result = []
+        for row in value.get(key, []) if isinstance(value.get(key, []), list) else []:
+            if not isinstance(row, dict):
+                continue
+            character = _text(row.get("character"), f"continuity_state.{key}.character", 120)
+            if character:
+                result.append({"character": character,
+                               "position": _text(row.get("position"), f"continuity_state.{key}.position", 160),
+                               "facing": _text(row.get("facing"), f"continuity_state.{key}.facing", 120),
+                               "movement_direction": _text(row.get("movement_direction"),
+                                                           f"continuity_state.{key}.movement_direction", 120),
+                               "eyeline_target": _text(row.get("eyeline_target"),
+                                                       f"continuity_state.{key}.eyeline_target", 120),
+                               "eyeline_direction": _text(row.get("eyeline_direction"),
+                                                          f"continuity_state.{key}.eyeline_direction", 120)})
+        return result[:16]
+
+    def holders(key):
+        result = []
+        for row in value.get(key, []) if isinstance(value.get(key, []), list) else []:
+            if not isinstance(row, dict):
+                continue
+            prop = _text(row.get("prop"), f"continuity_state.{key}.prop", 120)
+            if prop:
+                result.append({"prop": prop,
+                               "holder": _text(row.get("holder"), f"continuity_state.{key}.holder", 120,
+                                               "none") or "none",
+                               "state": _text(row.get("state"), f"continuity_state.{key}.state", 240)})
+        return result[:24]
+
+    eligible = value.get("mmh3_eligible", segment.get("transition_mode") == "continuous")
+    if type(eligible) is not bool:
+        eligible = False
+    return {
+        "opening_state": _text(value.get("opening_state"), "continuity opening state", 1200,
+                               segment.get("setting", "")),
+        "ending_state": _text(value.get("ending_state"), "continuity ending state", 1200,
+                              segment.get("ending", "")),
+        "positions_start": positions("positions_start"),
+        "positions_end": positions("positions_end"),
+        "prop_holders_start": holders("prop_holders_start"),
+        "prop_holders_end": holders("prop_holders_end"),
+        "mmh3_eligible": eligible,
+    }
+
+
+def normalise_shot_contract(value, segment=None):
+    value = value if isinstance(value, dict) else {}
+    segment = segment or {}
+    relation = value.get("relation_previous", segment.get("transition_mode", "hard_cut"))
+    if relation not in TRANSITION_MODES:
+        relation = "hard_cut"
+    role = value.get("role", "master")
+    if role not in SHOT_ROLES:
+        role = "master"
+    size = value.get("shot_size", "medium")
+    if size not in SHOT_SIZES:
+        size = "medium"
+    reason = value.get("edit_reason", "continuity")
+    if reason not in EDIT_REASONS:
+        reason = "continuity"
+    allow_cross = value.get("allow_axis_cross", False)
+    if type(allow_cross) is not bool:
+        allow_cross = False
+    return {
+        "role": role, "shot_size": size,
+        "opening_composition": _text(value.get("opening_composition"), "opening composition", 1000,
+                                     segment.get("setting", "")),
+        "ending_composition": _text(value.get("ending_composition"), "ending composition", 1000,
+                                    segment.get("ending", "")),
+        "camera_axis": _text(value.get("camera_axis"), "camera axis", 500),
+        "allow_axis_cross": allow_cross, "edit_reason": reason,
+        "relation_previous": relation,
+        "preserve_from_previous": _text(value.get("preserve_from_previous"), "preserved edit state", 1200),
+        "must_change": _text(value.get("must_change"), "required edit change", 1200),
+    }
+
+
+def reconcile_transition_contract(transition_mode, relation_previous, index):
+    """Collapse the planner's duplicate cut fields into one safe authority.
+
+    ``transition_mode`` controls continuity checks and MMH3 admission, while
+    the shot contract carries the same relation for editorial display. Local
+    models occasionally use ``continuous`` there merely to mean continuous
+    story time. Never promote that ambiguity to saved-motion continuation.
+    Conversely, a specific discontinuous edit is more informative than the
+    generic ``hard_cut`` default and is safe to preserve.
+    """
+    transition = transition_mode if transition_mode in TRANSITION_MODES else "hard_cut"
+    relation = relation_previous if relation_previous in TRANSITION_MODES else transition
+    if int(index) == 0:
+        return "hard_cut"
+    if transition == relation:
+        return transition
+    specific_cuts = {"matched_cut", "time_jump", "state_change", "insert"}
+    if transition == "hard_cut" and relation in specific_cuts:
+        return relation
+    return transition
+
+
 def production_schema_for_story(story):
     """Preserve source groups while allowing dense groups to split safely."""
     schema = copy.deepcopy(PRODUCTION_SCHEMA)
@@ -732,6 +1059,20 @@ def recommended_clip_count(target_seconds):
     maximum = max(minimum, target // PLANNED_MIN_SECONDS)
     preferred = max(1, math.floor(target / DEFAULT_CLIP_SECONDS + 0.5))
     return min(max(preferred, minimum), maximum, MAX_SEGMENTS)
+
+
+def storyboard_output_token_budget(clip_count):
+    """Reserve enough JSON output without exceeding local client limits.
+
+    LM Studio and the OpenAI-compatible local client both cap one structured
+    response at 4,096 output tokens.  Larger values fail before generation and
+    used to make a normal AI plan look like a successful heuristic fallback.
+    Long episodes are already planned in bounded source parts, so keep each
+    part inside the real transport limit and let source-contract validation
+    retry an incomplete part.
+    """
+    count = max(1, int(clip_count or 1))
+    return min(4096, max(2400, 1800 + count * 1300))
 
 
 def episode_timing_targets(production, chunk_index=1, chunk_total=1, story=None):
@@ -854,14 +1195,14 @@ def cards_from_project(project):
 
 def production_context_hash(production):
     context = {key: production.get(key) for key in
-        ("title", "language", "visual_style_preset", "visual_style_custom", "narrative_style", "narrative_style_custom", "narrative_notes",
+        ("title", "language", "brief", "visual_style_preset", "visual_style_custom", "narrative_style", "narrative_style_custom", "narrative_notes",
          "style_bible", "character_bible", "continuity_notes", "series_voice_style", "cards", "overview_asset_ids",
          "video_aspect_ratio", "video_resolution", "video_quality", "video_steps",
          "current_episode", "episodes")}
     # Prompt-renderer behavior is part of the prepared clip contract. Bump this
     # when a correction requires existing saved prompts to be regenerated;
     # source projects, cards, media and completed videos remain untouched.
-    context["production_prompt_renderer"] = "temporal-cast-continuity-v6"
+    context["production_prompt_renderer"] = "source-and-adjacent-continuity-v7"
     if production.get("prompt_version", "classic") != "classic":
         context["prompt_version"] = production["prompt_version"]
     if production.get("prompt_version") == "continuity_director":
@@ -1206,10 +1547,30 @@ def voice_character_aliases(production):
 
 
 _SPLIT_LAYOUT_CUE = re.compile(
-    r"\b(?:split[- ]screen|split[- ]panel|remote[- ]call panel)\b|"
-    r"分屏|分割画面|画面分割|スプリットスクリーン",
+    r"\b(?:split[- ]screen|split[- ]panel|remote[- ]call panel|split locations?|"
+    r"separate (?:rooms?|locations?|video panels?)|respective (?:rooms?|locations?)|"
+    r"each (?:in|inside) (?:his|her|their) own (?:room|location)|"
+    r"alternating matching (?:medium )?close[- ]?ups?)\b|"
+    r"分屏|分割画面|画面分割|分别位于不同|分別位於不同|各自的房间|各自的房間|"
+    r"交替匹配.{0,8}(?:近景|特写|特寫)|スプリットスクリーン|別々の(?:部屋|場所)|"
+    r"交互のマッチング(?:クローズアップ|ミディアムショット)",
     re.IGNORECASE,
 )
+_NEGATED_SPLIT_LAYOUT_CUE = re.compile(
+    r"\b(?:no|without|avoid(?:ing)?|never\s+use|not\s+(?:a|using))\s+(?:a\s+)?"
+    r"(?:split[- ]screen|split[- ]panel|remote[- ]call panel)\b|"
+    r"(?:不要|不使用|禁止|避免|无|無).{0,8}(?:分屏|分割画面|画面分割)|"
+    r"(?:スプリットスクリーン|分割画面)(?:なし|を使わない|禁止)",
+    re.IGNORECASE,
+)
+
+
+def _split_layout_requested(text):
+    """Return true only for an affirmative multi-panel composition request."""
+    without_negative_locks = _NEGATED_SPLIT_LAYOUT_CUE.sub("", str(text or ""))
+    return bool(_SPLIT_LAYOUT_CUE.search(without_negative_locks))
+
+
 _REMOTE_SEPARATION_CUE = re.compile(
     r"\b(?:only\s+(?:be\s+)?together\s+online|online[- ]only|long[- ]distance|"
     r"remain\s+physically\s+separate|separate\s+(?:physical\s+)?locations?|"
@@ -1314,10 +1675,11 @@ def _display_depiction(aliases, text, split_layout=False, declared_visible=False
         for alias in aliases:
             token = _alias_pattern(alias)
             patterns = (
-                rf"(?:face|image|portrait|photo|photograph|still|video)\s+(?:of\s+)?{token}",
+                rf"(?:face|image|portrait|photo|photograph|still|video)\s+(?:of\s+)?{token}"
+                rf"(?!['’]s\s+(?:[A-Za-z][A-Za-z-]*\s+){{0,4}}(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording)\b)",
                 rf"{token}(?:'s|’s)?\s+(?:face|image|portrait|photo|photograph|still|video)\b",
                 rf"{token}\s+(?:appears?|is\s+visible|smiles?|speaks?).{{0,60}}\b(?:on|inside|within|through)\s+(?:the\s+)?(?:phone\s+screen|screen|display|monitor|video)",
-                rf"\b(?:phone\s+screen|screen|display|monitor)\b[^.;]{{0,80}}\b(?:showing|shows?|displays?)\s+(?:(?:a|the|live)\s+)*(?:(?:view|image|video|face|still)\s+)*(?:of\s+)?{token}(?!['’]s\s+(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording))",
+                rf"\b(?:phone\s+screen|screen|display|monitor)\b[^.;]{{0,80}}\b(?:showing|shows?|displays?)\s+(?:(?:a|the|live)\s+)*(?:(?:view|image|video|face|still)\s+)*(?:of\s+)?{token}(?!['’]s\s+(?:[A-Za-z][A-Za-z-]*\s+){{0,4}}(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording)\b)",
                 rf"\b(?:looks?|looking|watches?|watching|sees?|seeing)\s+(?:at\s+)?{token}(?!['’]s\s+(?:phone|smartphone|laptop|room|apartment|desk|card|letter|photo|photograph|video|recording))\s+(?:on|inside|within|through)\s+(?:the\s+)?(?:phone\s+screen|screen|display|monitor|video)",
                 rf"\b(?:video|recording|message)\s+from\s+{token}",
             )
@@ -1389,7 +1751,7 @@ def character_presence_roles(production, segment):
                      ("title", "story", "setting", "action", "ending", "image_prompt"))
     staged_text = "\n".join(str(segment.get(key, "")) for key in
                             ("setting", "action", "ending", "image_prompt"))
-    split_layout = bool(_SPLIT_LAYOUT_CUE.search(staged_text))
+    split_layout = _split_layout_requested(staged_text)
     roles = {}
     aliases_by_card = character_aliases(production, text)
     separated_pairs = remote_separated_pairs(production, aliases_by_card)
@@ -1427,7 +1789,7 @@ def character_presence_roles(production, segment):
         if remote_from_local_owner:
             if display and not front_camera_view:
                 role = "display"
-            elif speaking or voiceover or voice_only or in_visible or selected:
+            elif speaking or voiceover or voice_only or in_visible or in_offscreen or selected:
                 role = "offscreen"
             else:
                 role = "absent"
@@ -1454,11 +1816,22 @@ def character_presence_roles(production, segment):
 
 
 _DEVICE_CUE = re.compile(
-    r"\b(?:phone|smartphone|mobile|monitor|texting|text message|video call|video message)\b|"
+    r"\b(?:phone|smartphone|mobile|laptop|notebook computer|computer|monitor|texting|text message|video call|video message)\b|"
     r"\b(?:sends?|sending|sent|opens?|opening|reads?|reading)\s+(?:a\s+|the\s+)?message\b|"
     r"(?<!off-)(?<!off )\b(?:screen|display)\b|"
     r"手机|手機|屏幕|螢幕|发信息|發信息|发消息|發消息|发信|發信|视频通话|視訊通話|"
     r"スマートフォン|携帯|画面|メッセージ|ビデオ通話",
+    re.IGNORECASE,
+)
+_HANDHELD_DEVICE_CUE = re.compile(
+    r"\b(?:phone|smartphone|mobile|cellphone|cell phone|tablet)\b|"
+    r"手机|手機|移动电话|移動電話|平板|スマートフォン|携帯|タブレット",
+    re.IGNORECASE,
+)
+_STATIC_DISPLAY_CUE = re.compile(
+    r"\b(?:laptop|notebook computer|desktop computer|computer monitor|monitor|desktop display)\b|"
+    r"笔记本电脑|筆記本電腦|电脑屏幕|電腦螢幕|显示器|顯示器|"
+    r"ノートパソコン|パソコン|コンピューターモニター|モニター",
     re.IGNORECASE,
 )
 _PHONE_TO_EAR_CUE = re.compile(
@@ -1509,20 +1882,29 @@ def device_screen_geometry_lock(segment, display_names=()):
     """
     text = "\n".join(str(segment.get(key, "")) for key in
                      ("story", "setting", "action", "ending", "image_prompt"))
+    contract = "DEVICE GEOMETRY CONTRACT V2. "
     requested = str(segment.get("device_view", "auto") or "auto").strip().casefold()
     if requested not in DEVICE_VIEW_MODES:
         requested = "auto"
     if requested == "auto" and not _DEVICE_CUE.search(text):
         return ""
     mode = requested
+    split_layout = _split_layout_requested(text)
+    static_only = bool(_STATIC_DISPLAY_CUE.search(text) and not _HANDHELD_DEVICE_CUE.search(text))
+    forced_remote_panel = bool(split_layout and len(tuple(display_names)) >= 2)
     corrected_phone_to_ear = bool(_PHONE_TO_EAR_CUE.search(text) and requested == "performance")
-    if corrected_phone_to_ear:
+    if forced_remote_panel:
+        # A planner may save ``performance`` while its own prose explicitly
+        # describes two remote rooms.  Geography is a hard physical fact and
+        # therefore outranks a generic view preference.
+        mode = "remote_panel"
+    elif corrected_phone_to_ear:
         # A phone pressed to the ear has only one physically valid display
         # orientation.  Planner-selected "performance" is descriptive, not a
         # licence to put video or chat pixels on the outward phone back.
         mode = "phone_to_ear"
     elif mode == "auto":
-        if _SPLIT_LAYOUT_CUE.search(text) and display_names:
+        if split_layout and display_names:
             mode = "remote_panel"
         elif _PHONE_TO_EAR_CUE.search(text):
             mode = "phone_to_ear"
@@ -1535,15 +1917,26 @@ def device_screen_geometry_lock(segment, display_names=()):
         else:
             mode = "performance"
     override = (
+        " PHYSICAL GEOGRAPHY OVERRIDE: the explicitly separate remote locations outrank the conflicting saved view label."
+        if forced_remote_panel and requested != "auto" else
         " PHYSICAL GEOMETRY OVERRIDE: the authored phone-to-ear action outranks the conflicting performance-view label."
         if corrected_phone_to_ear else
         (" DIRECTOR OVERRIDE: this manually selected view outranks conflicting automatic framing language."
          if requested != "auto" else ""))
     if mode == "remote_panel":
         return (
-            "REMOTE-CALL PANEL GEOMETRY LOCK: use one clean editorial split with exactly one bounded panel for each remote location and one instance of each participant. "
+            contract + "REMOTE-CALL PANEL GEOMETRY LOCK: use one clean editorial split with exactly one bounded panel for each remote location and one instance of each participant. "
             "Each panel has its own consistent background, light, camera axis and eyeline; the participants look toward the shared panel boundary but never occupy the same room, overlap panels or appear again inside a phone. "
             "Do not alternate compositions, add extra tiles, nest a screen inside a screen, mirror either participant or duplicate either identity." + override)
+    if static_only:
+        remote = (" The only identity permitted inside the static display is " +
+                  ", ".join(display_names) + "." if display_names else "")
+        return (
+            contract + "STATIC-DISPLAY GEOMETRY LOCK: use exactly one opaque laptop or monitor as a fixed physical prop with one bounded front display. "
+            "All interface, photograph, video and remote-person pixels remain clipped inside its bezel and share the display perspective. "
+            "Do not invent a phone, a hand-held foreground device, a foreground viewer, a second computer, a recursive screen or a full-size physical copy of anyone shown on the display. "
+            "If a local performer is also visible, choose one coherent camera side: either a screen-focused insert with only hands/shoulder/partial profile, or a performance view with the display oblique or background-readable; never show the same local identity as both a frontal foreground body and another frontal background body."
+            + remote + override)
     common = (
         "Use exactly one rigid opaque phone/device with one front screen and one back. "
         "Its four corners, bezel, reflections and displayed pixels share the same perspective and follow the hand as one object. "
@@ -1551,22 +1944,23 @@ def device_screen_geometry_lock(segment, display_names=()):
     )
     if mode == "phone_to_ear":
         return (
-            "PHONE-TO-EAR GEOMETRY LOCK: the speaker grille is held naturally at the ear; the screen faces inward/away from the audience and is not visible or readable. "
+            contract + "PHONE-TO-EAR GEOMETRY LOCK: the speaker grille is held naturally at the ear; the screen faces inward/away from the audience and is not visible or readable. "
             "Do not place a remote face, chat interface or glowing image on the outward phone back. " + common + override)
     if mode == "screen":
         remote = (" The only person permitted inside the display is " + ", ".join(display_names) + "."
                   if display_names else "")
         return (
-            "SCREEN-VIEW GEOMETRY LOCK: use a plausible over-the-shoulder, side-over-shoulder or insert composition from the holder's side of the screen axis. "
+            contract + "SCREEN-VIEW GEOMETRY LOCK: use a plausible over-the-shoulder, side-over-shoulder or insert composition from the holder's side of the screen axis. "
             "The audience may see the display face, while the holder is limited to naturally gripping hands, shoulder, back of head or a partial three-quarter profile; do not also show the holder's unobstructed frontal face. "
+            "Those partial foreground body parts and any frontal background performer must never be two copies of the same identity: choose one representation of the holder, never both. "
             "Keep the phone at a natural viewing distance and orientation, portrait unless the authored action explicitly requires landscape. "
             "The holder's eyes aim at the physical screen and any tap lands on that same screen plane." + remote + " " + common + override)
     if mode == "front_camera":
         return (
-            "FRONT-CAMERA GEOMETRY LOCK: use the phone camera's point of view; the performer looks into the lens beside the screen. "
+            contract + "FRONT-CAMERA GEOMETRY LOCK: use the phone camera's point of view; the performer looks into the lens beside the screen. "
             "The phone body and its screen are outside this camera view, so do not superimpose an interface, a second view of the performer or a floating phone. " + common + override)
     return (
-        "PERFORMANCE-VIEW GEOMETRY LOCK: prioritize the holder's face, eyeline and hand performance. "
+        contract + "PERFORMANCE-VIEW GEOMETRY LOCK: prioritize the holder's face, eyeline and hand performance. "
         "The screen faces the holder and away from the audience, so show only the opaque phone back or thin edge; its content is not visible or readable to the audience. "
         "Do not rotate the display toward the audience while the holder remains front-facing. " + common + override)
 
@@ -1637,7 +2031,7 @@ def effective_temporal_cast_lock(production, segment, roles=None):
         "Visible only as a non-diegetic thought/memory image: " + (", ".join(imagined) or "none") + ".",
         "A display or memory identity is not a physical person in the local setting.",
     ]
-    if (_DEVICE_CUE.search(text) or
+    if (display or _split_layout_requested(text) or _DEVICE_CUE.search(text) or
             str(segment.get("device_view", "auto") or "auto").strip().casefold() != "auto"):
         extra.append(
             "DEVICE INTERACTION LOCK: use exactly one local phone/device prop. Its screen content stays geometrically inside the bezel and never becomes a second real room or a second full-size body. For typing or sending, show a readable hand-to-device action and one deliberate tap with a simple non-verbal sent-state cue; do not invent extra chat messages, subtitles, captions, floating UI, extra hands or a second phone. Exact on-screen typography should be added in post rather than hallucinated by the video model.")
@@ -1670,9 +2064,78 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
         props = relevant_cards.get("props", [])
     guard = effective_temporal_cast_lock(production, segment, roles)
     prop_guard = inscribed_prop_continuity_lock(props)
+    state = normalise_continuity_state(segment.get("continuity_state"), segment)
+    positions_start = "; ".join(
+        f"{row['character']}={row['position']} facing {row['facing'] or 'unchanged'}, moving {row.get('movement_direction') or 'unchanged'}, eyeline {row.get('eyeline_direction') or 'unchanged'} toward {row.get('eyeline_target') or 'authored target'}"
+        for row in state["positions_start"]) or "not additionally specified"
+    positions_end = "; ".join(
+        f"{row['character']}={row['position']} facing {row['facing'] or 'unchanged'}, moving {row.get('movement_direction') or 'unchanged'}, eyeline {row.get('eyeline_direction') or 'unchanged'} toward {row.get('eyeline_target') or 'authored target'}"
+        for row in state["positions_end"]) or "not additionally specified"
+    holders_start = "; ".join(f"{row['prop']} held by {row['holder']}"
+                              + (f" ({row['state']})" if row.get("state") else "")
+                              for row in state["prop_holders_start"]) or "not additionally specified"
+    holders_end = "; ".join(f"{row['prop']} held by {row['holder']}"
+                            + (f" ({row['state']})" if row.get("state") else "")
+                            for row in state["prop_holders_end"]) or "not additionally specified"
+    manifest = production.get("source_manifest") or production_source_manifest(production)
+    refs = segment.get("source_refs", {})
+    source_rows = {row["id"]: row for kind in ("scenes", "paragraphs", "dialogue", "events")
+                   for row in _flatten_manifest(manifest, kind)}
+    source_parts = []
+    for label, key in (("Original scene", "scene_ids"), ("Original paragraph", "paragraph_ids"),
+                       ("Original dialogue", "dialogue_ids"), ("Plot event", "event_ids")):
+        values = []
+        for ident in refs.get(key, []):
+            row = source_rows.get(ident, {})
+            value = row.get("title") or ((row.get("speaker", "") + ": " if row.get("speaker") else "") +
+                                          str(row.get("text", "")))
+            if value:
+                values.append(f"{ident}={value}")
+        if values:
+            source_parts.append(label + ": " + " | ".join(values))
+    source_guard = (
+        "SOURCE COVERAGE LOCK: this clip is responsible only for the following authored material, in this order. " +
+        "\n".join(source_parts))[:7000]
+    continuity_guard = (
+        "ADJACENT CLIP STATE LOCK: opening=" + (state["opening_state"] or "use the authored opening") +
+        "; ending=" + (state["ending_state"] or "use the authored ending") +
+        ". Opening positions: " + positions_start + ". Ending positions: " + positions_end +
+        ". Opening prop holders: " + holders_start + ". Ending prop holders: " + holders_end +
+        f". Cut relation={segment.get('transition_mode', 'hard_cut')}; MMH3 continuation allowed=" +
+        ("yes" if segment.get("mmh3_allowed") else "no") +
+        ". Do not repeat the preceding action, swap a prop holder, reverse established screen direction, "
+        "or import an off-screen/display/memory identity into the physical set.")
+    shot_contract = normalise_shot_contract(segment.get("shot_contract"), segment)
+    previous = next((row for row in production.get("segments", [])
+                     if row.get("index") == segment.get("index", 0) - 1), None)
+    previous_snapshot = "none; this is the opening clip"
+    if previous:
+        prior_state = normalise_continuity_state(previous.get("continuity_state"), previous)
+        prior_shot = normalise_shot_contract(previous.get("shot_contract"), previous)
+        previous_snapshot = (
+            f"ending state={prior_state['ending_state']}; ending composition={prior_shot['ending_composition']}; "
+            f"shot size={prior_shot['shot_size']}; camera axis={prior_shot['camera_axis'] or 'unspecified'}; "
+            "positions=" + ("; ".join(
+                f"{row['character']} {row['position']} facing {row['facing']}, moving {row.get('movement_direction')}, eyeline {row.get('eyeline_direction')} toward {row.get('eyeline_target')}"
+                for row in prior_state["positions_end"]) or "unspecified") + "; props=" +
+            ("; ".join(f"{row['prop']} held by {row['holder']}"
+                       + (f" ({row['state']})" if row.get("state") else "")
+                       for row in prior_state["prop_holders_end"])
+             or "unspecified"))
+    edit_guard = (
+        f"SHOT EDIT CONTRACT: role={shot_contract['role']}; shot size={shot_contract['shot_size']}; "
+        f"opening composition={shot_contract['opening_composition']}; ending composition={shot_contract['ending_composition']}; "
+        f"axis={shot_contract['camera_axis'] or 'unspecified'}; allow axis crossing={shot_contract['allow_axis_cross']}; "
+        f"edit reason={shot_contract['edit_reason']}; relation to previous={shot_contract['relation_previous']}. "
+        f"PREVIOUS END SNAPSHOT: {previous_snapshot}. Preserve: {shot_contract['preserve_from_previous'] or 'only authored continuity'}. "
+        f"Must change: {shot_contract['must_change'] or 'only what the authored beat changes'}. "
+        "Keep reciprocal dialogue eyelines, screen direction and action phase. Avoid an accidental jump cut or replaying the preceding action.")
     return "\n\n".join(part for part in [
         "FINAL PRODUCTION RENDER OVERRIDE — this block supersedes any conflicting earlier staging, cast, screen, reflection, prop or audio prose. Do not reinterpret it as story content.",
         guard,
+        source_guard,
+        continuity_guard,
+        edit_guard,
         prop_guard,
     ] if part)
 
@@ -1737,6 +2200,21 @@ def segment_identity_repair_reasons(production, segment):
 
     render_text = "\n".join(str(segment.get(key, "")) for key in
                               ("story", "setting", "action", "ending", "image_prompt"))
+    display_names = [card.get("name", "") for card_id, card in characters.items()
+                     if roles.get(card_id) == "display"]
+    current_device_lock = device_screen_geometry_lock(segment, display_names)
+    saved_prompt = str(segment.get("video_prompt", "") or "")
+    device_upgrade_needed = bool(
+        ("STATIC-DISPLAY GEOMETRY LOCK" in current_device_lock and
+         "STATIC-DISPLAY GEOMETRY LOCK" not in saved_prompt) or
+        ("REMOTE-CALL PANEL GEOMETRY LOCK" in current_device_lock and
+         "REMOTE-CALL PANEL GEOMETRY LOCK" not in saved_prompt) or
+        ("SCREEN-VIEW GEOMETRY LOCK" in current_device_lock and
+         "DEVICE GEOMETRY CONTRACT V2" not in saved_prompt))
+    if saved_prompt and device_upgrade_needed:
+        reasons.append(
+            "本段使用手机、电脑屏幕或远程画面，但保存的提示词仍是旧版设备构图规则；"
+            "只需重新生成本段提示词和视频，不需要重新分镜")
     if (segment.get("project_id") and
             segment.get("reference_strategy_version", 0) < REFERENCE_STRATEGY_VERSION and
             (_DEVICE_CUE.search(render_text) or _MIRROR_CUE.search(render_text) or
@@ -2278,6 +2756,39 @@ def _split_near_middle(value):
     return (left, right) if left and right else None
 
 
+def _compact_fallback_field(value, limit):
+    """Keep a fallback field valid without pretending to replace its source.
+
+    The immutable source manifest retains every paragraph/event and exact
+    dialogue line. These prose fields are only render-facing summaries; a long
+    timed block must not crash the emergency planner merely because its action
+    notes exceed the local segment schema.
+    """
+    value = str(value or "").strip()
+    if len(value) <= limit:
+        return value
+    marker = "\n…\n"
+    available = max(2, limit - len(marker))
+    head_size = int(available * .7)
+    tail_size = available - head_size
+
+    def boundary(text, preferred, reverse=False):
+        window = text[max(0, preferred - 160):min(len(text), preferred + 160)]
+        matches = list(re.finditer(r"[。！？!?；;\n]", window))
+        if not matches:
+            return preferred
+        positions = [max(0, preferred - 160) + match.end() for match in matches]
+        return (min(positions, key=lambda item: abs(item - preferred)) if not reverse
+                else max(positions, key=lambda item: (item <= preferred, -abs(item - preferred))))
+
+    head_end = boundary(value, head_size)
+    tail_start = max(head_end, len(value) - tail_size)
+    # The exact field ceiling is more important than a pretty boundary. Trim a
+    # few excess characters after seeking sentence punctuation.
+    result = value[:head_end].rstrip() + marker + value[tail_start:].lstrip()
+    return result[:limit]
+
+
 def fallback_segments(story, target_seconds=None, language="zh-CN"):
     """Safe offline split when the selected local model is unavailable."""
     timed_groups = timed_clip_groups(story)
@@ -2291,13 +2802,18 @@ def fallback_segments(story, target_seconds=None, language="zh-CN"):
             dialogue = [{"speaker": line["speaker"], "text": line["text"],
                           "language": language_name, "voiceover": False}
                         for line in script_dialogue(group["text"])]
+            compact = _compact_fallback_field(group["text"], 3000)
             result.append({
-                "title": f"片段 {index + 1}", "story": group["text"], "setting": "",
-                "action": group["text"], "ending": "动作完成并保持可衔接的画面状态",
+                "title": f"片段 {index + 1}", "story": compact, "setting": "",
+                "action": compact, "ending": "动作完成并保持可衔接的画面状态",
                 "duration": max(PLANNED_MIN_SECONDS, min(MAX_SECONDS, group["duration"])),
                 "duration_reason": f"依据原剧本 {group['start']}–{group['end']} 秒自然节拍",
-                "dialogue": dialogue, "image_prompt": group["text"],
-                "cast_timeline": {key: [] for key in CAST_TIMELINE_KEYS},
+                "dialogue": dialogue, "image_prompt": compact,
+                # This is an emergency heuristic, not an authored declaration
+                # that the physical cast is empty.  Leave the timeline absent
+                # so apply_plan can seed it from exact visible card mentions
+                # and canonical dialogue speakers.  An explicit empty timeline
+                # remains reserved for intentional display/off-screen shots.
                 "transition_mode": "hard_cut",
                 "device_view": "auto",
                 "card_selection": {kind: [] for kind in SELECTABLE_CARD_KINDS}})
@@ -2344,26 +2860,48 @@ def fallback_segments(story, target_seconds=None, language="zh-CN"):
     result = []
     for index, value in enumerate(groups[:MAX_SEGMENTS]):
         duration = estimate_seconds(value)
+        compact = _compact_fallback_field(value, 3000)
         result.append({
-            "title": f"片段 {index + 1}", "story": value, "setting": "",
-            "action": value, "ending": "动作完成并保持可衔接的画面状态",
+            "title": f"片段 {index + 1}", "story": compact, "setting": "",
+            "action": compact, "ending": "动作完成并保持可衔接的画面状态",
             "duration": duration,
             "duration_reason": f"本地估算：对白、动作与停顿合计约 {duration} 秒",
-            "dialogue": [], "image_prompt": value,
-            "cast_timeline": {key: [] for key in CAST_TIMELINE_KEYS},
+            "dialogue": [], "image_prompt": compact,
             "transition_mode": "hard_cut",
             "device_view": "auto",
             "card_selection": {kind: [] for kind in SELECTABLE_CARD_KINDS}})
     return fit_planned_durations(result, target_seconds, language) if target_seconds is not None else result
 
 
-def segment_hash(segment):
+def _segment_hash_context(segment, *, keep_empty_prop_state=False):
     keys = ("title", "story", "setting", "action", "ending", "duration", "dialogue", "card_selection",
-            "cast_timeline", "transition_mode", "device_view", "prompt_direction", "keyframe_asset_ids", "workflow_profile_id")
-    context = {key: segment.get(key) for key in keys}
+            "cast_timeline", "transition_mode", "device_view", "source_refs", "continuity_state", "shot_contract",
+            "prompt_direction", "quality_repair_direction", "keyframe_asset_ids", "workflow_profile_id")
+    context = copy.deepcopy({key: segment.get(key) for key in keys})
+    # ``state`` was added to prop-holder rows after existing H3 projects had
+    # already recorded their source hash. Normalisation necessarily supplies an
+    # empty value for those old rows, but an empty migration field is not an
+    # authored storyboard change and must not make every saved clip stale.
+    if not keep_empty_prop_state:
+        continuity = context.get("continuity_state")
+        if isinstance(continuity, dict):
+            for key in ("prop_holders_start", "prop_holders_end"):
+                for row in continuity.get(key, []) if isinstance(continuity.get(key), list) else []:
+                    if isinstance(row, dict) and not str(row.get("state") or "").strip():
+                        row.pop("state", None)
     if segment.get("continue_previous") is False:
         context["continue_previous"] = False
+    return context
+
+
+def segment_hash(segment):
+    context = _segment_hash_context(segment)
     return _hash(context)
+
+
+def _segment_hash_with_empty_prop_state(segment):
+    """Compatibility hash written briefly by the prop-state schema upgrade."""
+    return _hash(_segment_hash_context(segment, keep_empty_prop_state=True))
 
 
 def _safe_ids(values, label, maximum):
@@ -2383,6 +2921,50 @@ def _seconds(value):
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
         raise ValueError("Recorded operation time must be a non-negative finite number.")
     return round(float(value), 3)
+
+
+def normalise_automation(value):
+    """Validate the durable episode-run cursor without trusting browser state."""
+    if not isinstance(value, dict):
+        value = {}
+    status = _text(value.get("status"), "automation status", 32, "idle") or "idle"
+    stage = _text(value.get("stage"), "automation stage", 32, "idle") or "idle"
+    if status not in AUTOMATION_STATUSES:
+        status = "idle"
+    if stage not in AUTOMATION_STAGES:
+        stage = "idle"
+    result = {
+        "status": status,
+        "stage": stage,
+        "stage_detail": _text(value.get("stage_detail"), "automation detail", 300),
+        "merge": value.get("merge", True),
+        "requested_by": _text(value.get("requested_by"), "automation requester", 32, "user") or "user",
+        "current_segment_id": value.get("current_segment_id") or None,
+        "current_index": value.get("current_index", 0),
+        "completed": value.get("completed", 0),
+        "total": value.get("total", 0),
+        "attempt": value.get("attempt", 0),
+        "run_id": value.get("run_id") or None,
+        "request_id": value.get("request_id") or None,
+        "last_error": _text(value.get("last_error"), "automation error", 2000),
+        "started_at": value.get("started_at"),
+        "updated_at": value.get("updated_at"),
+        "finished_at": value.get("finished_at"),
+    }
+    if type(result["merge"]) is not bool:
+        raise ValueError("Automation merge must be true or false.")
+    for key in ("current_index", "completed", "total", "attempt"):
+        if type(result[key]) is not int or result[key] < 0 or result[key] > 10000:
+            raise ValueError(f"Automation {key} must be a non-negative integer.")
+    for key in ("current_segment_id", "run_id", "request_id"):
+        if result[key]:
+            safe_id(result[key])
+    for key in ("started_at", "updated_at", "finished_at"):
+        raw = result[key]
+        if raw is not None and (type(raw) not in (int, float) or not math.isfinite(raw) or raw < 0):
+            raise ValueError(f"Automation {key} must be a non-negative timestamp.")
+        result[key] = round(float(raw), 3) if raw is not None else None
+    return result
 
 
 def normalise_segment(value, index, previous=None):
@@ -2409,6 +2991,11 @@ def normalise_segment(value, index, previous=None):
             "continue_previous", prior.get("continue_previous", True)) else "hard_cut"
     if transition_mode not in TRANSITION_MODES:
         transition_mode = "hard_cut"
+    shot_contract = normalise_shot_contract(
+        value.get("shot_contract", prior.get("shot_contract")), value)
+    transition_mode = reconcile_transition_contract(
+        transition_mode, shot_contract.get("relation_previous"), index)
+    shot_contract["relation_previous"] = transition_mode
     device_view = _text(value.get("device_view", prior.get("device_view")),
                         "device shot mode", 32, "auto") or "auto"
     if device_view not in DEVICE_VIEW_MODES:
@@ -2434,6 +3021,11 @@ def normalise_segment(value, index, previous=None):
         "image_prompt": _text(value.get("image_prompt"), "image prompt", 3000),
         "prompt_direction": _text(value.get("prompt_direction", prior.get("prompt_direction")),
                                   "video prompt revision", 6000),
+        "quality_repair_direction": _text(
+            value.get("quality_repair_direction", prior.get("quality_repair_direction")),
+            "post-render repair direction", 2000),
+        "quality_repair_count": value.get(
+            "quality_repair_count", prior.get("quality_repair_count", 0)),
         "video_prompt": _text(value.get("video_prompt", prior.get("video_prompt")),
                               "compiled video prompt", 250000),
         "video_prompt_source": _text(value.get("video_prompt_source", prior.get("video_prompt_source")),
@@ -2448,6 +3040,16 @@ def normalise_segment(value, index, previous=None):
             value.get("cast_timeline", prior.get("cast_timeline")),
             (value.get("card_selection") or {}).get("characters", [])),
         "cast_timeline_version": timeline_version,
+        "source_refs": normalise_source_refs(value.get("source_refs", prior.get("source_refs"))),
+        "source_contract_version": value.get("source_contract_version",
+                                             prior.get("source_contract_version", 0)),
+        "continuity_state": normalise_continuity_state(
+            value.get("continuity_state", prior.get("continuity_state")), value),
+        "shot_contract": shot_contract,
+        "coverage_issues": list(value.get("coverage_issues", prior.get("coverage_issues", [])) or []),
+        "continuity_issues": list(value.get("continuity_issues", prior.get("continuity_issues", [])) or []),
+        "preflight_issues": list(value.get("preflight_issues", prior.get("preflight_issues", [])) or []),
+        "mmh3_allowed": bool(value.get("mmh3_allowed", prior.get("mmh3_allowed", False))),
         "continuity_warnings": list(value.get("continuity_warnings", prior.get("continuity_warnings", [])) or []),
         "card_selection_source": _text(value.get("card_selection_source"), "card selection source", 30,
                                        prior.get("card_selection_source", "heuristic")) or "heuristic",
@@ -2458,20 +3060,30 @@ def normalise_segment(value, index, previous=None):
         "reference_strategy_version": prior.get("reference_strategy_version", 0),
         "image_asset_id": keyframe_asset_ids[-1] if keyframe_asset_ids else None,
         "keyframe_asset_ids": keyframe_asset_ids,
+        "ending_continuity_asset_id": prior.get("ending_continuity_asset_id"),
         "stale_reasons": list(prior.get("stale_reasons", [])),
         "selected_video_run_id": prior.get("selected_video_run_id"),
         "last_video_run_id": prior.get("last_video_run_id"),
     }
     if result["selected_video_run_id"]:
         safe_id(result["selected_video_run_id"])
+    if (type(result["quality_repair_count"]) is not int or
+            not 0 <= result["quality_repair_count"] <= 100):
+        raise ValueError("Post-render repair count must be a non-negative integer.")
     if type(result["continue_previous"]) is not bool:
         raise ValueError("Clip continuation choice must be true or false.")
     if (not isinstance(result["continuity_warnings"], list) or
             not all(isinstance(item, str) for item in result["continuity_warnings"])):
         raise ValueError("Clip continuity warnings must be text entries.")
     result["continuity_warnings"] = [item[:360] for item in result["continuity_warnings"][:16]]
+    for key in ("coverage_issues", "continuity_issues", "preflight_issues"):
+        if not isinstance(result[key], list):
+            result[key] = []
+        result[key] = [item for item in result[key][:32] if isinstance(item, dict)]
     if result["last_video_run_id"]:
         safe_id(result["last_video_run_id"])
+    if result["ending_continuity_asset_id"]:
+        safe_id(result["ending_continuity_asset_id"])
     if result["workflow_profile_id"] != "builtin":
         safe_id(result["workflow_profile_id"])
     if result["prompt_updated_at"] is not None and (
@@ -2484,6 +3096,8 @@ def normalise_segment(value, index, previous=None):
         result["card_selection_source"] = "heuristic"
     if type(result["reference_strategy_version"]) is not int or result["reference_strategy_version"] < 0:
         result["reference_strategy_version"] = 0
+    if type(result["source_contract_version"]) is not int or result["source_contract_version"] < 0:
+        result["source_contract_version"] = 0
     dialogue = value.get("dialogue", [])
     if not isinstance(dialogue, list) or len(dialogue) > 16:
         raise ValueError("A clip can contain at most sixteen dialogue events.")
@@ -2504,6 +3118,561 @@ def normalise_segment(value, index, previous=None):
         result["status"] = "stale"
         result["stale_reasons"] = ["分镜内容或时长在 H3 工程创建后发生了变化"]
     return result
+
+
+def _contract_issue(severity, code, message):
+    return {"severity": severity, "code": code, "message": str(message)[:600]}
+
+
+def _flatten_manifest(manifest, kind):
+    return [row for chunk in manifest.get("chunks", []) for row in chunk.get(kind, [])]
+
+
+def _distribute_source_refs(manifest, segments):
+    """Backfill legacy/fallback clips in source order without inventing coverage."""
+    if not segments:
+        return
+    for segment in segments:
+        segment["source_refs"] = {key: [] for key in SOURCE_REF_KEYS}
+    paragraphs = _flatten_manifest(manifest, "paragraphs")
+    count = len(segments)
+    paragraph_owner = {}
+    for index, row in enumerate(paragraphs):
+        owner = min(count - 1, int(index * count / max(1, len(paragraphs))))
+        paragraph_owner[row["id"]] = owner
+        segments[owner]["source_refs"]["paragraph_ids"].append(row["id"])
+        scene_id = row["scene_id"]
+        if scene_id not in segments[owner]["source_refs"]["scene_ids"]:
+            segments[owner]["source_refs"]["scene_ids"].append(scene_id)
+    for kind, key in (("dialogue", "dialogue_ids"), ("events", "event_ids")):
+        rows = _flatten_manifest(manifest, kind)
+        for index, row in enumerate(rows):
+            owner = paragraph_owner.get(
+                row.get("paragraph_id"), min(count - 1, int(index * count / max(1, len(rows)))))
+            segments[owner]["source_refs"][key].append(row["id"])
+
+
+def bind_planned_source_contract(production, planned, planner):
+    """Validate model bindings; only deterministic fallback/legacy plans are auto-bound."""
+    manifest = production_source_manifest(production)
+    expected = {"scene_ids": [row["id"] for row in _flatten_manifest(manifest, "scenes")],
+                "paragraph_ids": [row["id"] for row in _flatten_manifest(manifest, "paragraphs")],
+                "dialogue_ids": [row["id"] for row in _flatten_manifest(manifest, "dialogue")],
+                "event_ids": [row["id"] for row in _flatten_manifest(manifest, "events")]}
+    # Direct API callers and productions created before this contract have no
+    # source_refs field at all. Treat that as a legacy plan and bind it
+    # deterministically. New planner responses are schema-required to include
+    # the field, so an incomplete new response is still rejected below.
+    if planner != "local_ai" or not any("source_refs" in item for item in planned):
+        _distribute_source_refs(manifest, planned)
+        return manifest
+    for item in planned:
+        item["source_refs"] = normalise_source_refs(item.get("source_refs"))
+    issues = []
+    for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
+        actual = [value for item in planned for value in item["source_refs"][key]]
+        missing = [value for value in expected[key] if value not in actual]
+        duplicates = list(dict.fromkeys(value for value in actual if actual.count(value) > 1))
+        unknown = [value for value in actual if value not in expected[key]]
+        if missing:
+            issues.append(f"missing {key}: {', '.join(missing[:12])}")
+        if duplicates:
+            issues.append(f"duplicated {key}: {', '.join(duplicates[:12])}")
+        if unknown:
+            issues.append(f"unknown {key}: {', '.join(unknown[:12])}")
+        if not missing and not duplicates and not unknown and actual != expected[key]:
+            issues.append(f"reordered {key}")
+    known_scenes = set(expected["scene_ids"])
+    for item in planned:
+        unknown = [value for value in item["source_refs"]["scene_ids"] if value not in known_scenes]
+        if unknown:
+            issues.append("unknown scene_ids: " + ", ".join(unknown[:12]))
+        if not item["source_refs"]["scene_ids"] or not item["source_refs"]["paragraph_ids"]:
+            issues.append("every clip must bind at least one original scene and paragraph")
+        if not item["source_refs"]["dialogue_ids"] and not item["source_refs"]["event_ids"]:
+            issues.append("every clip must own at least one authored dialogue line or plot event")
+    if issues:
+        raise ValueError(
+            "The storyboard did not preserve the complete source coverage contract: " + "; ".join(issues))
+    return manifest
+
+
+def validate_planned_chunk_source_contract(story, chunk_index, planned):
+    """Reject a locally generated part before it can contaminate later parts.
+
+    A response can be valid, schema-conforming JSON and still omit the tail of
+    the source manifest when a local model runs short of output tokens. Waiting
+    until all parts are joined makes the resulting error hard to repair. This
+    check gives the caller one bounded retry for the affected part only.
+    """
+    if not isinstance(planned, list) or not planned:
+        raise ValueError(f"Storyboard part {chunk_index} returned no clips.")
+    manifest = source_manifest_for_text(story, chunk_index)
+    expected = {
+        "paragraph_ids": [row["id"] for row in manifest.get("paragraphs", [])],
+        "dialogue_ids": [row["id"] for row in manifest.get("dialogue", [])],
+        "event_ids": [row["id"] for row in manifest.get("events", [])],
+    }
+    issues = []
+    cleaned = []
+    for index, segment in enumerate(planned):
+        if not isinstance(segment, dict):
+            raise ValueError(f"Storyboard part {chunk_index} contains an invalid clip.")
+        # Run the same field-length/type validation used by the final save now,
+        # while this single local-model part can still be retried. In
+        # particular, verbose models sometimes copy the whole screenplay into
+        # ``story`` despite the schema's 3,000-character ceiling.
+        try:
+            segment = normalise_segment(segment, index)
+        except ValueError as exc:
+            raise ValueError(f"Storyboard part {chunk_index} has an invalid clip: {exc}") from exc
+        cleaned.append(segment)
+    planned[:] = cleaned
+    for key, expected_ids in expected.items():
+        actual = [ident for segment in planned for ident in segment["source_refs"][key]]
+        missing = [ident for ident in expected_ids if ident not in actual]
+        duplicates = list(dict.fromkeys(ident for ident in actual if actual.count(ident) > 1))
+        unknown = [ident for ident in actual if ident not in expected_ids]
+        if missing:
+            issues.append(f"missing {key}: {', '.join(missing[:20])}")
+        if duplicates:
+            issues.append(f"duplicated {key}: {', '.join(duplicates[:20])}")
+        if unknown:
+            issues.append(f"unknown {key}: {', '.join(unknown[:20])}")
+        if not missing and not duplicates and not unknown and actual != expected_ids:
+            issues.append(f"reordered {key}")
+    for segment in planned:
+        refs = segment["source_refs"]
+        if not refs["scene_ids"] or not refs["paragraph_ids"]:
+            issues.append("a clip is not bound to an original scene and paragraph")
+        if not refs["dialogue_ids"] and not refs["event_ids"]:
+            issues.append("a clip owns neither authored dialogue nor a plot event")
+    if issues:
+        raise ValueError(f"Storyboard part {chunk_index} did not preserve source coverage: " +
+                         "; ".join(dict.fromkeys(issues)))
+    return planned
+
+
+def audit_storyboard_contract(production, *, backfill_legacy=True):
+    """Derive coverage and adjacent-continuity reports for every saved clip."""
+    manifest = production_source_manifest(production)
+    segments = production.get("segments", [])
+    if backfill_legacy and segments and not any(
+            any(segment.get("source_refs", {}).get(key, []) for key in SOURCE_REF_KEYS)
+            for segment in segments):
+        _distribute_source_refs(manifest, segments)
+    expected_rows = {kind: _flatten_manifest(manifest, kind)
+                     for kind in ("scenes", "paragraphs", "dialogue", "events")}
+    expected_ids = {"scene_ids": [row["id"] for row in expected_rows["scenes"]],
+                    "paragraph_ids": [row["id"] for row in expected_rows["paragraphs"]],
+                    "dialogue_ids": [row["id"] for row in expected_rows["dialogue"]],
+                    "event_ids": [row["id"] for row in expected_rows["events"]]}
+    coverage_issues = []
+    for segment in segments:
+        segment["coverage_issues"] = []
+    strict_contract_active = any(
+        segment.get("source_contract_version", 0) >= STORY_CONTRACT_VERSION for segment in segments)
+    if strict_contract_active:
+        for segment in segments:
+            refs = segment.get("source_refs", {})
+            local = []
+            if not refs.get("scene_ids") or not refs.get("paragraph_ids"):
+                local.append(_contract_issue(
+                    "error", "unbound_clip",
+                    f"Clip {segment.get('index')} is not bound to an original scene and paragraph."))
+            if not refs.get("dialogue_ids") and not refs.get("event_ids"):
+                local.append(_contract_issue(
+                    "error", "unowned_story_beat",
+                    f"Clip {segment.get('index')} owns no original dialogue line or plot event."))
+            segment["coverage_issues"].extend(local)
+            coverage_issues.extend(local)
+    for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
+        actual = [value for segment in segments for value in segment.get("source_refs", {}).get(key, [])]
+        missing = [value for value in expected_ids[key] if value not in actual]
+        duplicates = list(dict.fromkeys(value for value in actual if actual.count(value) > 1))
+        unknown = [value for value in actual if value not in expected_ids[key]]
+        if missing:
+            coverage_issues.append(_contract_issue("error", "missing_source",
+                                                   f"Missing {key}: {', '.join(missing[:16])}"))
+        if duplicates:
+            coverage_issues.append(_contract_issue("error", "duplicate_source",
+                                                   f"Duplicated {key}: {', '.join(duplicates[:16])}"))
+        if unknown:
+            coverage_issues.append(_contract_issue("error", "unknown_source",
+                                                   f"Unknown {key}: {', '.join(unknown[:16])}"))
+        if not missing and not duplicates and not unknown and actual != expected_ids[key]:
+            coverage_issues.append(_contract_issue("error", "source_order",
+                                                   f"{key} no longer follows the source order."))
+    actual_dialogue = [line for segment in segments for line in segment.get("dialogue", [])]
+    expected_dialogue = expected_rows["dialogue"]
+    alias_owner = {
+        alias: card["name"].strip().casefold()
+        for card in production.get("cards", {}).get("characters", [])
+        for alias in character_aliases(production).get(card.get("id"), set())
+    }
+    alias_owner.update({alias: card["name"].strip().casefold()
+                        for alias, card in voice_character_aliases(production).items()})
+
+    def audited_speaker(value):
+        value = re.split(r"[|｜]", str(value or ""), maxsplit=1)[0].strip().casefold()
+        return alias_owner.get(value, value)
+    strict_dialogue_contract = bool(segments) and strict_contract_active
+    if strict_dialogue_contract and len(actual_dialogue) != len(expected_dialogue):
+        coverage_issues.append(_contract_issue(
+            "error", "dialogue_count",
+            f"Source has {len(expected_dialogue)} dialogue lines but the storyboard has {len(actual_dialogue)}."))
+    for index, (source, actual) in enumerate(
+            zip(expected_dialogue, actual_dialogue) if strict_dialogue_contract else [], 1):
+        source_speaker = audited_speaker(source.get("speaker", ""))
+        actual_speaker = audited_speaker(actual.get("speaker", ""))
+        if source_speaker != actual_speaker:
+            coverage_issues.append(_contract_issue(
+                "error", "wrong_speaker", f"Dialogue line {index} changed speaker from {source['speaker']} to {actual.get('speaker') or 'unknown'}."))
+        if (_dialogue_already_matches_language(source.get("text", ""), production.get("language", "zh-CN")) and
+                source.get("text", "") != actual.get("text", "")):
+            coverage_issues.append(_contract_issue(
+                "error", "changed_dialogue", f"Dialogue line {index} no longer matches the authored wording."))
+        if editorial_speaker_label(actual.get("speaker")):
+            coverage_issues.append(_contract_issue(
+                "error", "heading_as_dialogue", f"A section heading was treated as dialogue in line {index}."))
+    # Attach global issues to the most relevant clip while keeping a compact
+    # production summary for the episode-level admission gate.
+    for issue in coverage_issues:
+        if segments and issue not in segments[0]["coverage_issues"]:
+            segments[0]["coverage_issues"].append(issue)
+    production["source_manifest"] = manifest
+    production["coverage_report"] = {
+        "status": "error" if any(row["severity"] == "error" for row in coverage_issues) else "ok",
+        "issues": coverage_issues,
+        "counts": {"scenes": len(expected_rows["scenes"]),
+                   "paragraphs": len(expected_rows["paragraphs"]),
+                   "dialogue": len(expected_dialogue), "events": len(expected_rows["events"])},
+    }
+
+    continuity_issues = []
+    previous = None
+    transfer_cue = re.compile(r"\b(?:give|gave|hand|pass|take|receive|transfer|place|put)\b|"
+                              r"递|交给|接过|拿走|放下|传给|渡す|受け取|置く", re.IGNORECASE)
+    for segment in segments:
+        issues = []
+        roles = character_presence_roles(production, segment)
+        timeline = effective_cast_timeline(production, segment, roles)
+        state = normalise_continuity_state(segment.get("continuity_state"), segment)
+        shot_contract = normalise_shot_contract(segment.get("shot_contract"), segment)
+        segment["continuity_state"] = state
+        segment["shot_contract"] = shot_contract
+        if shot_contract["relation_previous"] != segment.get("transition_mode"):
+            issues.append(_contract_issue(
+                "error", "cut_relation_conflict",
+                "shot_contract.relation_previous disagrees with transition_mode."))
+        if previous is not None and segment.get("transition_mode") == "continuous":
+            prior_timeline = effective_cast_timeline(production, previous)
+            prior_end = {name.casefold(): name for name in prior_timeline["visible_end"]}
+            current_start = {name.casefold(): name for name in timeline["visible_start"]}
+            added = [current_start[key] for key in current_start.keys() - prior_end.keys()]
+            missing = [prior_end[key] for key in prior_end.keys() - current_start.keys()]
+            if added:
+                issues.append(_contract_issue("error", "sudden_character_addition",
+                                              "Continuous clip adds characters at its opening: " + ", ".join(added)))
+            if missing:
+                issues.append(_contract_issue("error", "sudden_character_disappearance",
+                                              "Continuous clip loses characters at its opening: " + ", ".join(missing)))
+            remote_before = {name.casefold() for name in
+                             prior_timeline["offscreen"] + prior_timeline["mentioned_only"]}
+            remote_now = [name for name in timeline["visible_start"] if name.casefold() in remote_before]
+            if remote_now:
+                issues.append(_contract_issue("error", "remote_became_physical",
+                                              "Remote/off-screen identities entered the real space without a cut: " +
+                                              ", ".join(remote_now)))
+            prior_positions = {row["character"].casefold(): row for row in
+                               previous.get("continuity_state", {}).get("positions_end", [])}
+            for row in state["positions_start"]:
+                old = prior_positions.get(row["character"].casefold())
+                if old and ((old.get("position") and row.get("position") and old["position"] != row["position"]) or
+                            (old.get("facing") and row.get("facing") and old["facing"] != row["facing"])):
+                    issues.append(_contract_issue(
+                        "error", "spatial_conflict",
+                        f"{row['character']} changes position/facing across a continuous cut without an authored move."))
+                if (old and old.get("movement_direction") and row.get("movement_direction") and
+                        old["movement_direction"] != row["movement_direction"]):
+                    issues.append(_contract_issue(
+                        "error", "movement_direction_conflict",
+                        f"{row['character']} reverses movement direction across a continuous cut."))
+                if (old and old.get("eyeline_direction") and row.get("eyeline_direction") and
+                        old["eyeline_direction"] != row["eyeline_direction"]):
+                    issues.append(_contract_issue(
+                        "error", "eyeline_conflict",
+                        f"{row['character']}'s eyeline direction flips across a continuous cut."))
+            prior_props = {row["prop"].casefold(): row["holder"] for row in
+                           previous.get("continuity_state", {}).get("prop_holders_end", [])}
+            prior_prop_rows = {row["prop"].casefold(): row for row in
+                               previous.get("continuity_state", {}).get("prop_holders_end", [])}
+            for row in state["prop_holders_start"]:
+                holder = prior_props.get(row["prop"].casefold())
+                if holder and holder.casefold() != row["holder"].casefold() and not transfer_cue.search(
+                        "\n".join(str(segment.get(key, "")) for key in ("story", "action"))):
+                    issues.append(_contract_issue(
+                        "error", "prop_changed_hands",
+                        f"{row['prop']} changes holder from {holder} to {row['holder']} without a handoff."))
+                old = prior_prop_rows.get(row["prop"].casefold())
+                if (old and old.get("state") and row.get("state") and
+                        old["state"].strip().casefold() != row["state"].strip().casefold()):
+                    issues.append(_contract_issue(
+                        "error", "prop_state_jump",
+                        f"{row['prop']} changes visible state across a continuous boundary "
+                        f"({old['state']} -> {row['state']}). Keep phone orientation, screen direction, "
+                        "open/closed state and hand use continuous, or author a motivated cut."))
+            previous_selection = previous.get("card_selection", {})
+            current_selection = segment.get("card_selection", {})
+            prior_wardrobe = {str(value).strip().casefold()
+                              for value in previous_selection.get("wardrobe", []) if str(value).strip()}
+            current_wardrobe = {str(value).strip().casefold()
+                                for value in current_selection.get("wardrobe", []) if str(value).strip()}
+            if prior_wardrobe and current_wardrobe and prior_wardrobe != current_wardrobe:
+                issues.append(_contract_issue(
+                    "error", "wardrobe_jump",
+                    "Wardrobe-card selection changes across a continuous boundary. Preserve the same worn "
+                    "wardrobe, or use a state-change/time-jump cut."))
+            prior_environments = {str(value).strip().casefold()
+                                  for value in previous_selection.get("environments", []) if str(value).strip()}
+            current_environments = {str(value).strip().casefold()
+                                    for value in current_selection.get("environments", []) if str(value).strip()}
+            if (prior_environments and current_environments and
+                    prior_environments != current_environments):
+                issues.append(_contract_issue(
+                    "warning", "environment_boundary_change",
+                    "Environment-card selection changes during continuous action. Confirm the move is visibly "
+                    "motivated (for example through a doorway), otherwise use a scene-change cut."))
+            if (str(previous.get("action", "")).strip() and
+                    str(previous.get("action", "")).strip().casefold() == str(segment.get("action", "")).strip().casefold()):
+                issues.append(_contract_issue("warning", "repeated_action",
+                                              "This clip repeats the preceding clip's action verbatim."))
+            previous_shot = previous.get("shot_contract", {})
+            if (previous_shot.get("camera_axis") and shot_contract.get("camera_axis") and
+                    previous_shot["camera_axis"] != shot_contract["camera_axis"] and
+                    not shot_contract["allow_axis_cross"]):
+                issues.append(_contract_issue(
+                    "error", "axis_crossing",
+                    "The camera axis changes during continuous action without permission to cross the axis."))
+        if previous is not None and segment.get("transition_mode") in ("hard_cut", "matched_cut"):
+            previous_shot = previous.get("shot_contract", {})
+            if (shot_contract.get("shot_size") == previous_shot.get("shot_size") and
+                    shot_contract.get("opening_composition") and
+                    shot_contract.get("opening_composition") == previous_shot.get("ending_composition") and
+                    segment.get("transition_mode") != "matched_cut"):
+                issues.append(_contract_issue(
+                    "warning", "accidental_jump_cut",
+                    "The new shot repeats the preceding size and composition; change framing or use an intentional match."))
+        hard_errors = any(row["severity"] == "error" for row in issues)
+        mmh3_allowed = bool(previous is not None and segment.get("transition_mode") == "continuous" and
+                            state.get("mmh3_eligible") and not hard_errors)
+        if production.get("auto_continue_previous") and segment.get("continue_previous") and not mmh3_allowed:
+            issues.append(_contract_issue("error", "invalid_mmh3_continuation",
+                                          "Previous-ending continuation is enabled but this transition is not MMH3-safe."))
+        segment["mmh3_allowed"] = mmh3_allowed
+        segment["continuity_issues"] = issues
+        continuity_issues.extend({**row, "segment_index": segment.get("index")} for row in issues)
+        previous = segment
+    production["continuity_report"] = {
+        "status": "error" if any(row["severity"] == "error" for row in continuity_issues) else
+                  "warning" if continuity_issues else "ok",
+        "issues": continuity_issues,
+    }
+    audit_shot_preflight(production)
+    return production
+
+
+def _preflight_text(segment):
+    return "\n".join(str(segment.get(key) or "") for key in
+                     ("story", "setting", "action", "ending", "prompt_direction"))
+
+
+def _explicit_cut_count(text):
+    # Count authored editorial changes, not ordinary uses of words such as
+    # "cut paper". A production clip is one H3 render and therefore should not
+    # quietly contain a miniature edit sequence.
+    return len(re.findall(
+        r"\b(?:cut\s+to|smash\s+cuts?|jump\s+cuts?|match[- ]cuts?|hard\s+cuts?|"
+        r"insert\s+shot|reaction\s+shot|reverse\s+shot|"
+        r"through\s+(?:a\s+)?(?:visual\s+)?match\s+cut|transitions?\s+to)\b|"
+        r"切到|切至|镜头切换|鏡頭切換|匹配剪辑|匹配剪輯|カット(?:する|して)?|場面転換|マッチカット",
+        text, re.IGNORECASE | re.MULTILINE))
+
+
+def _hard_editorial_cut_count(text):
+    """Count edits that cannot be safely restaged as one continuous H3 take.
+
+    A single plain ``cut to`` inside one location is commonly model-authored
+    shorthand for changing emphasis. Prompt generation can turn that into a
+    pan, rack focus or reframing without changing story facts. Match, smash,
+    jump and explicit hard/time/location transitions remain blocking.
+    """
+    return len(re.findall(
+        r"\b(?:smash\s+cuts?|jump\s+cuts?|match[- ]cuts?|hard\s+cuts?|"
+        r"through\s+(?:a\s+)?(?:visual\s+)?match\s+cut|transitions?\s+to)\b|"
+        r"镜头切换|鏡頭切換|匹配剪辑|匹配剪輯|場面転換|マッチカット",
+        text, re.IGNORECASE | re.MULTILINE))
+
+
+def _camera_view_count(text):
+    patterns = (
+        r"\b(?:extreme\s+wide|wide\s+shot|full\s+shot|medium\s+shot|medium\s+close|"
+        r"close[- ]?up|extreme\s+close|over[- ]the[- ]shoulder|overhead|top[- ]down|"
+        r"low[- ]angle|high[- ]angle|pov|reverse\s+angle)\b",
+        r"(?:大全景|远景|遠景|全景|中景|近景|特写|特寫|大特写|大特寫|过肩|過肩|"
+        r"俯拍|仰拍|主观镜头|主觀鏡頭|クローズアップ|ロングショット|俯瞰|煽り)",
+    )
+    found = []
+    for pattern in patterns:
+        found.extend(match.group(0).casefold() for match in re.finditer(pattern, text, re.IGNORECASE))
+    return len(dict.fromkeys(found))
+
+
+def _action_beat_count(text):
+    clauses = [row.strip() for row in re.split(
+        r"(?:[.!?。！？;；\n]+|\b(?:then|afterwards|next|meanwhile|suddenly)\b|"
+        r"然后|接着|随后|与此同时|突然|然後|接著|隨後|同時|それから|続いて|次に|突然)",
+        text, flags=re.IGNORECASE) if row.strip()]
+    return len(clauses)
+
+
+def shot_preflight_for_segment(production, segment):
+    """Return one compact, actionable pre-prompt quality report.
+
+    Semantic facts come from the authored contracts; cheap text checks only
+    flag render complexity. Warnings remain advisory. Errors are reserved for
+    contradictions that cannot be rendered without changing the screenplay.
+    """
+    issues = []
+    text = _preflight_text(segment)
+    duration = int(segment.get("duration") or DEFAULT_CLIP_SECONDS)
+    timeline = effective_cast_timeline(production, segment)
+    visible_count = max(len(timeline.get("visible_start", [])),
+                        len(timeline.get("visible_end", [])))
+    # Story, setting and action commonly restate the same editorial idea.  The
+    # number of authored edits is therefore the largest count in any one field,
+    # not the sum of duplicate prose across all fields.  Two explicit cuts in
+    # the action still block one H3 render, while one match-cut repeated in the
+    # summary and setting remains one (still blocking) editorial boundary.
+    preflight_fields = [str(segment.get(key) or "") for key in
+                        ("story", "setting", "action", "ending", "prompt_direction")]
+    cut_count = max((_explicit_cut_count(value) for value in preflight_fields), default=0)
+    hard_cut_count = max((_hard_editorial_cut_count(value) for value in preflight_fields), default=0)
+    camera_views = _camera_view_count(text)
+    action_beats = _action_beat_count("\n".join(
+        str(segment.get(key) or "") for key in ("action", "ending")))
+
+    if action_beats > max(4, math.ceil(duration / 2)):
+        issues.append(_contract_issue(
+            "warning", "dense_action",
+            f"Clip {segment.get('index')} packs about {action_beats} action beats into {duration}s; simplify or split it."))
+    if cut_count > 1:
+        issues.append(_contract_issue(
+            "error", "multiple_internal_cuts",
+            f"Clip {segment.get('index')} contains {cut_count} internal cuts, but one H3 clip must remain one filmable setup."))
+    elif hard_cut_count:
+        issues.append(_contract_issue(
+            "error", "internal_editorial_cut",
+            f"Clip {segment.get('index')} contains an editorial cut or match-cut inside one H3 render; split it into separate storyboard clips and join them in the final edit."))
+    elif cut_count == 1:
+        issues.append(_contract_issue(
+            "warning", "internal_cut",
+            f"Clip {segment.get('index')} contains one repairable internal cut cue; prompt generation must restage it as one continuous camera setup."))
+    if camera_views >= 3:
+        issues.append(_contract_issue(
+            "error", "impossible_camera_change",
+            f"Clip {segment.get('index')} asks one render to cover {camera_views} distinct camera views."))
+    elif camera_views == 2:
+        issues.append(_contract_issue(
+            "warning", "camera_change",
+            f"Clip {segment.get('index')} names two camera views; confirm the move is physically continuous."))
+
+    face_front = re.search(
+        r"(?:front[- ]facing|face\s+(?:toward|to)\s+(?:the\s+)?camera|正面脸|正面臉|正对镜头|"
+        r"正對鏡頭|カメラ正面)", text, re.IGNORECASE)
+    screen_front = re.search(
+        r"(?:screen\s+(?:faces?|facing)\s+(?:the\s+)?camera|readable\s+(?:phone\s+)?screen|"
+        r"phone\s+screen\s+front|屏幕正对镜头|螢幕正對鏡頭|手机屏幕正面|手機螢幕正面|"
+        r"画面をカメラ正面)", text, re.IGNORECASE)
+    if face_front and screen_front and segment.get("device_view") not in ("screen", "remote_panel"):
+        issues.append(_contract_issue(
+            "error", "face_screen_geometry",
+            f"Clip {segment.get('index')} simultaneously requires a frontal face and frontal readable phone screen from one camera."))
+
+    roles = character_presence_roles(production, segment)
+    visible_labels = {str(name).strip().casefold() for name in
+                      timeline.get("visible_start", []) + timeline.get("visible_end", [])}
+    aliases = character_aliases(production)
+    escaped_planes = []
+    cards = {card["id"]: card for card in production.get("cards", {}).get("characters", [])}
+    for card_id, role in roles.items():
+        if role not in ("display", "imagined", "offscreen"):
+            continue
+        if any(alias in visible_labels for alias in aliases.get(card_id, set())):
+            escaped_planes.append(cards.get(card_id, {}).get("name", card_id))
+    if escaped_planes:
+        issues.append(_contract_issue(
+            "error", "nonphysical_character_in_reality",
+            "Remote, remembered or off-screen characters were placed in the physical cast: " +
+            ", ".join(escaped_planes[:8])))
+
+    dialogue_floor = dialogue_minimum_seconds(segment)
+    if segment.get("dialogue") and dialogue_floor > duration:
+        modest_overrun = dialogue_floor <= duration + 2
+        issues.append(_contract_issue(
+            "warning" if modest_overrun else "error",
+            "tight_dialogue" if modest_overrun else "dialogue_overflow",
+            (f"Clip {segment.get('index')} has about {dialogue_floor}s of conservatively paced dialogue in a "
+             f"{duration}s authored clip; use a naturally brisk delivery and avoid extra pauses."
+             if modest_overrun else
+             f"Clip {segment.get('index')} has at least {dialogue_floor}s of dialogue but only {duration}s available.")))
+    if visible_count > 9:
+        issues.append(_contract_issue(
+            "error", "cast_capacity",
+            f"Clip {segment.get('index')} asks for {visible_count} physical characters, beyond the nine-reference H3 budget."))
+    elif visible_count > 4:
+        issues.append(_contract_issue(
+            "warning", "dense_cast",
+            f"Clip {segment.get('index')} has {visible_count} visible characters; prefer an overview reference and restrained staging."))
+
+    # Coverage and adjacent-state failures belong to the same user-facing
+    # preflight instead of surfacing later as unrelated generation errors.
+    inherited = [copy.deepcopy(row) for row in
+                 list(segment.get("coverage_issues", [])) +
+                 list(segment.get("continuity_issues", []))]
+    result = inherited + issues
+    deduped, seen = [], set()
+    for row in result:
+        key = (row.get("severity"), row.get("code"), row.get("message"))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(row)
+    return deduped
+
+
+def audit_shot_preflight(production):
+    all_issues = []
+    global_coverage_errors = [copy.deepcopy(row) for row in
+                              production.get("coverage_report", {}).get("issues", [])
+                              if row.get("severity") == "error"]
+    for segment in production.get("segments", []):
+        segment["preflight_issues"] = global_coverage_errors + shot_preflight_for_segment(production, segment)
+        unique, seen = [], set()
+        for row in segment["preflight_issues"]:
+            key = (row.get("severity"), row.get("code"), row.get("message"))
+            if key not in seen:
+                seen.add(key)
+                unique.append(row)
+        segment["preflight_issues"] = unique
+        all_issues.extend({**row, "segment_index": segment.get("index")}
+                          for row in segment["preflight_issues"])
+    production["preflight_report"] = {
+        "status": "error" if any(row.get("severity") == "error" for row in all_issues) else
+                  "warning" if all_issues else "ok",
+        "issues": all_issues,
+        "checked_clips": len(production.get("segments", [])),
+    }
+    return production
 
 
 class ProductionManager:
@@ -2594,6 +3763,9 @@ class ProductionManager:
         result["auto_continue_previous"] = result.get("auto_continue_previous", False)
         if type(result["auto_continue_previous"]) is not bool:
             raise ValueError("Automatic continuation from the preceding clip must be true or false.")
+        result["auto_quality_review"] = result.get("auto_quality_review", True)
+        if type(result["auto_quality_review"]) is not bool:
+            raise ValueError("Automatic post-render quality review must be true or false.")
         result["auto_keyframes_enabled"] = result.get("auto_keyframes_enabled", False)
         if type(result["auto_keyframes_enabled"]) is not bool:
             raise ValueError("Automatic supplemental keyframes must be true or false.")
@@ -2617,6 +3789,7 @@ class ProductionManager:
         result["task_state"] = _text(result.get("task_state"), "task state", 16, "active") or "active"
         if result["task_state"] not in ("active", "paused"):
             raise ValueError("Production task state must be active or paused.")
+        result["automation"] = normalise_automation(result.get("automation"))
         raw_timings = result.get("timings", {})
         if not isinstance(raw_timings, dict):
             raise ValueError("Production timings must be an object.")
@@ -2672,12 +3845,25 @@ class ProductionManager:
         if not isinstance(segments, list) or len(segments) > MAX_SEGMENTS:
             raise ValueError(f"A production can contain at most {MAX_SEGMENTS} clips.")
         result["segments"] = [normalise_segment(item, i, item) for i, item in enumerate(segments)]
+        # Reports are derived from the current episode source and current clip
+        # order on every load/save. Legacy projects receive deterministic
+        # source bindings once; partial or contradictory bindings remain
+        # visible as errors instead of being silently repaired.
+        audit_storyboard_contract(result, backfill_legacy=True)
         current_context_hash = production_context_hash(result)
         upstream_changed = False
         for segment in result["segments"]:
             reasons = []
+            current_segment_hash = segment_hash(segment)
+            # Accept and immediately rebase the short-lived upgrade hash that
+            # included ``state: ""`` in legacy prop rows. The user did not edit
+            # the storyboard, so loading or saving an old project must not start
+            # an automatic prompt rebuild.
+            if (segment["project_id"] and segment["source_hash"] and
+                    segment["source_hash"] == _segment_hash_with_empty_prop_state(segment)):
+                segment["source_hash"] = current_segment_hash
             source_changed = bool(segment["project_id"] and
-                                  segment["source_hash"] != segment_hash(segment))
+                                  segment["source_hash"] != current_segment_hash)
             if source_changed:
                 reasons.append("分镜内容或时长在 H3 工程创建后发生了变化")
             if segment["project_id"] and segment.get("context_hash") != current_context_hash:
@@ -2782,6 +3968,7 @@ class ProductionManager:
             "overview_asset_ids": empty_overview_assets(),
             "auto_merge": True,
             "auto_continue_previous": False,
+            "auto_quality_review": True,
             "auto_keyframes_enabled": False,
             "auto_keyframe_model": "z_image_turbo_bf16.safetensors",
             "video_aspect_ratio": body.get("video_aspect_ratio", source.get("aspect_ratio", "16:9")),
@@ -2789,6 +3976,7 @@ class ProductionManager:
             "video_quality": body.get("video_quality", source.get("comfy_render", {}).get("quality", "fast")),
             "video_steps": body.get("video_steps", source.get("comfy_render", {}).get("steps", "auto")),
             "task_state": "active",
+            "automation": normalise_automation(None),
             "timings": {key: None for key in TIMING_KEYS},
             "generated_overviews": {},
             "planner": None, "planner_warning": None, "segments": []}
@@ -2796,7 +3984,7 @@ class ProductionManager:
 
     def update(self, ident, body):
         current = self.get(ident)
-        allowed = {"title", "language", "prompt_version", "brief", "style_bible", "character_bible", "continuity_notes", "cards", "segments", "auto_merge", "auto_continue_previous", "task_state", "auto_keyframes_enabled", "auto_keyframe_model",
+        allowed = {"title", "language", "prompt_version", "brief", "style_bible", "character_bible", "continuity_notes", "cards", "segments", "auto_merge", "auto_continue_previous", "auto_quality_review", "task_state", "auto_keyframes_enabled", "auto_keyframe_model",
                    "video_aspect_ratio", "video_resolution", "video_quality", "video_steps",
                    "visual_style_preset", "visual_style_custom", "narrative_style", "narrative_style_custom", "narrative_notes", "episode_count", "episode_minutes",
                    "current_episode", "episodes", "card_collection_id", "card_collection_name", "overview_asset_ids", "series_voice_style"}
@@ -3109,6 +4297,8 @@ class ProductionManager:
         }
         character_by_voice_alias = voice_character_aliases(current)
         planned = copy.deepcopy(planned)
+        explicit_source_contract = any("source_refs" in item for item in planned)
+        source_manifest = bind_planned_source_contract(current, planned, planner)
         if any(group.get("dialogue_parse_failed") for group in locked_groups):
             raise ValueError(
                 "The source screenplay appears to contain quoted dialogue, but its speaker format could not be parsed. "
@@ -3244,6 +4434,29 @@ class ProductionManager:
                 for child, count in zip(children, counts):
                     child["dialogue"] = translated[offset:offset + count]
                     offset += count
+        # Apply the same exact-dialogue contract to ordinary scripts without
+        # authored timecodes. source_refs decides which clip owns each line;
+        # the model may translate words but never move, merge or reassign them.
+        source_dialogue = {row["id"]: row for row in _flatten_manifest(source_manifest, "dialogue")}
+        for item in planned if (explicit_source_contract or planner != "local_ai") else []:
+            expected = [source_dialogue[value] for value in item.get("source_refs", {}).get("dialogue_ids", [])
+                        if value in source_dialogue]
+            exact = []
+            requires_translation = False
+            for row in expected:
+                speaker = row["speaker"]
+                folded = speaker.casefold()
+                card = character_by_alias.get(folded) or character_by_voice_alias.get(folded)
+                if card:
+                    speaker = card["name"]
+                exact.append({"speaker": speaker, "text": row["text"],
+                              "language": PRODUCTION_LANGUAGES[current["language"]], "voiceover": False})
+                requires_translation = requires_translation or not _dialogue_already_matches_language(
+                    row["text"], current["language"])
+            if not requires_translation or planner != "local_ai":
+                item["dialogue"] = exact
+            else:
+                translated_dialogue(item, {"source_dialogue": exact})
         departed_characters, continuity_corrections = set(), []
         for index, item in enumerate(planned):
             item = copy.deepcopy(item)
@@ -3413,6 +4626,8 @@ class ProductionManager:
             # prior identity because ordinal clips may have shifted meaning.
             prior = (old[index] if index < len(old) and (
                 len(old) == len(planned) or segment_hash(old[index]) == segment_hash(item)) else None)
+            item["source_contract_version"] = (
+                STORY_CONTRACT_VERSION if explicit_source_contract or planner != "local_ai" else 0)
             segment = normalise_segment(item, index, prior)
             segment["card_selection_source"] = (
                 "local_ai" if planner == "local_ai" and isinstance(item.get("card_selection"), dict)
@@ -3431,6 +4646,7 @@ class ProductionManager:
         segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
         if not segment:
             raise ValueError("Production clip not found.")
+        self.assert_storyboard_contract_current(production, segment)
         if segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION:
             raise ValueError(
                 "This storyboard predates temporal cast tracking. Replan this episode before rebuilding its video prompts.")
@@ -3709,6 +4925,7 @@ class ProductionManager:
             internal_timing,
             "" if narrative_version else voice_context,
             f"CLIP PROMPT REVISION REQUEST: {segment['prompt_direction']}" if segment.get("prompt_direction") else "",
+            f"POST-RENDER QUALITY REPAIR: {segment['quality_repair_direction']}" if segment.get("quality_repair_direction") else "",
         ] if x)
         # Re-materialising replaces both production-managed channels instead of
         # appending another copy from the previous clip project.
@@ -4459,6 +5676,64 @@ class ProductionManager:
         segment["selected_video_run_id"] = None
         return self.save(production)
 
+    def apply_quality_repair(self, ident, segment_id, direction):
+        """Apply one explicitly approved repair while preserving all take history.
+
+        This method is deliberately not an automatic recovery hook.  The API
+        calls it only after a human has reviewed the failed take and approved
+        its bounded repair direction.
+        """
+        production = self.get(ident)
+        segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
+        if not segment:
+            raise ValueError("Production clip not found.")
+        direction = _text(direction, "post-render repair direction", 2000)
+        if not direction:
+            raise ValueError("The quality review did not provide a safe repair direction.")
+        count = int(segment.get("quality_repair_count") or 0)
+        if count >= 3:
+            raise ValueError(
+                "This clip has already used three approved quality-repair attempts. "
+                "Review the storyboard and edit its prompt manually before rendering another take.")
+        segment["quality_repair_direction"] = direction
+        segment["quality_repair_count"] = count + 1
+        segment["video_prompt"] = ""
+        segment["video_prompt_source"] = ""
+        segment["selected_video_run_id"] = None
+        segment["status"] = "stale"
+        segment["stale_reasons"] = ["视频成片质检发现明确问题，需要按质检要求重建本段"]
+        return self.save(production)
+
+    def apply_boundary_action(self, ident, previous_segment_id, segment_id, run_id,
+                              action, asset_id=None, can_continue=False):
+        production = self.get(ident)
+        previous = next((row for row in production["segments"]
+                         if row["id"] == safe_id(previous_segment_id)), None)
+        segment = next((row for row in production["segments"]
+                        if row["id"] == safe_id(segment_id)), None)
+        if not previous or not segment or segment["index"] != previous["index"] + 1:
+            raise ValueError("Choose two adjacent production clips.")
+        if action not in ("save", "use_next", "hard_cut"):
+            raise ValueError("Choose save, use_next or hard_cut for this boundary.")
+        if asset_id:
+            previous["ending_continuity_asset_id"] = safe_id(asset_id)
+        if action == "use_next":
+            if not can_continue:
+                raise ValueError(
+                    "This take has no verified MMH3 continuation state. Save the frame for review, or rerender the preceding clip with automatic continuation enabled.")
+            production["auto_continue_previous"] = True
+            previous["selected_video_run_id"] = safe_id(run_id)
+            segment["continue_previous"] = True
+            segment["transition_mode"] = "continuous"
+            segment["continuity_state"]["mmh3_eligible"] = True
+            segment["shot_contract"]["relation_previous"] = "continuous"
+        elif action == "hard_cut":
+            segment["continue_previous"] = False
+            segment["transition_mode"] = "hard_cut"
+            segment["continuity_state"]["mmh3_eligible"] = False
+            segment["shot_contract"]["relation_previous"] = "hard_cut"
+        return self.save(production)
+
     def record_timing(self, ident, key, seconds):
         if key not in TIMING_KEYS:
             raise ValueError("Unsupported production timing metric.")
@@ -4471,6 +5746,30 @@ class ProductionManager:
         if production["task_state"] == "paused":
             raise ValueError("This production is paused. Resume it before starting another task.")
         return production
+
+    def update_automation(self, ident, changes):
+        """Atomically persist background orchestration progress."""
+        if not isinstance(changes, dict):
+            raise ValueError("Automation update must be an object.")
+        allowed = set(normalise_automation(None))
+        if set(changes) - allowed:
+            raise ValueError("Automation update contains unsupported fields.")
+        with self.lock:
+            production = self.get(ident)
+            automation = copy.deepcopy(production.get("automation", {}))
+            automation.update(copy.deepcopy(changes))
+            production["automation"] = normalise_automation(automation)
+            return self.save(production)
+
+    def assert_storyboard_contract_current(self, production, segment):
+        """Block prompt/video work through one unified shot preflight gate."""
+        preflight_errors = [row.get("message", "") for row in segment.get("preflight_issues", [])
+                            if row.get("severity") == "error"]
+        if preflight_errors:
+            raise ValueError(
+                f"Clip {segment.get('index')} failed shot preflight. Fix or replan it before generating video: " +
+                " ".join(preflight_errors[:5]))
+        return True
 
     def assert_video_project_current(self, production, project):
         """Reject stale or visually ungrounded production snapshots.
@@ -4487,6 +5786,7 @@ class ProductionManager:
                         if item.get("id") == segment_id), None)
         if segment is None:
             raise ValueError("This production clip no longer exists. Rebuild its video prompt before rendering.")
+        self.assert_storyboard_contract_current(production, segment)
         strategy = link.get("reference_strategy") if isinstance(link.get("reference_strategy"), dict) else {}
         if (strategy.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or
                 segment.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or
@@ -4580,18 +5880,22 @@ def planning_card_catalog(production):
     return catalog
 
 
-def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previous_ending=""):
+def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previous_ending="",
+                     previous_contract=None):
     source_story = story or production["brief"]
     timing = episode_timing_targets(production, chunk_index, chunk_total, source_story)
     locked_dialogue = locked_timed_dialogue(production, source_story)
+    source_manifest = source_manifest_for_text(source_story, chunk_index)
     return json.dumps({
         "title": production["title"], "story_or_script": source_story,
         "project_output_language": PRODUCTION_LANGUAGES[production["language"]],
         "current_episode": production.get("current_episode", 1),
         "part": {"index": chunk_index, "total": chunk_total,
-                 "previous_part_ending": previous_ending},
+                 "previous_part_ending": previous_ending,
+                 "previous_part_handoff": previous_contract or {}},
         "episode_timing": timing,
         "locked_source_dialogue": locked_dialogue,
+        "source_manifest": source_manifest,
         "visual_style_preset": production.get("visual_style_preset", "cinematic_realism"),
         "custom_visual_style": production.get("visual_style_custom", ""),
         "visual_style_bible": production["style_bible"],
@@ -4613,16 +5917,26 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
                     "but use another count inside episode_timing.feasible_clip_count only when the story genuinely requires it. "
                     "The sum of clip durations must equal episode_timing.part_target_seconds. Derive individual 5-15 second "
                     "durations from dialogue and action rather than making them mechanically uniform. Prefer at most four visible "
-                    "named identities per clip. Fill cast_timeline for every clip: visible_start and visible_end are exact boundary "
+                    "named identities per clip. Bind every source_manifest paragraph, dialogue and event ID exactly once and in "
+                    "order through source_refs; scene IDs may repeat for adjacent clips. Fill cast_timeline for every clip: "
+                    "visible_start and visible_end are exact boundary "
                     "states; enters and exits are physical changes during this clip; offscreen and mentioned_only must never be "
                     "depicted. A character who exited stays absent from later clips until a later cast_timeline.enters explicitly "
-                    "brings that character back. Set transition_mode to continuous only for truly unbroken time/place/action; use "
+                    "brings that character back. Fill continuity_state with concrete opening/ending state, physical screen positions, "
+                    "facing and movement directions, eyeline targets, important prop holders plus their visible state/orientation "
+                    "(especially phone screen direction and hand), and a truthful mmh3_eligible decision. "
+                    "Fill shot_contract with editorial role, shot size, opening/ending composition, axis, edit motivation and explicit "
+                    "preserve/change instructions. Set transition_mode to continuous "
+                    "only for truly unbroken time/place/action; use "
                     "hard_cut, matched_cut, time_jump, state_change or insert for discontinuities. Make card_selection.characters "
                     "the exact union of visible_start, visible_end, enters and exits. In each locked_source_dialogue group, source_dialogue is the "
                     "complete authored line roster. When requires_translation is false, copy dialogue verbatim. When it is true, translate each "
                     "source_dialogue text once into project_output_language while preserving speaker, count and order; never consolidate, omit, "
                     "reassign or invent a line. For each clip copy only "
-                    "exact available card names into card_selection. Start continuously after previous_part_ending when present.")
+                    "exact available card names into card_selection. When previous_part_handoff is present, treat its ending cast, "
+                    "positions, facing, motion, eyelines, prop holders, shot size, composition and axis as the authoritative prior "
+                    "frame. State explicitly what the first new clip preserves and what it changes; never replay the prior action. "
+                    "Start continuously only when that handoff is physically compatible; otherwise author a motivated cut.")
     }, ensure_ascii=False, indent=2)
 
 

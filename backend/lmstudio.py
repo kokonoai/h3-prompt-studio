@@ -98,19 +98,36 @@ def _response_json(text):
     return _strict_json(text)
 
 
-def _server_error(detail, status=None):
+def _server_error(detail, status=None, provider='LM Studio'):
     """Keep actionable server failures separate from schema compatibility."""
+    provider = provider if provider in ('LM Studio', 'Ollama') else 'Local AI'
+    detail = detail if isinstance(detail, str) else str(detail)
     lower = detail.lower()
+    summary = ''
+    try:
+        payload = json.loads(detail)
+        if isinstance(payload, dict):
+            candidate = payload.get('error') or payload.get('message') or payload.get('detail')
+            if isinstance(candidate, dict):
+                candidate = candidate.get('message') or candidate.get('error') or candidate.get('detail')
+            if isinstance(candidate, str):
+                summary = candidate
+    except (ValueError, TypeError, RecursionError):
+        summary = detail
+    summary = re.sub(r'\s+', ' ', summary).strip()[:320]
     if status in (401, 403):
-        return 'authentication_required', 'LM Studio requires a valid API token.'
+        return 'authentication_required', f'{provider} requires a valid API token.'
     if any(term in lower for term in ('out of memory', 'insufficient memory', 'failed to allocate', 'allocation failed')):
-        return 'model_out_of_memory', 'LM Studio ran out of memory. Use a smaller model or a shorter loaded context.'
+        return 'model_out_of_memory', f'{provider} ran out of memory. Use a smaller model or a shorter loaded context.'
     if (any(term in lower for term in ('context length', 'context_length', 'context window', 'context size', 'context overflow'))
             and any(term in lower for term in ('exceed', 'overflow', 'too long', 'too large', 'full', 'limit reached', 'cannot fit'))):
         return 'context_length_exceeded', 'This request exceeds the loaded model context. Shorten the scene/history or prepare a larger context.'
     if status in (429, 503):
-        return 'server_busy', 'LM Studio is busy or temporarily unavailable. Wait for its current work to finish, then retry.'
-    return 'http_error', f'LM Studio returned HTTP {status}' if status is not None else 'LM Studio returned a server error.'
+        return 'server_busy', f'{provider} is busy or temporarily unavailable. Wait for its current work to finish, then retry.'
+    if status is not None:
+        suffix = f': {summary}' if summary else ''
+        return 'http_error', f'{provider} returned HTTP {status}{suffix}'
+    return 'http_error', f'{provider} returned a server error' + (f': {summary}' if summary else '.')
 
 
 def validate_data_url(data_url):
@@ -251,7 +268,7 @@ class LMStudioClient:
             detail = re.sub(r"data:image/[^\s\"']+", "[image data]", raw)
             if self.api_key:
                 detail = detail.replace(self.api_key, "[redacted]")
-            code, message = _server_error(detail, exc.code)
+            code, message = _server_error(detail, exc.code, provider)
             raise LMStudioError(message, code=code, status_code=exc.code, detail=detail[:1000]) from exc
         except (TimeoutError, error.URLError) as exc:
             if isinstance(exc, TimeoutError) or isinstance(getattr(exc, 'reason', None), TimeoutError):
@@ -681,6 +698,7 @@ class LMStudioClient:
 
     def complete_json(self, model, system, content, schema, max_tokens=4096, temperature=0.3,
                       *, request_id=None, cancel_event=None, on_progress=None):
+        provider = 'Ollama' if self.is_ollama else 'LM Studio'
         self.last_completion_info = None
         self._check_cancel(cancel_event)
         if not isinstance(system, str) or len(system) > 16_000:
@@ -761,7 +779,7 @@ class LMStudioClient:
             except LMStudioError as exc:
                 record.update(error=str(exc), error_code=exc.code, status_code=exc.status_code,
                               elapsed_seconds=time.perf_counter() - attempt_started)
-                classified, _ = _server_error(exc.detail, exc.status_code)
+                classified, _ = _server_error(exc.detail, exc.status_code, provider)
                 detail = exc.detail.lower()
                 capability_error = (not compatibility_retry and attempt < 2
                     and exc.status_code in (400, 422, 500) and classified == 'http_error')
@@ -794,7 +812,7 @@ class LMStudioClient:
                     detail = str(response['error'])[:1000]
                     if self.api_key:
                         detail = detail.replace(self.api_key, '[redacted]')
-                    code, message = _server_error(detail)
+                    code, message = _server_error(detail, provider=provider)
                     raise LMStudioError(message, code=code, detail=detail)
                 if not isinstance(response.get('choices'), list) or len(response['choices']) != 1:
                     raise LMStudioError('LM Studio did not return exactly one completion choice.', code='invalid_response')

@@ -102,6 +102,56 @@ def test_production_video_job_counts_keep_lost_requests_separate(server):
     assert counts == {'active_jobs': 2, 'uncertain_jobs': 1}
 
 
+def test_quality_context_separates_remote_panels_from_physical_cast(server):
+    module, _client, _fake = server
+    koko_id, besi_id = str(uuid.uuid4()), str(uuid.uuid4())
+    production = {
+        'brief': 'Koko and Besi talk remotely from separate rooms.', 'episode_count': 1,
+        'style_bible': 'restrained anime drama',
+        'cards': {'characters': [
+            {'id': koko_id, 'name': 'Koko', 'description': 'long black hair'},
+            {'id': besi_id, 'name': 'Besi', 'description': 'short dark hair'},
+        ]},
+    }
+    segment = {
+        'index': 26, 'title': 'Separate rooms', 'device_view': 'performance',
+        'story': 'They talk remotely.', 'setting': 'Split locations in their separate rooms.',
+        'action': 'Alternating matching close-ups: Koko speaks and Besi answers.',
+        'ending': 'Each remains in a separate room.', 'image_prompt': 'remote conversation',
+        'dialogue': [], 'card_selection': {'characters': ['Koko', 'Besi']},
+        'cast_timeline': {'visible_start': ['Koko', 'Besi'], 'visible_end': ['Koko', 'Besi'],
+                          'enters': [], 'exits': [], 'offscreen': [], 'mentioned_only': []},
+        'continuity_state': {},
+    }
+
+    context = module._quality_visual_context(production, segment, [])
+
+    assert context['required_visible_first'] == []
+    assert context['required_visible_last'] == []
+    assert context['display_only'] == ['Koko', 'Besi']
+    assert context['must_not_be_physical'] == ['Koko', 'Besi']
+    assert 'REMOTE-CALL PANEL GEOMETRY LOCK' in context['device_geometry_contract']
+    assert [row['name'] for row in context['characters']] == ['Koko', 'Besi']
+
+
+def test_quality_reference_selection_accepts_canonical_card_names(server, monkeypatch):
+    module, _client, _fake = server
+    asset_id, card_id = str(uuid.uuid4()), str(uuid.uuid4())
+    folder = module.DATA / 'assets' / asset_id
+    folder.mkdir(parents=True)
+    Image.new('RGB', (32, 32), (100, 120, 140)).save(folder / 'koko.png')
+    monkeypatch.setattr(module, 'asset_meta', lambda _ident: {
+        'filename': 'koko.png', 'media_type': 'image'})
+    production = {'cards': {'characters': [{
+        'id': card_id, 'name': 'Koko', 'asset_ids': [asset_id]}], 'styles': []}}
+    segment = {'card_selection': {'characters': ['Koko']}}
+
+    rows = module._quality_reference_rows(production, segment)
+
+    assert len(rows) == 1
+    assert rows[0]['label'] == 'IDENTITY Koko'
+
+
 def test_production_outputs_never_adopts_a_take_older_than_current_prompt(server, monkeypatch):
     module, _client, _fake = server
     production_id, segment_id, project_id = (str(uuid.uuid4()) for _ in range(3))
@@ -123,6 +173,9 @@ def test_production_outputs_never_adopts_a_take_older_than_current_prompt(server
         def get(self, _ident):
             return copy.deepcopy(production)
 
+        def list(self):
+            return []
+
     monkeypatch.setattr(module, 'production_manager', lambda: Productions())
 
     result = module.production_outputs(production_id, [old, current])
@@ -135,6 +188,186 @@ def test_production_outputs_never_adopts_a_take_older_than_current_prompt(server
     assert not missing['all_ready']
     assert missing['segments'][0]['selected'] is None
     assert missing['final_ready'] is False
+
+
+def test_stale_project_with_legacy_take_is_optional_upgrade_not_blocking(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(4))
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Historical clip',
+            'project_id': project_id, 'status': 'stale',
+            'selected_video_run_id': run_id,
+        }],
+    }
+    take = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+            'status': 'succeeded', 'video_url': '/legacy.mp4', 'created_at': 100.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+        def list(self):
+            return []
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    result = module.production_outputs(production_id, [take])
+
+    assert result['all_ready']
+    assert result['segments'][0]['legacy_upgrade'] is True
+    assert result['legacy_upgrade_count'] == 1
+    assert result['legacy_unreviewed_count'] == 1
+    assert result['blocking_stale_count'] == 0
+
+
+def test_batch_legacy_review_returns_before_background_work(server, monkeypatch):
+    module, client, _fake = server
+    production_id = str(uuid.uuid4())
+    started = []
+
+    class Productions:
+        def assert_active(self, ident):
+            assert ident == production_id
+            return {'id': ident}
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target, self.args = target, args
+
+        def start(self):
+            started.append((self.target, self.args))
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module.threading, 'Thread', DeferredThread)
+    monkeypatch.setattr(module, 'production_outputs', lambda ident: {'production_id': ident})
+    module.PRODUCTION_QUALITY_JOBS.clear()
+
+    response = client.post(
+        f'/api/productions/{production_id}/quality',
+        headers=auth(module), json={'legacy_only': True})
+
+    assert response.status_code == 200
+    assert response.json()['quality_batch']['status'] == 'running'
+    assert response.json()['outputs']['production_id'] == production_id
+    assert len(started) == 1
+
+
+def test_rejected_take_becomes_adoptable_only_after_human_override(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(4))
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Reviewed take',
+            'project_id': project_id, 'status': 'ready',
+            'selected_video_run_id': run_id,
+        }],
+    }
+    take = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+            'status': 'succeeded', 'video_url': '/reviewed.mp4', 'created_at': 300.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    accepted = {'value': False}
+    monkeypatch.setattr(module, '_production_quality_descriptor', lambda *_args: {
+        'status': 'failed', 'required': True, 'accepted': accepted['value'],
+        'summary': 'One sampled-frame defect.', 'issues': [],
+    })
+
+    rejected = module.production_outputs(production_id, [take])
+    assert not rejected['all_ready']
+    assert rejected['segments'][0]['selected'] is None
+    assert rejected['segments'][0]['candidates'][0]['quality_review']['status'] == 'failed'
+
+    accepted['value'] = True
+    overridden = module.production_outputs(production_id, [take])
+    assert overridden['all_ready']
+    assert overridden['quality_ready']
+    assert overridden['segments'][0]['selected']['id'] == run_id
+
+
+def test_batch_quality_acceptance_validates_then_releases_once(server, monkeypatch):
+    module, client, _fake = server
+    production_id = str(uuid.uuid4())
+    segment_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    run_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    production = {
+        'id': production_id, 'auto_merge': True,
+        'segments': [
+            {'id': segment_ids[index], 'index': index + 1,
+             'project_id': project_ids[index], 'selected_video_run_id': None}
+            for index in range(2)
+        ],
+    }
+    runs = {
+        run_ids[index]: {
+            'id': run_ids[index], 'project_id': project_ids[index],
+            'status': 'succeeded', 'video_url': f'/take-{index}.mp4',
+        }
+        for index in range(2)
+    }
+    saved_productions, saved_reviews, automation_starts = [], [], []
+
+    class Productions:
+        def assert_active(self, ident):
+            assert ident == production_id
+            return production
+
+        def save(self, value):
+            saved_productions.append(copy.deepcopy(value))
+            return value
+
+    class Videos:
+        def get(self, ident):
+            return copy.deepcopy(runs[ident])
+
+    class Automation:
+        def start(self, ident, **options):
+            automation_starts.append((ident, options))
+            return {'status': 'running'}
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, 'video_manager', lambda: Videos())
+    monkeypatch.setattr(module, 'production_automation_manager', lambda: Automation())
+    monkeypatch.setattr(module, '_production_quality_descriptor', lambda _p, segment_id, run_id: {
+        'status': 'failed', 'required': True, 'accepted': False,
+        'summary': f'QC evidence for {segment_id}',
+        'issues': [{'code': 'duplicate_character', 'severity': 'error',
+                    'message': f'Original finding for {run_id}'}],
+    })
+
+    def save_review(prod_id, segment_id, run_id, value):
+        saved_reviews.append((prod_id, segment_id, run_id, copy.deepcopy(value)))
+        return value
+
+    monkeypatch.setattr(module, '_save_production_quality', save_review)
+    monkeypatch.setattr(module, 'production_outputs', lambda ident: {
+        'production_id': ident,
+        'selected_run_ids': [row['selected_video_run_id'] for row in production['segments']],
+    })
+
+    response = client.post(
+        f'/api/productions/{production_id}/quality/accept', headers=auth(module),
+        json={'items': [
+            {'segment_id': segment_ids[0], 'run_id': run_ids[0]},
+            {'segment_id': segment_ids[1], 'run_id': run_ids[1]},
+        ]})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['accepted_count'] == 2
+    assert payload['outputs']['selected_run_ids'] == run_ids
+    assert len(saved_reviews) == 2
+    assert all(review[3]['accepted'] is True for review in saved_reviews)
+    assert all(review[3]['issues'][0]['code'] == 'duplicate_character' for review in saved_reviews)
+    assert len(saved_productions) == 1
+    assert len(automation_starts) == 1
+    assert automation_starts[0][1]['requested_by'] == 'human_quality_override_batch'
 
 
 def test_concat_applies_one_final_loudness_master(server, monkeypatch, tmp_path):

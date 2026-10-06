@@ -6,7 +6,8 @@ import pytest
 from PIL import Image, ImageDraw
 
 from backend.compiler import compile_project
-from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
+from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
+                                 _segment_hash_with_empty_prop_state,
                                  authored_internal_timing,
                                  card_plan_source_hash, character_aliases, current_episode_story,
                                  character_presence_roles,
@@ -16,9 +17,13 @@ from backend.productions import (REFERENCE_STRATEGY_VERSION, ProductionManager, 
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  normalise_segment, production_schema_for_story, render_character_identity,
+                                 production_source_manifest,
+                                 reconcile_transition_contract,
                                  render_visual_style,
-                                 scoped_character_bible, script_dialogue, segment_hash,
-                                 timed_clip_groups, timed_group_story)
+                                 scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
+                                 storyboard_output_token_budget,
+                                 timed_clip_groups, timed_group_story, timed_story_beats,
+                                 validate_planned_chunk_source_contract)
 from backend.projects import merge_plan, new_project, shot
 from backend.video_workflows import VideoWorkflowManager
 
@@ -345,6 +350,38 @@ def test_display_only_split_call_keeps_an_explicit_empty_physical_timeline(tmp_p
     assert not any(segment["cast_timeline"].values())
 
 
+def test_negative_split_screen_lock_does_not_turn_local_actor_into_display(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    besi = _card("Besi")
+    koko = _card("Koko")
+    production = manager.create({
+        "source_project": source, "language": "en",
+        "brief": ("Besi receives Koko's card photograph while they remain physically separate "
+                  "and never share the same room."),
+    })
+    production["cards"]["characters"] = [besi, koko]
+    segment = normalise_segment({
+        "title": "Card photograph", "story": "Besi studies Koko's card photograph.",
+        "setting": "Besi's room beside an open laptop.",
+        "action": "Besi tilts his head and smiles while Koko's laughter is heard through the phone.",
+        "ending": "Besi keeps smiling.", "duration": 5, "duration_reason": "final reaction",
+        "dialogue": [],
+        "image_prompt": ("Besi is visible behind the laptop showing one digital photograph of Koko's cream "
+                         "handwritten card. No split screen and no second room."),
+        "card_selection": {"characters": ["Besi"], "wardrobe": [], "props": [],
+                           "environments": [], "voices": []},
+        "cast_timeline": {"visible_start": ["Besi"], "visible_end": ["Besi"],
+                          "enters": [], "exits": [], "offscreen": ["Koko"],
+                          "mentioned_only": []},
+        "transition_mode": "insert", "device_view": "screen",
+    }, 1)
+
+    roles = character_presence_roles(production, segment)
+
+    assert roles[besi["id"]] == "physical"
+    assert roles[koko["id"]] == "offscreen"
+
+
 @pytest.mark.parametrize(("action", "image_prompt", "expected", "rejected"), [
     ("Koko looks at the phone and hesitates.", "Medium close-up on Koko's face.",
      "PERFORMANCE-VIEW GEOMETRY LOCK", "SCREEN-VIEW GEOMETRY LOCK"),
@@ -379,6 +416,59 @@ def test_remote_call_split_uses_separate_location_panels_not_a_phone_inside_a_ph
     assert "never occupy the same room" in lock
     assert "appear again inside a phone" in lock
     assert "SCREEN-VIEW GEOMETRY LOCK" not in lock
+
+
+def test_separate_room_language_forces_remote_panels_over_saved_performance_view():
+    koko, besi = _card("Koko"), _card("Besi")
+    production = {
+        "brief": "Koko and Besi remain physically separate.",
+        "cards": {**{kind: [] for kind in CARD_KINDS}, "characters": [koko, besi]},
+    }
+    segment = {
+        "device_view": "performance",
+        "story": "They talk remotely.",
+        "setting": "Split locations in their separate rooms.",
+        "action": "Alternating matching close-ups: Koko speaks, then Besi answers.",
+        "ending": "Each remains in a separate room.", "image_prompt": "Remote conversation",
+        "card_selection": {"characters": ["Koko", "Besi"]},
+        "cast_timeline": {"visible_start": ["Koko", "Besi"],
+                          "visible_end": ["Koko", "Besi"], "enters": [], "exits": [],
+                          "offscreen": [], "mentioned_only": []},
+        "dialogue": [],
+    }
+
+    roles = character_presence_roles(production, segment)
+    assert roles == {koko["id"]: "display", besi["id"]: "display"}
+    lock = device_screen_geometry_lock(segment, ["Koko", "Besi"])
+    assert "REMOTE-CALL PANEL GEOMETRY LOCK" in lock
+    assert "PHYSICAL GEOGRAPHY OVERRIDE" in lock
+    assert "PERFORMANCE-VIEW GEOMETRY LOCK" not in lock
+
+
+def test_laptop_only_scene_uses_static_display_instead_of_phone_geometry():
+    lock = device_screen_geometry_lock({
+        "story": "Besi reads a message on his laptop.",
+        "setting": "Besi's desk and computer monitor.",
+        "action": "The laptop display shows Koko's photograph while Besi reacts.",
+        "ending": "The photograph remains inside the laptop bezel.",
+        "image_prompt": "Laptop insert at a desk.",
+    }, ["Koko"])
+
+    assert "STATIC-DISPLAY GEOMETRY LOCK" in lock
+    assert "Do not invent a phone" in lock
+    assert "SCREEN-VIEW GEOMETRY LOCK" not in lock
+    assert "full-size physical copy" in lock
+
+
+def test_phone_screen_lock_forbids_two_copies_of_the_holder():
+    lock = device_screen_geometry_lock({
+        "story": "Koko checks a phone photograph.", "setting": "desk",
+        "action": "Over-the-shoulder insert of the phone screen.",
+        "ending": "Koko lowers the phone.", "image_prompt": "Phone screen insert",
+    })
+
+    assert "SCREEN-VIEW GEOMETRY LOCK" in lock
+    assert "two copies of the same identity" in lock
 
 
 def test_manual_device_view_overrides_conflicting_automatic_phone_framing():
@@ -572,6 +662,60 @@ B closes the gate while A waits.
     assert all("Production note" not in clip["story"] for clip in clips)
 
 
+def test_shot_timecode_body_excludes_next_part_metadata():
+    screenplay = """## Part 2: Sent Across the Distance
+
+**Time:** 00:10–00:20
+**Characters appearing:** Koko
+
+### Shot 1 | 00:10–00:15
+Koko photographs the card.
+
+### Shot 2 | 00:15–00:20
+Koko sends the photograph and turns the phone face down.
+
+---
+
+## Part 3: The Old Mood
+
+**Time:** 00:20–00:30
+**Duration:** 10s
+**Characters appearing:** Besi
+
+### Shot 1 | 00:20–00:30
+Besi enters his apartment and notices the phone.
+
+---
+
+## Production Continuity Notes
+
+The physical card remains in Koko's room.
+"""
+
+    beats = timed_story_beats(screenplay)
+
+    assert [(beat["start"], beat["end"]) for beat in beats] == [
+        (10, 15), (15, 20), (20, 30)]
+    assert "Part 3" not in beats[1]["text"]
+    assert "Duration" not in beats[1]["text"]
+    assert "Characters appearing" not in beats[1]["text"]
+    assert beats[1]["text"] == "Koko sends the photograph and turns the phone face down."
+    assert beats[2]["text"] == "Besi enters his apartment and notices the phone."
+    assert "Production Continuity Notes" not in beats[2]["text"]
+
+
+def test_long_timed_fallback_keeps_render_fields_inside_segment_schema():
+    screenplay = "0:00-0:10\n" + ("A crosses the room and records every visible production detail. " * 90)
+
+    clips = fallback_segments(screenplay, 10, "en")
+    segment = normalise_segment(clips[0], 0)
+
+    assert len(segment["story"]) <= 3000
+    assert len(segment["action"]) <= 3000
+    assert len(segment["image_prompt"]) <= 3000
+    assert "…" in segment["story"]
+
+
 def test_thirty_second_episode_targets_about_three_five_to_fifteen_second_clips(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({
@@ -643,6 +787,13 @@ def test_storyboard_planning_chunks_keep_long_local_answers_bounded():
     assert len(pieces) >= 5
     assert max(map(len, pieces)) <= 2000
     assert "".join(pieces).replace("\n", "") == story.replace("\n", "")
+
+
+def test_storyboard_output_budget_never_exceeds_local_client_limit():
+    assert storyboard_output_token_budget(1) == 3100
+    assert storyboard_output_token_budget(2) == 4096
+    assert storyboard_output_token_budget(20) == 4096
+    assert storyboard_output_token_budget(0) == 3100
 
 
 def test_merged_authored_clip_gets_local_action_timing_without_dialogue_copy():
@@ -1372,6 +1523,32 @@ def test_revised_prompt_releases_old_manually_selected_take(tmp_path):
     assert updated["segments"][0]["video_prompt"] == "current prompt"
 
 
+def test_post_render_repair_requires_explicit_calls_and_stops_after_three(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "title": "Quality review"})
+    production = manager.apply_plan(production["id"], [{
+        "title": "One careful action", "story": "A waits.", "setting": "room",
+        "action": "A waits.", "ending": "A looks up.", "duration": 5,
+        "duration_reason": "one beat", "image_prompt": "A waiting",
+        "dialogue": [], "card_selection": {},
+    }], "local_ai")
+    segment_id = production["segments"][0]["id"]
+
+    for attempt in range(1, 4):
+        production = manager.apply_quality_repair(
+            production["id"], segment_id,
+            "Keep exactly one physical instance of the visible character.")
+        segment = production["segments"][0]
+        assert segment["quality_repair_count"] == attempt
+        assert segment["status"] == "stale"
+        assert not segment["video_prompt"]
+
+    with pytest.raises(ValueError, match="three approved quality-repair attempts"):
+        manager.apply_quality_repair(
+            production["id"], segment_id,
+            "Keep exactly one physical instance of the visible character.")
+
+
 def test_ref2va_materialise_excludes_non_card_source_people_and_assets(tmp_path):
     manager, source, projects, _assets, store_asset = _rig(tmp_path)
     legacy_image = _image(store_asset, "legacy-yu", "gray")
@@ -1761,6 +1938,36 @@ def test_old_prepared_reference_strategy_keeps_adopted_take_ready(tmp_path):
     assert checked["cards"] == original_cards
     assert checked["segments"][0]["status"] == "ready"
     assert checked["segments"][0]["stale_reasons"] == []
+
+
+def test_old_device_geometry_prompt_marks_only_that_clip_for_rebuild(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A checks a phone, then waits."})
+    character = _card("A", [_image(store_asset, "a", "red")["id"]])
+    production["cards"]["characters"] = [character]
+    production = manager.save(production)
+    timeline = {"visible_start": ["A"], "visible_end": ["A"], "enters": [],
+                "exits": [], "offscreen": [], "mentioned_only": []}
+    phone = _planned_clip("A checks the phone", ["A"], timeline)
+    phone["action"] = "Insert shot: A checks the phone screen."
+    plain = _planned_clip("A waits", ["A"], timeline)
+    production = manager.apply_plan(production["id"], [phone, plain], "local_ai")
+    for row in list(production["segments"]):
+        result = manager.materialise(production["id"], row["id"])
+        project = result["project"]
+        prompt = compile_project(project)["prompt"]
+        production = manager.set_segment_prompt(
+            production["id"], row["id"], prompt, "compiled", 1.0, project["id"])
+
+    production["segments"][0]["video_prompt"] = production["segments"][0]["video_prompt"].replace(
+        "DEVICE GEOMETRY CONTRACT V2. ", "")
+    checked = manager.save(production)
+
+    assert checked["segments"][0]["status"] == "stale"
+    assert any("旧版设备构图规则" in reason
+               for reason in checked["segments"][0]["stale_reasons"])
+    assert checked["segments"][1]["status"] == "ready"
+    assert checked["segments"][1]["stale_reasons"] == []
 
 
 def test_generated_card_image_marks_only_clips_using_that_card_stale(tmp_path):
@@ -2344,3 +2551,309 @@ def test_same_count_replan_preserves_clip_and_take_links_as_stale(tmp_path):
     assert revised["project_id"] == original_project
     assert revised["last_video_run_id"] == last_run
     assert revised["status"] == "stale"
+
+
+def _continuity_state(opening, ending, names, *, mmh3):
+    positions = [{"character": name, "position": "left" if index == 0 else "right",
+                  "facing": "toward partner", "movement_direction": "still",
+                  "eyeline_target": names[1 - index] if len(names) == 2 else "camera",
+                  "eyeline_direction": "right" if index == 0 else "left"}
+                 for index, name in enumerate(names)]
+    return {"opening_state": opening, "ending_state": ending,
+            "positions_start": copy.deepcopy(positions), "positions_end": copy.deepcopy(positions),
+            "prop_holders_start": [], "prop_holders_end": [], "mmh3_eligible": mmh3}
+
+
+def _shot_contract(relation, role="master"):
+    return {"role": role, "shot_size": "medium", "opening_composition": "A left, B right",
+            "ending_composition": "A left, B right", "camera_axis": "A-B conversation axis",
+            "allow_axis_cross": False, "edit_reason": "dialogue_reaction",
+            "relation_previous": relation, "preserve_from_previous": "positions and card holder",
+            "must_change": "speaker reaction"}
+
+
+def test_new_planner_rejects_missing_source_reference(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A opens the door."})
+    production = manager.save(production)
+    manifest = production_source_manifest(production)
+    paragraph = manifest["chunks"][0]["paragraphs"][0]
+    clip = _planned_clip("A opens the door", [], {key: [] for key in
+        ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")}, "hard_cut")
+    clip["source_refs"] = {"scene_ids": [paragraph["scene_id"]], "paragraph_ids": [paragraph["id"]],
+                           "dialogue_ids": [], "event_ids": []}
+    clip["continuity_state"] = _continuity_state("closed door", "open door", [], mmh3=False)
+    clip["shot_contract"] = _shot_contract("hard_cut")
+    with pytest.raises(ValueError, match="missing event_ids"):
+        manager.apply_plan(production["id"], [clip], "local_ai")
+
+
+def test_each_local_story_part_is_rejected_immediately_when_its_tail_is_missing():
+    story = "Scene\nA opens the door.\nA crosses the room.\nA closes the window."
+    manifest = production_source_manifest({"brief": story, "episode_count": 1,
+                                           "episode_minutes": .5, "episodes": [],
+                                           "current_episode": 1})["chunks"][0]
+    clip = _planned_clip("A opens the door", [], {
+        "visible_start": [], "visible_end": [], "enters": [], "exits": [],
+        "offscreen": [], "mentioned_only": []}, "hard_cut")
+    clip["source_refs"] = {
+        "scene_ids": [manifest["scenes"][0]["id"]],
+        "paragraph_ids": [manifest["paragraphs"][0]["id"]],
+        "dialogue_ids": [],
+        "event_ids": [manifest["events"][0]["id"]],
+    }
+
+    with pytest.raises(ValueError, match="Storyboard part 1.*missing paragraph_ids"):
+        validate_planned_chunk_source_contract(story, 1, [clip])
+
+    clip["source_refs"] = {
+        "scene_ids": [manifest["scenes"][0]["id"]],
+        "paragraph_ids": [row["id"] for row in manifest["paragraphs"]],
+        "dialogue_ids": [row["id"] for row in manifest["dialogue"]],
+        "event_ids": [row["id"] for row in manifest["events"]],
+    }
+    overlong = copy.deepcopy(clip)
+    overlong["story"] = "x" * 3001
+    with pytest.raises(ValueError, match="story must be text with at most 3000 characters"):
+        validate_planned_chunk_source_contract(story, 1, [overlong])
+
+    validated = validate_planned_chunk_source_contract(story, 1, [clip])
+    assert validated[0]["story"] == clip["story"]
+    assert validated[0]["source_refs"] == clip["source_refs"]
+
+
+def test_source_coverage_and_adjacent_edit_contract_gate_video_prompt(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    brief = 'Scene 1\nA: "Hello."\nA gives the card to B.\nB: "Thanks."'
+    production = manager.create({"source_project": source, "brief": brief, "language": "en"})
+    production["cards"]["characters"] = [_card("A"), _card("B")]
+    production["cards"]["wardrobe"] = [_card("Blue coat"), _card("Red coat")]
+    production = manager.save(production)
+    chunk = production_source_manifest(production)["chunks"][0]
+    paragraphs = {row["text"]: row for row in chunk["paragraphs"]}
+    dialogue = chunk["dialogue"]
+    event = chunk["events"][0]
+    scene_id = chunk["scenes"][0]["id"]
+    first_timeline = {"visible_start": ["A", "B"], "visible_end": ["A", "B"],
+                      "enters": [], "exits": [], "offscreen": [], "mentioned_only": []}
+    second_timeline = {"visible_start": ["B"], "visible_end": ["B"],
+                       "enters": [], "exits": [], "offscreen": [], "mentioned_only": []}
+    first = _planned_clip("A greets and gives the card", ["A", "B"], first_timeline, "hard_cut")
+    first["dialogue"] = [{"speaker": "A", "text": "Hello.", "language": "English", "voiceover": False}]
+    first["source_refs"] = {"scene_ids": [scene_id],
+                            "paragraph_ids": [chunk["paragraphs"][0]["id"],
+                                              paragraphs['A: "Hello."']["id"], event["paragraph_id"]],
+                            "dialogue_ids": [dialogue[0]["id"]], "event_ids": [event["id"]]}
+    first["continuity_state"] = _continuity_state("A and B face each other", "B holds the card", ["A", "B"], mmh3=False)
+    first["continuity_state"]["prop_holders_end"] = [
+        {"prop": "phone", "holder": "B", "state": "portrait, screen facing B"}]
+    first["card_selection"]["wardrobe"] = ["Blue coat"]
+    first["shot_contract"] = _shot_contract("hard_cut")
+    second = _planned_clip("B answers", ["B"], second_timeline, "continuous")
+    second["dialogue"] = [{"speaker": "B", "text": "Thanks.", "language": "English", "voiceover": False}]
+    second["source_refs"] = {"scene_ids": [scene_id],
+                             "paragraph_ids": [paragraphs['B: "Thanks."']["id"]],
+                             "dialogue_ids": [dialogue[1]["id"]], "event_ids": []}
+    second["continuity_state"] = _continuity_state("B holds the card", "B lowers the card", ["B"], mmh3=True)
+    second["continuity_state"]["prop_holders_start"] = [
+        {"prop": "phone", "holder": "B", "state": "landscape, screen facing camera"}]
+    second["card_selection"]["wardrobe"] = ["Red coat"]
+    second["shot_contract"] = _shot_contract("continuous", "reaction")
+    production = manager.apply_plan(production["id"], [first, second], "local_ai")
+
+    assert production["coverage_report"]["status"] == "ok"
+    assert any(row["code"] == "sudden_character_disappearance"
+               for row in production["segments"][1]["continuity_issues"])
+    assert any(row["code"] == "prop_state_jump"
+               for row in production["segments"][1]["continuity_issues"])
+    assert any(row["code"] == "wardrobe_jump"
+               for row in production["segments"][1]["continuity_issues"])
+    first_project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    compiled = compile_project(first_project)
+    assert "SOURCE COVERAGE LOCK" in compiled["prompt"]
+    assert "SHOT EDIT CONTRACT" in compiled["prompt"]
+    with pytest.raises(ValueError, match="failed shot preflight"):
+        manager.materialise(production["id"], production["segments"][1]["id"])
+
+
+def test_shot_preflight_unifies_dialogue_camera_and_internal_cut_failures(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A explains the plan."})
+    production["cards"]["characters"] = [_card("A")]
+    segment = normalise_segment({
+        "title": "Overloaded shot", "story": "A explains the plan.", "setting": "Office",
+        "action": ("Wide shot. Cut to a close-up. Cut to an overhead view. "
+                   "A turns, walks, opens the case, points, sits, stands and crosses the room."),
+        "ending": "A faces camera.", "duration": 5, "duration_reason": "test",
+        "dialogue": [{"speaker": "A", "text": "This explanation contains far too many spoken words to fit naturally inside a five second shot.",
+                      "language": "English", "voiceover": False}],
+        "image_prompt": "", "card_selection": {"characters": ["A"], "wardrobe": [], "props": [],
+                                                    "environments": [], "voices": []},
+        "cast_timeline": {"visible_start": ["A"], "visible_end": ["A"], "enters": [], "exits": [],
+                          "offscreen": [], "mentioned_only": []},
+        "transition_mode": "hard_cut", "continuity_state": _continuity_state("A stands", "A stands", ["A"], mmh3=False),
+        "shot_contract": _shot_contract("hard_cut"),
+    }, 0)
+    issues = shot_preflight_for_segment(production, segment)
+    codes = {row["code"] for row in issues}
+    assert {"multiple_internal_cuts", "impossible_camera_change", "dialogue_overflow"} <= codes
+    assert any(row["code"] == "dense_action" and row["severity"] == "warning" for row in issues)
+
+
+def test_shot_preflight_blocks_a_match_cut_hidden_inside_a_sentence():
+    production = {"brief": "A remote exchange.",
+                  "cards": {kind: [] for kind in CARD_KINDS}}
+    segment = normalise_segment({
+        "title": "Across two rooms", "story": "Two people react in separate rooms.",
+        "setting": "Two apartments",
+        "action": "The image moves through a visual match cut from Koko's desk to Besi's laptop.",
+        "ending": "Besi reads the message.", "duration": 10,
+        "duration_reason": "one exchange", "dialogue": [], "image_prompt": "",
+        "transition_mode": "hard_cut",
+    }, 1)
+
+    issues = shot_preflight_for_segment(production, segment)
+    assert any(row["code"] == "internal_editorial_cut" and row["severity"] == "error"
+               for row in issues)
+
+
+def test_shot_preflight_does_not_count_one_repeated_match_cut_as_three_edits():
+    production = {"brief": "A remote exchange.",
+                  "cards": {kind: [] for kind in CARD_KINDS}}
+    segment = normalise_segment({
+        "title": "Connected card",
+        "story": "A visual match cut connects Koko's card to Besi's screen.",
+        "setting": "A match cut between two rooms.",
+        "action": "The image match-cuts from the paper card to its photograph.",
+        "ending": "Besi studies the photograph.", "duration": 5,
+        "duration_reason": "final visual rhyme", "dialogue": [], "image_prompt": "",
+        "transition_mode": "matched_cut",
+    }, 26)
+
+    issues = shot_preflight_for_segment(production, segment)
+
+    assert any(row["code"] == "internal_editorial_cut" and row["severity"] == "error"
+               for row in issues)
+    assert not any(row["code"] == "multiple_internal_cuts" for row in issues)
+
+
+def test_shot_preflight_allows_one_plain_cut_to_be_restaged_continuously():
+    production = {"brief": "Besi notices the state of his room.",
+                  "cards": {kind: [] for kind in CARD_KINDS}}
+    segment = normalise_segment({
+        "title": "Besi's realization",
+        "story": "Besi notices the mess and checks the card photo on his phone.",
+        "setting": "Besi's apartment",
+        "action": ("POV wide shot pans across dishes and laundry. Cut to Besi; his smile settles into a "
+                   "focused look before he glances at the phone in his hand."),
+        "ending": "Besi studies the phone.", "duration": 5,
+        "duration_reason": "brief reaction", "dialogue": [], "image_prompt": "",
+        "transition_mode": "hard_cut",
+    }, 13)
+
+    issues = shot_preflight_for_segment(production, segment)
+
+    assert any(row["code"] == "internal_cut" and row["severity"] == "warning" for row in issues)
+    assert not any(row["code"] == "internal_editorial_cut" for row in issues)
+
+
+def test_duplicate_cut_fields_are_reconciled_before_preflight():
+    # "continuous" in the descriptive contract must not silently enable
+    # saved-motion continuation when the operational field requested a cut.
+    assert reconcile_transition_contract("hard_cut", "continuous", 1) == "hard_cut"
+    # Preserve a more specific, still-discontinuous editorial cut instead of
+    # flattening every safe relation to the generic default.
+    assert reconcile_transition_contract("hard_cut", "matched_cut", 1) == "matched_cut"
+    assert reconcile_transition_contract("hard_cut", "time_jump", 1) == "time_jump"
+    # The first clip has no preceding clip regardless of model prose.
+    assert reconcile_transition_contract("continuous", "continuous", 0) == "hard_cut"
+
+    segment = normalise_segment({
+        "title": "Photograph the card", "story": "Koko photographs the card.",
+        "setting": "desk", "action": "Koko raises the phone.", "ending": "photo saved",
+        "duration": 5, "duration_reason": "authored timing", "dialogue": [],
+        "image_prompt": "", "transition_mode": "hard_cut",
+        "shot_contract": {"relation_previous": "continuous"},
+    }, 1)
+    assert segment["transition_mode"] == "hard_cut"
+    assert segment["shot_contract"]["relation_previous"] == "hard_cut"
+
+
+def test_modest_authored_dialogue_overrun_warns_but_large_overrun_blocks():
+    production = {"brief": "A and B exchange two short lines.",
+                  "cards": {kind: [] for kind in CARD_KINDS}}
+    compact = normalise_segment({
+        "title": "Brief exchange", "story": "A and B exchange two short lines.",
+        "setting": "room", "action": "They speak without an added pause.", "ending": "hold",
+        "duration": 5, "duration_reason": "authored timing",
+        "dialogue": [
+            {"speaker": "A", "text": "I have to look more handsome now.", "language": "English", "voiceover": False},
+            {"speaker": "B", "text": "You already do.", "language": "English", "voiceover": False},
+        ], "image_prompt": "", "transition_mode": "hard_cut",
+    }, 1)
+    compact_issues = shot_preflight_for_segment(production, compact)
+    assert any(row["code"] == "tight_dialogue" and row["severity"] == "warning"
+               for row in compact_issues)
+    assert not any(row["code"] == "dialogue_overflow" for row in compact_issues)
+
+    overloaded = copy.deepcopy(compact)
+    overloaded["dialogue"][0]["text"] = " ".join("word" for _ in range(45))
+    overloaded_issues = shot_preflight_for_segment(production, overloaded)
+    assert any(row["code"] == "dialogue_overflow" and row["severity"] == "error"
+               for row in overloaded_issues)
+
+
+def test_boundary_actions_save_verified_continuation_or_force_hard_cut(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A waits. A continues waiting."})
+    production["cards"]["characters"] = [_card("A")]
+    production = manager.save(production)
+    timeline = {"visible_start": ["A"], "visible_end": ["A"], "enters": [], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    production = manager.apply_plan(production["id"], [
+        _planned_clip("A waits", ["A"], timeline, "hard_cut"),
+        _planned_clip("A continues", ["A"], timeline, "hard_cut"),
+    ], "local_heuristic")
+    first, second = production["segments"]
+    run_id, asset_id = _id(), _id()
+    saved = manager.apply_boundary_action(
+        production["id"], first["id"], second["id"], run_id, "save", asset_id=asset_id)
+    assert saved["segments"][0]["ending_continuity_asset_id"] == asset_id
+    continued = manager.apply_boundary_action(
+        production["id"], first["id"], second["id"], run_id, "use_next",
+        asset_id=asset_id, can_continue=True)
+    assert continued["auto_continue_previous"] is True
+    assert continued["segments"][0]["selected_video_run_id"] == run_id
+    assert continued["segments"][1]["transition_mode"] == "continuous"
+    cut = manager.apply_boundary_action(
+        production["id"], first["id"], second["id"], run_id, "hard_cut")
+    assert cut["segments"][1]["continue_previous"] is False
+    assert cut["segments"][1]["shot_contract"]["relation_previous"] == "hard_cut"
+
+
+def test_empty_prop_state_schema_upgrade_does_not_mark_saved_clip_stale(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A checks the phone."})
+    production["cards"]["characters"] = [_card("A")]
+    production = manager.save(production)
+    timeline = {"visible_start": ["A"], "visible_end": ["A"], "enters": [], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    production = manager.apply_plan(production["id"], [
+        _planned_clip("A checks the phone", ["A"], timeline, "hard_cut")], "local_heuristic")
+    segment = production["segments"][0]
+    segment["continuity_state"] = _continuity_state("A holds phone", "A holds phone", ["A"], mmh3=False)
+    segment["continuity_state"]["prop_holders_start"] = [
+        {"prop": "phone", "holder": "A", "state": ""}]
+    production = manager.save(production)
+    materialised = manager.materialise(production["id"], production["segments"][0]["id"])["production"]
+    segment = materialised["segments"][0]
+
+    # Simulate the brief upgrade build which persisted the normalised empty
+    # state in its source hash. Current validation rebases it without asking the
+    # user to regenerate a prompt or video.
+    segment["source_hash"] = _segment_hash_with_empty_prop_state(segment)
+    loaded = manager.save(materialised)
+
+    assert loaded["segments"][0]["status"] == "ready"
+    assert loaded["segments"][0]["stale_reasons"] == []
+    assert loaded["segments"][0]["source_hash"] == segment_hash(loaded["segments"][0])

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Clapperboard, Clock3, Download, Film, FolderOpen, ImagePlus, LoaderCircle, Pause, Play, Plus, RefreshCw, Save, Search, Settings2, Sparkles, Square, Trash2, Upload, Video, X } from "lucide-react";
-import { api, apiPatch, downloadText } from "./api";
+import { api, apiPatch, ApiTimeoutError, downloadText } from "./api";
 import { localText, useUiLanguage, type UiLanguage } from "./i18n";
 import type { Project } from "./model";
 import SeriesWorkspace from "./SeriesWorkspace";
@@ -8,6 +8,11 @@ import VideoLibrary from "./VideoLibrary";
 import "./ProductionStudio.css";
 
 type Dialogue = { speaker:string; text:string; language:string; voiceover:boolean };
+type ContractIssue = {severity:"error"|"warning";code:string;message:string};
+type SourceRefs = {scene_ids:string[];paragraph_ids:string[];dialogue_ids:string[];event_ids:string[]};
+type ContinuityPosition = {character:string;position:string;facing:string;movement_direction:string;eyeline_target:string;eyeline_direction:string};
+type ContinuityState = {opening_state:string;ending_state:string;positions_start:ContinuityPosition[];positions_end:ContinuityPosition[];prop_holders_start:{prop:string;holder:string}[];prop_holders_end:{prop:string;holder:string}[];mmh3_eligible:boolean};
+type ShotContract = {role:string;shot_size:string;opening_composition:string;ending_composition:string;camera_axis:string;allow_axis_cross:boolean;edit_reason:string;relation_previous:string;preserve_from_previous:string;must_change:string};
 type DeviceViewMode = "auto"|"performance"|"screen"|"front_camera"|"phone_to_ear"|"remote_panel";
 type CardKind = "characters"|"wardrobe"|"props"|"environments"|"voices"|"styles";
 type SelectableCardKind = Exclude<CardKind,"styles">;
@@ -33,11 +38,14 @@ type Segment = {
   device_view?:DeviceViewMode;
   selected_video_run_id?:string|null; last_video_run_id?:string|null;
   card_selection?:Record<SelectableCardKind,string[]>; card_selection_source?:"local_ai"|"heuristic";
+  source_refs?:SourceRefs; continuity_state?:ContinuityState; shot_contract?:ShotContract;
+  coverage_issues?:ContractIssue[]; continuity_issues?:ContractIssue[]; preflight_issues?:ContractIssue[]; mmh3_allowed?:boolean;
+  ending_continuity_asset_id?:string|null;
 };
 type Production = {
   id:string; title:string; language:"zh-CN"|"zh-TW"|"en"|"ja"; brief:string; style_bible:string; character_bible:string;
   prompt_version:"classic"|"continuity_director"|"storyboard_narrative";
-  continuity_notes:string; series_voice_style:string; source_project_id:string; source_mode?:string; planner?:string|null; auto_merge:boolean; auto_continue_previous:boolean; task_state:"active"|"paused";
+  continuity_notes:string; series_voice_style:string; source_project_id:string; source_mode?:string; planner?:string|null; auto_merge:boolean; auto_continue_previous:boolean; auto_quality_review:boolean; task_state:"active"|"paused"; automation?:ProductionAutomation;
   planner_warning?:string|null; cards:CardLibrary; segments:Segment[];
   visual_style_preset:string; visual_style_custom:string; narrative_style:string; narrative_style_custom:string; narrative_notes:string;
   episode_count:number; episode_minutes:number; current_episode:number; episodes:Episode[];
@@ -48,12 +56,20 @@ type Production = {
   video_aspect_ratio:string; video_resolution:string; video_quality:"fast"|"detailed"|"lora8"; video_steps:"auto"|4|8|16;
   auto_keyframes_enabled:boolean; auto_keyframe_model:string;
   timings:{episode_plan_seconds?:number|null;storyboard_plan_seconds?:number|null;merge_seconds?:number|null};
+  coverage_report?:{status:"ok"|"error";issues:ContractIssue[];counts:{scenes:number;paragraphs:number;dialogue:number;events:number}};
+  continuity_report?:{status:"ok"|"warning"|"error";issues:(ContractIssue&{segment_index?:number})[]};
+  preflight_report?:{status:"ok"|"warning"|"error";issues:(ContractIssue&{segment_index?:number})[];checked_clips:number};
 };
 type ProductionPage = "projects"|"series"|"videos"|"cardsets"|"script"|"assets"|"episodes"|"storyboard"|"output"|"settings";
 type Summary = { id:string; title:string; segment_count:number; ready_count:number; updated_at:number; episode_count?:number;current_episode?:number };
-type ProductionVideoJob = { id:string; status:string; stage?:string; error?:string|null; operation?:string; seed?:number|null; duration?:number|null; new_seconds?:number|null; created_at?:number; elapsed_seconds?:number|null;server_execution_seconds?:number|null;output_folder?:string|null;width?:number; height?:number; video_url?:string|null; scene_video_url?:string|null };
-type ProductionOutputRow = { segment_id:string; index:number; title:string; project_id?:string|null; project_status:string; candidates:ProductionVideoJob[]; selected?:ProductionVideoJob|null; selection:"manual"|"latest" };
-type ProductionOutputs = { production_id:string; auto_merge:boolean; segments:ProductionOutputRow[]; selected_run_ids:string[]; all_ready:boolean; ready_count:number; segment_count:number; signature?:string|null; estimated_seconds:number; active_jobs:number; uncertain_jobs:number; timings:{episode_plan_seconds?:number|null;storyboard_plan_seconds?:number|null;prompt_generation_seconds?:number|null;video_generation_seconds?:number|null;merge_seconds?:number|null};final_ready:boolean; final_url?:string|null; download_url?:string|null; file_path?:string|null; folder_path?:string|null };
+type ReviewFrames = {status:"extracting"|"ready";first_url:string;middle_url:string;last_url:string;metrics?:Record<string,unknown>|null};
+type QualityReview = {status:"legacy"|"pending"|"reviewing"|"passed"|"warning"|"failed"|"manual_review";required:boolean;accepted:boolean;summary:string;issues:(ContractIssue&{confidence?:number;frame?:string;repair_instruction?:string})[];repair_direction?:string;reviewed_at?:number|null;visual_error?:string|null;overridden_at?:number|null;override_note?:string|null;legacy_take?:boolean};
+type BoundaryReview = {previous_segment_id:string;segment_id:string;previous_last_url:string;next_first_url:string;previous_middle_url:string;next_middle_url:string;frames_ready:boolean;planned_cast:{previous_end:string[];next_start:string[]};metrics:{brightness_delta?:number|null;temperature_delta?:number|null;histogram_delta?:number|null};issues:ContractIssue[];status:"ok"|"warning"|"error"};
+type ProductionVideoJob = { id:string; status:string; stage?:string; error?:string|null; operation?:string; seed?:number|null; duration?:number|null; new_seconds?:number|null; created_at?:number; elapsed_seconds?:number|null;server_execution_seconds?:number|null;output_folder?:string|null;width?:number; height?:number; video_url?:string|null; scene_video_url?:string|null;review_frames?:ReviewFrames;quality_review?:QualityReview;can_continue?:boolean;continuation_source?:string|null };
+type ProductionAutomation = {status:"idle"|"running"|"retrying"|"paused"|"needs_attention"|"completed";stage:string;stage_detail?:string;merge:boolean;current_segment_id?:string|null;current_index:number;completed:number;total:number;attempt:number;run_id?:string|null;last_error?:string;started_at?:number|null;updated_at?:number|null;finished_at?:number|null};
+type ProductionQualityBatch = {status:"running"|"completed"|"failed";legacy_only:boolean;reviewed_count:number;failed_count:number;started_at?:number|null;finished_at?:number|null;error?:string|null};
+type ProductionOutputRow = { segment_id:string; index:number; title:string; project_id?:string|null; project_status:string; candidates:ProductionVideoJob[]; selected?:ProductionVideoJob|null; selection:"manual"|"latest";boundary?:BoundaryReview|null;legacy_upgrade?:boolean };
+type ProductionOutputs = { production_id:string; auto_merge:boolean; automation?:ProductionAutomation;quality_batch?:ProductionQualityBatch|null; segments:ProductionOutputRow[]; selected_run_ids:string[]; all_ready:boolean; quality_ready:boolean; quality_pending_count:number;legacy_upgrade_count:number;legacy_unreviewed_count:number;blocking_stale_count:number; ready_count:number; segment_count:number; signature?:string|null; estimated_seconds:number; active_jobs:number; uncertain_jobs:number; timings:{episode_plan_seconds?:number|null;storyboard_plan_seconds?:number|null;prompt_generation_seconds?:number|null;video_generation_seconds?:number|null;merge_seconds?:number|null};final_ready:boolean; final_url?:string|null; download_url?:string|null; file_path?:string|null; folder_path?:string|null };
 
 export const segmentNeedsVideoPrompt=(segment:Segment)=>
   !segment.video_prompt?.trim()||segment.status!=="ready"||!segment.project_id||!!segment.stale_reasons?.length;
@@ -67,6 +83,17 @@ export const videoPromptTargets=(segments:Segment[],force=false)=>
   force?segments:segments.filter(segmentNeedsVideoPrompt);
 export const videoRenderTargets=(segments:Segment[],outputs:ProductionOutputs|null|undefined,force=false)=>
   force?segments:segments.filter(segment=>!segmentHasCompletedVideo(segment,outputs));
+export const selectedClipTargets=(segments:Segment[],selectedIds:Iterable<string>)=>{
+  const selected=new Set(selectedIds);
+  return segments.filter(segment=>selected.has(segment.id));
+};
+export const qualityAcceptanceTargets=(outputs:ProductionOutputs|null|undefined)=>
+  outputs?.segments.flatMap(row=>{
+    const take=row.candidates.find(job=>
+      job.status==="succeeded"&&!!job.video_url&&
+      job.quality_review?.status==="failed"&&!job.quality_review.accepted);
+    return take?[{segment_id:row.segment_id,run_id:take.id,index:row.index,title:row.title}]:[];
+  })||[];
 
 const blank = (project:Project) => ({
   // A new episode/part is deliberately empty. The current Scene Studio
@@ -1051,16 +1078,39 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const [cardSetDetails,setCardSetDetails]=useState<Record<string,CardCollectionDetail>>({});
   const [openEpisodeId,setOpenEpisodeId]=useState<string|null>(null);
   const [openSegmentId,setOpenSegmentId]=useState<string|null>(null);
+  const [selectedSegmentIds,setSelectedSegmentIds]=useState<string[]>([]);
+  const [selectedQualityRunIds,setSelectedQualityRunIds]=useState<string[]>([]);
   const [outputs,setOutputs]=useState<ProductionOutputs|null>(null);
   const [outputsLoading,setOutputsLoading]=useState(false);
   const [merging,setMerging]=useState(false);
-  const [bulkAction,setBulkAction]=useState<""|"prompts"|"redo-prompts"|"videos"|"redo-videos"|"all"|"full">("");
+  const [bulkAction,setBulkAction]=useState<""|"prompts"|"redo-prompts"|"videos"|"redo-videos"|"selected"|"all"|"full">("");
   const autoMergeAttempt=useRef("");
+  const automation=outputs?.automation;
+  const automationActive=automation?.status==="running"||automation?.status==="retrying";
   const totalSeconds=useMemo(()=>production?.segments.reduce((n,s)=>n+s.duration,0)||0,[production?.segments]);
   const currentEpisodeTiming=useMemo(()=>episodeTiming(production?.episode_minutes||draft.episode_minutes),[production?.episode_minutes,draft.episode_minutes]);
   const currentEpisodeForPlan=production?.episodes.find(episode=>episode.index===production.current_episode)||production?.episodes[0];
   const ready=production?.segments.filter(s=>s.status==="ready").length||0;
   const stale=production?.segments.filter(s=>s.status==="stale").length||0;
+  const legacyUpgradeCount=outputs?.legacy_upgrade_count||0;
+  const legacyUnreviewedCount=outputs?.legacy_unreviewed_count||0;
+  const blockingStaleCount=outputs?.blocking_stale_count??Math.max(0,stale-legacyUpgradeCount);
+  const legacyOnlyReady=legacyUpgradeCount>0&&blockingStaleCount===0&&(outputs?.ready_count||0)===production?.segments.length;
+  const legacyReviewRunning=outputs?.quality_batch?.status==="running";
+  const selectedSegmentSet=useMemo(()=>new Set(selectedSegmentIds),[selectedSegmentIds]);
+  const qualityOverrideTargets=useMemo(()=>qualityAcceptanceTargets(outputs),[outputs]);
+  const selectedQualityRunSet=useMemo(()=>new Set(selectedQualityRunIds),[selectedQualityRunIds]);
+  const qualityOverrideKey=qualityOverrideTargets.map(item=>item.run_id).join("|");
+  const automationAttentionText=automation?.stage==="quality"&&qualityOverrideTargets.length?t(
+    "生成后质检有 "+qualityOverrideTargets.length+" 个不合格版本等待你决定。它们没有被采用，也不会自动重做。请到“视频一览与输出”逐项查看；可勾选后批量判定合格，或单独批准修复并重做。",
+    qualityOverrideTargets.length+" rejected post-render takes need your decision. They were not adopted or rerendered. Review them in Project videos and output, then batch-accept selected takes or approve individual repairs.",
+    "生成後の品質検査で不合格となった "+qualityOverrideTargets.length+" 件が判断待ちです。自動採用・再生成はされません。「プロジェクト映像と出力」で確認し、選択分を一括承認するか、個別の修正再生成を承認してください。",
+    "生成後質檢有 "+qualityOverrideTargets.length+" 個不合格版本等待你決定。它們沒有被採用，也不會自動重做。請到「影片一覽與輸出」逐項查看；可勾選後批量判定合格，或單獨批准修復並重做。"
+  ):automation?.last_error;
+  const updateCandidateIds=useMemo(()=>production?.segments.filter(segment=>
+    segment.status==="stale"||!!segment.stale_reasons?.length||
+    !!outputs?.segments.find(row=>row.segment_id===segment.id)?.legacy_upgrade
+  ).map(segment=>segment.id)||[],[production?.segments,outputs?.segments]);
   const overviewKind=OVERVIEW_CARD_KINDS.includes(cardKind as OverviewCardKind)?cardKind as OverviewCardKind:null;
   const filteredItems=useMemo(()=>{const query=projectQuery.trim().toLocaleLowerCase();return query?items.filter(item=>item.title.toLocaleLowerCase().includes(query)):items;},[items,projectQuery]);
   const filteredCollections=useMemo(()=>{const query=cardSetQuery.trim().toLocaleLowerCase();return query?collections.filter(item=>item.name.toLocaleLowerCase().includes(query)):collections;},[collections,cardSetQuery]);
@@ -1072,6 +1122,18 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   },[filteredItems,items,production?.id,projectPage]);
   useEffect(()=>setProjectPage(0),[projectQuery]);
   useEffect(()=>{if(projectPage>=projectPages)setProjectPage(projectPages-1);},[projectPage,projectPages]);
+  useEffect(()=>setSelectedSegmentIds([]),[production?.id]);
+  useEffect(()=>setSelectedQualityRunIds([]),[production?.id]);
+  useEffect(()=>setSelectedSegmentIds(current=>{
+    const existing=new Set(production?.segments.map(segment=>segment.id)||[]);
+    const next=current.filter(id=>existing.has(id));
+    return next.length===current.length?current:next;
+  }),[production?.segments]);
+  useEffect(()=>setSelectedQualityRunIds(current=>{
+    const available=new Set(qualityOverrideKey?qualityOverrideKey.split("|"):[]);
+    const next=current.filter(id=>available.has(id));
+    return next.length===current.length?current:next;
+  }),[qualityOverrideKey]);
 
   const refreshList=async()=>setItems(await api("/productions"));
   const refreshCollections=async()=>setCollections(await api("/card-collections"));
@@ -1092,9 +1154,29 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   useEffect(()=>{if(!production)setDraft(blank(project));},[project.id]);
   useEffect(()=>{pauseRequestedRef.current=production?.task_state==="paused";},[production?.id,production?.task_state]);
 
+  const timeoutMessage=()=>t(
+    "Studio 的连接等待超时，但不代表任务失败；服务器可能仍在继续。项目状态已经重新核对，请不要连续重复点击。若仍显示处理中，等待片刻后刷新即可。",
+    "The Studio connection timed out, but the task may still be running. The project state has been checked again. Do not submit the same action repeatedly; if it still shows as active, wait briefly and refresh.",
+    "Studioへの接続待機がタイムアウトしましたが、処理は継続中の場合があります。プロジェクト状態を再確認しました。同じ操作を連打せず、処理中なら少し待って更新してください。",
+    "Studio 連線等待逾時，但不代表任務失敗；伺服器可能仍在繼續。專案狀態已重新核對，請勿連續重複點擊。若仍顯示處理中，稍候再重新整理。"
+  );
+  const reconcileAfterTimeout=async(id=production?.id)=>{
+    if(!id)return null;
+    try{
+      const [current,overview]=await Promise.all([
+        api("/productions/"+id) as Promise<Production>,
+        api("/productions/"+id+"/outputs") as Promise<ProductionOutputs>,
+      ]);
+      setProduction(current);setDraft(current);setOutputs(overview);
+      return overview;
+    }catch{return null;}
+  };
   const run=async(label:string,fn:()=>Promise<void>)=>{
     if(busyRef.current)return;busyRef.current=true;setBusy(label);setError("");setNotice("");
-    try{await fn();}catch(e){setError((e as Error).message);}finally{busyRef.current=false;setBusy("");}
+    try{await fn();}catch(e){
+      if(e instanceof ApiTimeoutError){await reconcileAfterTimeout();setNotice(timeoutMessage());}
+      else setError((e as Error).message);
+    }finally{busyRef.current=false;setBusy("");}
   };
   const focusCardLibrary=()=>requestAnimationFrame(()=>requestAnimationFrame(()=>
     document.getElementById("production-card-library")?.scrollIntoView({behavior:"smooth",block:"start"})));
@@ -1110,7 +1192,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     if(!value)return create();
     const next=await apiPatch("/productions/"+value.id,{
       title:value.title,brief:value.brief,style_bible:value.style_bible,
-       language:value.language,prompt_version:value.prompt_version,auto_merge:value.auto_merge,auto_continue_previous:value.auto_continue_previous,
+       language:value.language,prompt_version:value.prompt_version,auto_merge:value.auto_merge,auto_continue_previous:value.auto_continue_previous,auto_quality_review:value.auto_quality_review!==false,
       video_aspect_ratio:value.video_aspect_ratio,video_resolution:value.video_resolution,video_quality:value.video_quality,video_steps:value.video_steps,
       auto_keyframes_enabled:value.auto_keyframes_enabled,auto_keyframe_model:value.auto_keyframe_model,
       character_bible:value.character_bible,continuity_notes:value.continuity_notes,
@@ -1125,7 +1207,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     const current=production?await save():await create();
     const next=await api("/productions/"+current.id+"/plan",{use_ai:useAI},undefined,undefined,{timeoutMs:900000});
     setProduction(next);setDraft(next);setKeyframeSuggestions([]);await refreshList();
-    setNotice(next.planner==="local_ai"?t("本地 AI 已按本集目标总时长拆分，并为每段选择 5–15 秒时长。","Local AI matched the episode target and selected 5–15 seconds for each clip.","ローカルAIが話の目標尺に合わせ、各クリップを5〜15秒に設定しました。","本地 AI 已按本集目標總時長拆分，並為每段選擇 5–15 秒時長。"):t("已用本地动态时长规则完成拆分。","Dynamic local timing is complete.","ローカル動的時間推定が完了しました。","已用本地動態時長規則完成拆分。"));
+    setNotice(next.planner==="local_ai"?t("本地 AI 已按本集目标总时长拆分，并为每段选择 5–15 秒时长。","Local AI matched the episode target and selected 5–15 seconds for each clip.","ローカルAIが話の目標尺に合わせ、各クリップを5〜15秒に設定しました。","本地 AI 已按本集目標總時長拆分，並為每段選擇 5–15 秒時長。"):t("已按你的选择使用本地规则建立可编辑草稿。","An editable local-rule draft was created as requested.","選択に従い、編集可能なローカルルール案を作成しました。","已依你的選擇使用本地規則建立可編輯草稿。"));
   });
   const planCards=()=>run(t("AI 分析剧本并补全文字卡","AI analyse script and complete text cards","AIで脚本を分析して文章カードを補完","AI 分析劇本並補全文字卡"),async()=>{
     const saved=await save();
@@ -1391,6 +1473,13 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     });
   };
 
+  const toggleSegmentSelection=(segmentId:string)=>setSelectedSegmentIds(current=>
+    current.includes(segmentId)?current.filter(id=>id!==segmentId):[...current,segmentId]);
+  const selectUpdateCandidates=()=>setSelectedSegmentIds(current=>{
+    const allSelected=updateCandidateIds.length>0&&updateCandidateIds.every(id=>current.includes(id));
+    return allSelected?current.filter(id=>!updateCandidateIds.includes(id)):
+      Array.from(new Set([...current,...updateCandidateIds]));
+  });
   const prepareOne=(segment:Segment,open=false)=>run(t("准备 H3 分镜工程","Prepare H3 clip project","H3クリッププロジェクトを準備","準備 H3 分鏡專案"),async()=>{
     if(open&&production?.task_state==="paused"&&segment.project_id){await onOpenProject(segment.project_id);onStudio();return;}
     const saved=await save();
@@ -1417,6 +1506,67 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     const value=await apiPatch("/productions/"+production.id+"/segments/"+row.segment_id+"/video",{run_id:runId||null}) as ProductionOutputs;
     autoMergeAttempt.current="";setOutputs(value);
   });
+  const reviewTake=async(row:ProductionOutputRow,take:ProductionVideoJob)=>run(t("质检视频版本","Review video take","映像テイクを検査","質檢影片版本"),async()=>{
+    if(!production)return;
+    const result=await api("/productions/"+production.id+"/segments/"+row.segment_id+"/runs/"+take.id+"/quality",{force:true},undefined,"POST",{timeoutMs:300000}) as {outputs:ProductionOutputs};
+    setOutputs(result.outputs);autoMergeAttempt.current="";
+    const review=result.outputs.segments.find(item=>item.segment_id===row.segment_id)?.candidates.find(item=>item.id===take.id)?.quality_review;
+    setNotice(review?.status==="failed"?t("质检发现明确问题：该版本不会被采用。请先查看证据，再决定是否批准修复重做。","Quality review found a clear defect. This take will not be adopted. Review the evidence before approving a repair rerender.","品質検査で明確な問題が見つかりました。このテイクは採用されません。証拠を確認してから修正再生成を承認してください。","質檢發現明確問題：此版本不會被採用。請先查看證據，再決定是否批准修復重做。"):t("本段视频质检已完成。","This take's quality review is complete.","このテイクの品質検査が完了しました。","本段影片質檢已完成。"));
+  });
+  const reviewLegacyVideos=async()=>run(t("批量质检旧版视频","Review legacy videos","旧版映像を一括検査","批量質檢舊版影片"),async()=>{
+    if(!production||!legacyUnreviewedCount||legacyReviewRunning)return;
+    if(!window.confirm(t("将只检查当前采用的 "+legacyUnreviewedCount+" 个旧版视频，不会修改分镜、提示词或重新生成视频。继续吗？","Review the "+legacyUnreviewedCount+" currently adopted legacy takes only? Storyboards and prompts will not be changed, and no video will be rerendered.","現在採用中の旧版映像 "+legacyUnreviewedCount+" 件だけを検査します。絵コンテやプロンプトは変更せず、映像も再生成しません。続けますか？","只會檢查目前採用的 "+legacyUnreviewedCount+" 個舊版影片，不會修改分鏡、提示詞或重新生成影片。繼續嗎？")))return;
+    const result=await api("/productions/"+production.id+"/quality",{legacy_only:true},undefined,"POST",{timeoutMs:30000}) as {quality_batch:ProductionQualityBatch;outputs:ProductionOutputs};
+    setOutputs(result.outputs);autoMergeAttempt.current="";
+    setNotice(t("旧版视频质检已在后台启动。可离开当前页面；不会修改分镜、提示词或重做视频，完成后结果会自动刷新。","Legacy video review started in the background. You may leave this page. It will not change storyboards or prompts or rerender videos, and results refresh automatically.","旧版映像の検査をバックグラウンドで開始しました。このページを離れても構いません。絵コンテやプロンプトは変更せず、映像も再生成しません。結果は自動更新されます。","舊版影片質檢已在背景啟動。可離開目前頁面；不會修改分鏡、提示詞或重做影片，完成後結果會自動重新整理。"));
+  });
+  const approveQualityRepair=async(row:ProductionOutputRow,take:ProductionVideoJob)=>run(t("批准修复并重做","Approve repair and rerender","修正と再生成を承認","批准修復並重做"),async()=>{
+    if(!production)return;
+    if(!window.confirm(t("将把质检要求加入本段提示词，并在后台生成一个新版本。失败版本会保留但不会采用。继续吗？","Add the review repair requirements to this clip and render a new take in the background? The rejected take is kept but not adopted.","品質検査の修正条件をこのクリップに追加し、バックグラウンドで新しいテイクを生成します。不合格テイクは保持されますが採用されません。続けますか？","會把質檢要求加入本段提示詞，並在背景生成新版本。失敗版本會保留但不採用。繼續嗎？")))return;
+    const result=await api("/productions/"+production.id+"/segments/"+row.segment_id+"/runs/"+take.id+"/quality/approve-repair",{},undefined,"POST",{timeoutMs:30000}) as {production:Production;outputs:ProductionOutputs};
+    setProduction(result.production);setDraft(result.production);setOutputs(result.outputs);autoMergeAttempt.current="";
+    setNotice(t("已人工批准修复；后台将只重建本段并生成新版本。","Repair approved. The background queue will rebuild only this clip and create a new take.","修正を承認しました。バックグラウンドでこのクリップだけを再構築し、新しいテイクを生成します。","已人工批准修復；背景會只重建本段並生成新版本。"));
+  });
+  const acceptQualityOverride=async(row:ProductionOutputRow,take:ProductionVideoJob)=>run(t("人工判定合格","Accept after human review","手動で合格にする","人工判定合格"),async()=>{
+    if(!production)return;
+    if(!window.confirm(t("你已查看该版本和质检证据，并确认它可以进入最终合片吗？原质检问题会保留在记录中。","Have you reviewed this take and its QC evidence and confirmed that it may enter the final assembly? The original QC findings remain in the record.","このテイクと品質検査の証拠を確認し、最終結合への使用を承認しますか？元の検査結果は記録に残ります。","你已查看此版本和質檢證據，並確認它可以進入最終合片嗎？原質檢問題會保留在記錄中。")))return;
+    const result=await api("/productions/"+production.id+"/segments/"+row.segment_id+"/runs/"+take.id+"/quality/accept",{},undefined,"POST",{timeoutMs:30000}) as {outputs:ProductionOutputs};
+    setOutputs(result.outputs);autoMergeAttempt.current="";
+    setNotice(t("已记录人工判定合格；此版本现可作为采用版本进入合片。","Human acceptance recorded. This take may now be adopted and assembled.","手動承認を記録しました。このテイクを採用して結合できます。","已記錄人工判定合格；此版本現在可作為採用版本進入合片。"));
+  });
+  const acceptSelectedQualityOverrides=async()=>run(t("批量判定合格","Accept selected takes","選択テイクを一括承認","批量判定合格"),async()=>{
+    if(!production||!selectedQualityRunIds.length)return;
+    const selected=new Set(selectedQualityRunIds);
+    const items=qualityOverrideTargets.filter(item=>selected.has(item.run_id));
+    if(!items.length)return;
+    if(!window.confirm(t(
+      "你已逐一查看所选 "+items.length+" 个视频及其质检证据，并确认全部可以进入最终合片吗？这是人工放行，不会删除原质检问题，也不会自动重做视频。",
+      "Have you reviewed the "+items.length+" selected takes and their QC evidence and confirmed that every one may enter the final assembly? This is a human release: original findings remain and no video is rerendered.",
+      "選択した "+items.length+" 件のテイクと品質検査証拠を個別に確認し、すべて最終結合に使用できると判断しましたか？手動承認のため、元の検査結果は保持され、映像は再生成されません。",
+      "你已逐一查看所選 "+items.length+" 個影片及其質檢證據，並確認全部可進入最終合片嗎？這是人工放行，不會刪除原質檢問題，也不會自動重做影片。"
+    )))return;
+    const result=await api("/productions/"+production.id+"/quality/accept",{
+      items:items.map(item=>({segment_id:item.segment_id,run_id:item.run_id})),
+    },undefined,"POST",{timeoutMs:30000}) as {accepted_count:number;outputs:ProductionOutputs};
+    setOutputs(result.outputs);setSelectedQualityRunIds([]);autoMergeAttempt.current="";
+    setNotice(t(
+      "已批量人工放行 "+result.accepted_count+" 个版本；原质检问题仍保留，采用版本现可进入合片。",
+      result.accepted_count+" takes were manually released. Original QC findings remain, and the adopted takes may now enter assembly.",
+      result.accepted_count+" 件を手動で一括承認しました。元の品質検査結果は保持され、採用テイクを結合に使用できます。",
+      "已批量人工放行 "+result.accepted_count+" 個版本；原質檢問題仍保留，採用版本現在可進入合片。"
+    ));
+  });
+  const boundaryAction=async(row:ProductionOutputRow,action:"save"|"use_next"|"hard_cut")=>run(
+    action==="save"?t("保存连续性帧","Save continuity frame","連続性フレームを保存","儲存連續性影格"):
+    action==="use_next"?t("用于下一镜头","Use for next shot","次ショットに使用","用於下一鏡頭"):
+    t("改为普通硬切","Use a normal hard cut","通常のハードカットに変更","改為普通硬切"),async()=>{
+      if(!production)return;
+      const result=await api("/productions/"+production.id+"/boundaries/"+row.segment_id,{action}) as {production:Production;outputs:ProductionOutputs;asset_id?:string|null};
+      setProduction(result.production);setDraft(result.production);setOutputs(result.outputs);autoMergeAttempt.current="";
+      setNotice(action==="save"?t("已把上一段实际最后一帧保存为连续性帧。","The preceding take's actual final frame was saved for continuity.","前のテイクの実際の最終フレームを連続性用に保存しました。","已把上一段實際最後一影格儲存為連續性影格。"):
+        action==="use_next"?t("已指定下一镜头使用上一段采用版本的 MMH3 结尾状态；请重做下一段提示词与视频。","The next shot now uses the adopted preceding take's MMH3 ending state. Regenerate its prompt and video.","次ショットは前の採用テイクのMMH3終了状態を使用します。次のプロンプトと映像を再生成してください。","已指定下一鏡頭使用上一段採用版本的 MMH3 結尾狀態；請重做下一段提示詞與影片。"):
+        t("下一段已改为普通硬切，不再错误续接上一段末帧。","The next clip now uses a normal hard cut and will not inherit the previous ending.","次クリップを通常のハードカットに変更し、前の終端を継承しません。","下一段已改為普通硬切，不再錯誤續接上一段末幀。"));
+    });
   const setAutoMerge=async(enabled:boolean)=>{
     if(!production)return;
     setProduction({...production,auto_merge:enabled});
@@ -1438,12 +1588,25 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     try{
       const value=await apiPatch("/productions/"+production.id,{task_state:state}) as Production;
       pauseRequestedRef.current=state==="paused";
-      setProduction(value);setDraft(value);await refreshList();
+      setProduction(value);setDraft(value);
+      if(state==="active"&&outputs?.automation?.status==="paused"){
+        const resumed=await api("/productions/"+production.id+"/automation/start",{merge:true},undefined,"POST",{timeoutMs:30000}) as {production:Production;outputs:ProductionOutputs};
+        setProduction(resumed.production);setDraft(resumed.production);setOutputs(resumed.outputs);
+      }
+      await refreshList();
       setNotice(state==="paused"?queuePausedNotice():t(
-        "制作任务已恢复。已完成内容仍然保留；点“继续完成本集”即可只处理缺失部分。",
-        "Production resumed. Completed work is still preserved; choose Resume episode to process only missing work.",
-        "制作タスクを再開しました。完成済み内容は保持されています。「この話を続行」で不足分だけを処理できます。",
-        "製作任務已恢復。已完成內容仍然保留；點「繼續完成本集」即可只處理缺失部分。"));
+        outputs?.automation?.status==="paused"
+          ?"制作任务已恢复，后台会从缺失片段自动继续；已完成内容不会重做。"
+          :"制作任务已恢复。已完成内容仍然保留；点“继续完成本集”即可只处理缺失部分。",
+        outputs?.automation?.status==="paused"
+          ?"Production resumed. The background queue continues automatically from missing clips; completed work is not regenerated."
+          :"Production resumed. Completed work is still preserved; choose Resume episode to process only missing work.",
+        outputs?.automation?.status==="paused"
+          ?"制作を再開しました。バックグラウンドキューは不足クリップから自動的に続行し、完成済み内容は再生成しません。"
+          :"制作タスクを再開しました。完成済み内容は保持されています。「この話を続行」で不足分だけを処理できます。",
+        outputs?.automation?.status==="paused"
+          ?"製作任務已恢復，背景會從缺失片段自動繼續；已完成內容不會重做。"
+          :"製作任務已恢復。已完成內容仍然保留；點「繼續完成本集」即可只處理缺失部分。"));
     }catch(e){
       if(state==="paused")pauseRequestedRef.current=false;
       setError((e as Error).message);
@@ -1491,10 +1654,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     return()=>{active=false;window.clearInterval(timer);};
   },[production?.id]);
   useEffect(()=>{
-    if(production?.task_state==="paused"||bulkAction||!production?.auto_merge||!outputs?.all_ready||outputs.active_jobs>0||outputs.uncertain_jobs>0||outputs.final_ready||!outputs.signature||merging)return;
+    if(production?.task_state==="paused"||bulkAction||automationActive||!production?.auto_merge||!outputs?.all_ready||outputs.active_jobs>0||outputs.uncertain_jobs>0||outputs.final_ready||!outputs.signature||merging)return;
     if(autoMergeAttempt.current===outputs.signature)return;
     autoMergeAttempt.current=outputs.signature;void buildFilm(true);
-  },[production?.task_state,production?.auto_merge,outputs?.all_ready,outputs?.active_jobs,outputs?.uncertain_jobs,outputs?.final_ready,outputs?.signature,merging,bulkAction]);
+  },[production?.task_state,production?.auto_merge,outputs?.all_ready,outputs?.active_jobs,outputs?.uncertain_jobs,outputs?.final_ready,outputs?.signature,merging,bulkAction,automationActive]);
 
   const rebuildPrompt=(segment:Segment,useAI=true)=>run(useAI?t("用本地 LLM 重做视频提示词","Rebuild video prompt with local LLM","ローカルLLMで映像プロンプトを再作成","用本地 LLM 重做影片提示詞"):t("按当前结构重建视频提示词","Recompile current video prompt","現在の構造から映像プロンプトを再構築","按目前結構重建影片提示詞"),async()=>{
     let saved=await save();
@@ -1608,6 +1771,49 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         t("缺失的 "+targets.length+" 段视频已全部完成；原有完成版本未重复生成。","All "+targets.length+" missing videos are complete; existing takes were not regenerated.","不足していた "+targets.length+" 件の映像が完了しました。既存テイクは再生成していません。","缺失的 "+targets.length+" 段影片已全部完成；原有完成版本未重複生成。"));
     }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production?.id,true);}
   };
+  const regenerateSelectedSegments=async()=>{
+    if(busyRef.current||!production||!selectedSegmentIds.length)return;
+    const requested=selectedClipTargets(production.segments,selectedSegmentIds);
+    if(!requested.length)return;
+    if(!window.confirm(t(
+      "将依次更新选中的 "+requested.length+" 段视频提示词并重新生成视频。旧提示词、旧视频和旧成片都会保留；不会重新规划分镜。继续吗？",
+      "Update prompts and rerender the "+requested.length+" selected clips in order? Existing prompts, takes and films are kept, and the storyboard will not be replanned.",
+      "選択した "+requested.length+" 件のプロンプトを更新し、映像を順番に再生成します。旧プロンプト・テイク・完成版は保持され、絵コンテは再計画しません。続けますか？",
+      "將依序更新選取的 "+requested.length+" 段影片提示詞並重新生成影片。舊提示詞、舊影片和舊成片都會保留；不會重新規劃分鏡。繼續嗎？")))return;
+    pauseRequestedRef.current=false;busyRef.current=true;setBulkAction("selected");setError("");setNotice("");
+    try{
+      let current=await save();
+      const targetIds=new Set(requested.map(segment=>segment.id));
+      const targets=current.segments.filter(segment=>targetIds.has(segment.id));
+      let overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;
+      setOutputs(overview);
+      if(overview.uncertain_jobs>0)overview=await resolveUncertainVideoJobs(overview,current.id);
+      if(overview.active_jobs>0)throw new Error(t("已有视频任务正在运行，请等待或停止后再处理选中分镜。","A video job is already running. Wait for it to finish or stop it before processing the selection.","映像処理中です。完了または停止後に選択クリップを処理してください。","已有影片任務正在執行，請等待或停止後再處理選取分鏡。"));
+      for(let index=0;index<targets.length;index++){
+        stopIfPauseRequested();
+        current=await ensureSegmentCharacterImages(current,targets[index].id);
+        let target=current.segments.find(segment=>segment.id===targets[index].id)||targets[index];
+        setBusy(t("选中分镜 "+(index+1)+"/"+targets.length+"：更新第 "+target.index+" 段提示词","Selected clips "+(index+1)+"/"+targets.length+": updating prompt for clip "+target.index,"選択クリップ "+(index+1)+"/"+targets.length+"：クリップ "+target.index+" のプロンプトを更新","選取分鏡 "+(index+1)+"/"+targets.length+"：更新第 "+target.index+" 段提示詞"));
+        const promptResult=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as {production:Production};
+        current=promptResult.production;setProduction(current);setDraft(current);
+        target=current.segments.find(segment=>segment.id===target.id)||target;
+        setBusy(t("选中分镜 "+(index+1)+"/"+targets.length+"：生成第 "+target.index+" 段视频","Selected clips "+(index+1)+"/"+targets.length+": rendering clip "+target.index,"選択クリップ "+(index+1)+"/"+targets.length+"：クリップ "+target.index+" を生成","選取分鏡 "+(index+1)+"/"+targets.length+"：生成第 "+target.index+" 段影片"));
+        const submitted=await submitVideoWithPromptRepair(current,target);
+        current=submitted.production;setProduction(current);setDraft(current);
+        let job=submitted.run as ProductionVideoJob;
+        while(["preparing","queued","running","uncertain"].includes(job.status)){
+          await sleep(5000);job=await api("/video/runs/"+job.id) as ProductionVideoJob;
+          overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
+        }
+        stopIfPauseRequested();
+        if(job.status!=="succeeded")throw new Error(t("选中分镜批量重做停在第 "+target.index+" 段：","Selected rebuild stopped at clip "+target.index+": ","選択クリップの再生成はクリップ "+target.index+" で停止しました：","選取分鏡批量重做停在第 "+target.index+" 段：")+(job.error||job.stage||job.status));
+        setSelectedSegmentIds(value=>value.filter(id=>id!==target.id));
+      }
+      await refreshList();
+      setNotice(t("选中的 "+targets.length+" 段已完成提示词更新和视频重做；旧版本仍可在结果区查看。","Updated prompts and rendered new takes for all "+targets.length+" selected clips. Earlier versions remain available in Results.","選択した "+targets.length+" 件のプロンプト更新と映像再生成が完了しました。旧版は結果画面に残っています。","選取的 "+targets.length+" 段已完成提示詞更新和影片重做；舊版本仍可在結果區查看。"));
+    }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}
+    finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production.id,true);}
+  };
   const generateEpisodeFilm=async(options:{full?:boolean}={})=>{
     const full=!!options.full;
     if(busyRef.current||!production||(!full&&!production.segments.length))return;
@@ -1685,59 +1891,29 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         }
       }
 
-      const staleVideoSegmentIds=new Set(current.segments.filter(segment=>segment.status==="stale").map(segment=>segment.id));
-      const promptTargets=current.segments.filter(segmentNeedsVideoPrompt);
-      for(let i=0;i<promptTargets.length;i++){
-        stopIfPauseRequested();
-        const target=current.segments.find(item=>item.id===promptTargets[i].id)||promptTargets[i];
-        setBusy(full?t("全流程 · 第 4/6 步：视频提示词 "+(i+1)+"/"+promptTargets.length,"Full run · Step 4/6: video prompts "+(i+1)+"/"+promptTargets.length,"全工程・ステップ4/6：映像プロンプト "+(i+1)+"/"+promptTargets.length,"全流程 · 第 4/6 步：影片提示詞 "+(i+1)+"/"+promptTargets.length):t("一键生成 · 第 1/3 步：提示词 "+(i+1)+"/"+promptTargets.length,"One-click production · Step 1/3: prompts "+(i+1)+"/"+promptTargets.length,"一括制作・ステップ1/3：プロンプト "+(i+1)+"/"+promptTargets.length,"一鍵生成 · 第 1/3 步：提示詞 "+(i+1)+"/"+promptTargets.length));
-        const result=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as any;
-        current=result.production;setProduction(current);setDraft(current);
-      }
-
-      overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
-      const videoTargets=current.segments.filter(segment=>
-        staleVideoSegmentIds.has(segment.id)||!segmentHasCompletedVideo(segment,overview));
-      for(let i=0;i<videoTargets.length;i++){
-        stopIfPauseRequested();
-        let target=current.segments.find(item=>item.id===videoTargets[i].id)||videoTargets[i];
-        if(!staleVideoSegmentIds.has(target.id)&&segmentHasCompletedVideo(target,overview))continue;
-        // Re-check immediately before submission. A preceding prompt repair can
-        // legitimately change downstream continuity and make a later clip
-        // stale after the initial prompt-target snapshot was calculated.
-        if(segmentNeedsVideoPrompt(target)){
-          setBusy(full?t("全流程 · 第 4/6 步：提交前同步第 "+target.index+" 段提示词","Full run · Step 4/6: sync clip "+target.index+" prompt before submission","全工程・ステップ4/6：送信前にクリップ "+target.index+" のプロンプトを同期","全流程 · 第 4/6 步：提交前同步第 "+target.index+" 段提示詞"):t("一键生成 · 提交前同步第 "+target.index+" 段提示词","One-click production · sync clip "+target.index+" prompt before submission","一括制作・送信前にクリップ "+target.index+" のプロンプトを同期","一鍵生成 · 提交前同步第 "+target.index+" 段提示詞"));
-          const repaired=await api("/productions/"+current.id+"/segments/"+target.id+"/prompt",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as {production:Production};
-          current=repaired.production;setProduction(current);setDraft(current);
-          target=current.segments.find(item=>item.id===target.id)||target;
-        }
-        setBusy(full?t("全流程 · 第 5/6 步：提交视频 "+(i+1)+"/"+videoTargets.length,"Full run · Step 5/6: submit video "+(i+1)+"/"+videoTargets.length,"全工程・ステップ5/6：映像を送信 "+(i+1)+"/"+videoTargets.length,"全流程 · 第 5/6 步：提交影片 "+(i+1)+"/"+videoTargets.length):t("一键生成 · 第 2/3 步：提交视频 "+(i+1)+"/"+videoTargets.length,"One-click production · Step 2/3: submit video "+(i+1)+"/"+videoTargets.length,"一括制作・ステップ2/3：映像を送信 "+(i+1)+"/"+videoTargets.length,"一鍵生成 · 第 2/3 步：提交影片 "+(i+1)+"/"+videoTargets.length));
-        const submitted=await submitVideoWithPromptRepair(current,target);
-        current=submitted.production;setProduction(current);setDraft(current);
-        let job=submitted.run as ProductionVideoJob;
-        while(["preparing","queued","running","uncertain"].includes(job.status)){
-          setBusy(full?t("全流程 · 第 5/6 步：渲染 "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status),"Full run · Step 5/6: rendering "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status),"全工程・ステップ5/6：レンダー "+(i+1)+"/"+videoTargets.length+"・"+(job.stage||job.status),"全流程 · 第 5/6 步：渲染 "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status)):t("一键生成 · 第 2/3 步：渲染 "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status),"One-click production · Step 2/3: rendering "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status),"一括制作・ステップ2/3：レンダー "+(i+1)+"/"+videoTargets.length+"・"+(job.stage||job.status),"一鍵生成 · 第 2/3 步：渲染 "+(i+1)+"/"+videoTargets.length+" · "+(job.stage||job.status)));
-          await sleep(5000);
-          job=await api("/video/runs/"+job.id) as ProductionVideoJob;
-          overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
-        }
-        stopIfPauseRequested();
-        if(job.status!=="succeeded")throw new Error(t("一键生成停在第 "+target.index+" 段：","One-click production stopped at clip "+target.index+": ","一括制作はクリップ "+target.index+" で停止しました：","一鍵生成停在第 "+target.index+" 段：")+(job.error||job.stage||job.status));
-        overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
-      }
-
-      overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
-      if(!overview.all_ready)throw new Error(t("仍有片段没有可采用的视频，一键生成已在合片前停止。","Some clips still have no adoptable video. One-click production stopped before assembly.","採用できる映像がないクリップが残っているため、結合前に一括制作を停止しました。","仍有片段沒有可採用的影片，一鍵生成已在合片前停止。"));
       stopIfPauseRequested();
-      setBusy(full?t("全流程 · 第 6/6 步：合并最终成片","Full run · Step 6/6: assembling final film","全工程・ステップ6/6：最終映像を結合","全流程 · 第 6/6 步：合併最終成片"):t("一键生成 · 第 3/3 步：合并最终成片","One-click production · Step 3/3: assembling final film","一括制作・ステップ3/3：最終映像を結合","一鍵生成 · 第 3/3 步：合併最終成片"));
-      setMerging(true);
-      overview=await api("/productions/"+current.id+"/film",{},undefined,"POST",{timeoutMs:1800000}) as ProductionOutputs;
-      setOutputs(overview);await refreshList();
-      setProductionPage("output");
-      setNotice(full?t("全流程完成：文字卡、剧集规划、分镜、提示词、视频和最终成片均已处理。","Full run complete: text cards, episode plan, storyboard, prompts, videos and final assembly are ready.","全工程が完了しました。文章カード、エピソード計画、絵コンテ、プロンプト、映像、最終結合を処理しました。","全流程完成：文字卡、劇集規劃、分鏡、提示詞、影片和最終成片均已處理。"):t("整集已完成：提示词、视频和最终成片均已按分镜顺序生成。","The episode is complete: prompts, videos and the final film were produced in storyboard order.","全話が完成しました。プロンプト・映像・最終映像を絵コンテ順に生成しました。","整集已完成：提示詞、影片和最終成片均已按分鏡順序生成。"));
+      setBusy(full?t("全流程 · 已交给后台持续制作","Full run · handing off to the durable background queue","全工程・バックグラウンドキューへ引き継ぎ","全流程 · 已交給背景持續製作"):t("正在启动可恢复的一键任务","Starting the resumable episode queue","再開可能な一括タスクを開始中","正在啟動可恢復的一鍵任務"));
+      const queued=await api("/productions/"+current.id+"/automation/start",{merge:true},undefined,"POST",{timeoutMs:30000}) as {automation:ProductionAutomation;production:Production;outputs:ProductionOutputs};
+      current=queued.production;overview=queued.outputs;
+      setProduction(current);setDraft(current);setOutputs(overview);setProductionPage("output");await refreshList();
+      setNotice(t(
+        "后台任务已启动。现在可以刷新页面或切换页面；系统会保存当前片段和请求编号，短暂断线会自动重试，完成全部缺失片段后自动合片。",
+        "The durable background run has started. You may reload or leave this page; the current clip and request ID are persisted, transient failures retry automatically, and the final film is assembled after all missing clips finish.",
+        "永続バックグラウンドタスクを開始しました。ページの再読み込みや移動が可能です。現在のクリップとリクエストIDを保存し、一時的な障害は自動再試行、未完成クリップ完了後に自動結合します。",
+        "背景任務已啟動。現在可以重新整理或切換頁面；系統會儲存目前片段和請求編號，短暫斷線會自動重試，完成全部缺失片段後自動合片。"));
     }catch(e){
       const reason=(e as Error).message;
       if(isPauseRequestError(e)){setNotice(queuePausedNotice());}
+      else if(e instanceof ApiTimeoutError){
+        const reconciled=await reconcileAfterTimeout(currentId);
+        if(reconciled?.automation&&["running","retrying"].includes(reconciled.automation.status)){
+          setNotice(t(
+            "前端等待超时，但后台一键任务已经确认在运行。无需重按；页面会继续刷新进度。",
+            "The browser wait timed out, but the background one-click run is confirmed active. Do not submit it again; this page will keep refreshing its progress.",
+            "画面の待機はタイムアウトしましたが、バックグラウンドの一括処理は実行中です。再送せず、このページの進捗更新を待ってください。",
+            "前端等待逾時，但背景一鍵任務已確認正在執行。無需重按；頁面會繼續重新整理進度。"));
+        }else setNotice(timeoutMessage());
+      }
       else setError(t(
         "一键流程已暂停，已经完成的提示词和视频均已保存。请确认 H3 Studio 与 ComfyUI 正在运行，再点“继续完成本集”即可从缺失处接着做。原因：",
         "One-click production paused. Completed prompts and videos are saved. Make sure H3 Studio and ComfyUI are running, then choose Resume episode to continue only the missing work. Reason: ",
@@ -1746,13 +1922,18 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       )+reason);
     }finally{setMerging(false);busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(currentId,true);}
   };
+  const upgradeLegacyClips=async()=>{
+    if(!production||!legacyUpgradeCount)return;
+    if(!window.confirm(t("将把 "+legacyUpgradeCount+" 段旧版工程升级到当前分镜与连续性规则，并为这些段生成新提示词和新视频。旧视频和旧成片仍会保留。继续吗？","Upgrade "+legacyUpgradeCount+" legacy clip projects to the current storyboard and continuity rules and create new prompts and takes? Existing videos and films will remain available.",legacyUpgradeCount+" 件の旧版クリップを現在の絵コンテと連続性ルールへ更新し、新しいプロンプトと映像を作成します。旧映像と旧完成版は保持されます。続けますか？","將把 "+legacyUpgradeCount+" 段舊版工程升級到目前分鏡與連續性規則，並為這些片段生成新提示詞和新影片。舊影片和舊成片仍會保留。繼續嗎？")))return;
+    await generateEpisodeFilm();
+  };
   const stopVideo=async(job:ProductionVideoJob)=>{
     const action=async()=>{
     await api("/video/runs/"+job.id+"/cancel",{},undefined,"POST",{timeoutMs:30000});
     await refreshOutputs(production?.id,true);
     setNotice(t("当前视频任务已停止。ComfyUI 视频无法从中点恢复；可回到该片段重新生成。","The current video task was stopped. ComfyUI cannot resume mid-render; regenerate that clip when ready.","現在の映像タスクを停止しました。途中再開はできないため、必要ならクリップを再生成してください。","目前影片任務已停止。ComfyUI 無法從中點恢復；可回到該片段重新生成。"));
     };
-    if(bulkAction==="videos"||bulkAction==="redo-videos"||bulkAction==="all"||bulkAction==="full"){
+    if(bulkAction==="videos"||bulkAction==="redo-videos"||bulkAction==="selected"||bulkAction==="all"||bulkAction==="full"){
       try{await action();}catch(e){setError((e as Error).message);}
       return;
     }
@@ -1837,15 +2018,17 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       </div>
       <div className="production-full-runner-actions">
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
-        <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
-          {bulkAction==="full"?<LoaderCircle className="spin" size={18}/>:<Sparkles size={18}/>}<span>{bulkAction==="full"?t("全流程运行中…","Full run in progress…","全工程を実行中…","全流程執行中…"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
+        <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
+          {bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:<Sparkles size={18}/>}<span>{automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
         </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy||(production.task_state==="paused"&&!!busy)} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
-          {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存状态…","Saving state…","状態を保存中…","正在儲存狀態…"):production.task_state==="paused"?t("恢复任务","Resume task","タスクを再開","恢復任務"):busy?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
+          {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存状态…","Saving state…","状態を保存中…","正在儲存狀態…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
         </button></div>
       </div>
     </section>}
     {(error||notice)&&<div className={error?"production-alert error":"production-alert"}>{error||notice}</div>}
     {busy&&<div className="production-progress"><LoaderCircle className="spin" size={18}/><span>{busy}</span></div>}
+    {automationActive&&<div className="production-automation-status"><LoaderCircle className="spin" size={18}/><div><strong>{t("后台正在持续制作","Durable background production is running","バックグラウンド制作を継続中","背景正在持續製作")}</strong><span>{automation?.stage_detail||automation?.stage} · {automation?.completed||0}/{automation?.total||production?.segments.length||0}{automation?.current_index?" · "+t("第 "+automation.current_index+" 段","Clip "+automation.current_index,"クリップ "+automation.current_index,"第 "+automation.current_index+" 段"):""}{automation?.status==="retrying"?" · "+t("自动重试 "+automation.attempt,"Auto retry "+automation.attempt,"自動再試行 "+automation.attempt,"自動重試 "+automation.attempt):""}</span></div></div>}
+    {automation?.status==="needs_attention"&&<div className="production-alert error"><strong>{t("后台任务需要处理：","Background production needs attention: ","バックグラウンドタスクを確認してください：","背景任務需要處理：")}</strong>{automationAttentionText}</div>}
 
     {productionPage==="projects"&&<section className="production-projects card">
       <div className="section-title production-projects-title"><div><span className="eyebrow">EPISODES · CLIPS</span><h2><FolderOpen size={21}/>{t("剧集 / 片段管理","Episodes & clips","エピソード／クリップ管理","劇集／片段管理")}</h2><p>{t("这里管理每集拆分出的制作片段；整部剧的分集编排与最终合片请到“剧本管理”。普通单镜头工程仍在“镜头工作室 → 已保存项目”。","Manage production parts split from episodes here. Use Script management for the whole story and final assembly. Single-scene projects remain in Scene Studio → Saved projects.","各話から分けた制作パートを管理します。全編の話数構成と結合は「脚本管理」で行います。単一シーンはシーンスタジオの保存済みプロジェクトにあります。","這裡管理每集拆分出的製作片段；整部劇的分集編排與最終合片請到「劇本管理」。普通單鏡頭工程仍在「鏡頭工作室 → 已儲存專案」。")}</p></div><button className="primary" onClick={startNewProduction}><Plus size={18}/>{t("新建剧集 / 片段","New episode / clip part","エピソード／クリップを作成","新建劇集／片段")}</button></div>
@@ -1997,10 +2180,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <section className="production-overview" hidden={productionPage!=="storyboard"}>
         <div><strong>{production.segments.length}</strong><span>{t("个动态片段","dynamic clips","個の動的クリップ","個動態片段")}</span></div>
         <div><strong>{totalSeconds}s / {currentEpisodeTiming.targetSeconds}s</strong><span>{t("生成时长 / 本集目标（续写重叠未扣除）","generated / episode target (before continuation overlap)","生成尺 / 話の目標（継続重複を除く前）","生成時長／本集目標（續寫重疊未扣除）")}</span></div>
-        <div><strong>{ready}</strong><span>{t("已准备 H3 工程","H3 projects ready","準備済みH3プロジェクト","已準備 H3 專案")}</span></div>
-        <div><strong>{stale}</strong><span>{t("修改后待重建","stale after changes","変更後・再構築待ち","修改後待重建")}</span></div>
+        <div><strong>{ready}</strong><span>{t("当前规则 H3 工程","Current-rule H3 projects","現行ルールのH3プロジェクト","目前規則 H3 專案")}</span></div>
+        <div className={legacyOnlyReady?"legacy-available":blockingStaleCount>0?"blocking-stale":""}><strong>{legacyOnlyReady?(outputs?.ready_count||0):blockingStaleCount}</strong><span>{legacyOnlyReady?t("旧版视频可用 · 升级可选","Legacy videos usable · upgrade optional","旧版映像を使用可・更新任意","舊版影片可用 · 升級可選"):t("内容变更后需要更新","updates required after content changes","内容変更後に更新が必要","內容變更後需要更新")}</span></div>
       </section>
-      {productionPage==="storyboard"&&!!production.segments.length&&Math.abs(totalSeconds-currentEpisodeTiming.targetSeconds)>1&&<div className="storyboard-fallback-warning card"><div><strong>{t("当前分镜总时长没有对齐本集目标","Storyboard duration does not match the episode target","絵コンテの合計尺が話の目標と一致していません","目前分鏡總時長未對齊本集目標")}</strong><span>{t("目前是 "+totalSeconds+" 秒，目标是 "+currentEpisodeTiming.targetSeconds+" 秒。直接重做提示词或视频不会增加缺少的剧情；请先重新 AI 规划，或手动调整片段时长。角色资料库和旧视频版本会保留。","The storyboard is "+totalSeconds+"s, while the target is "+currentEpisodeTiming.targetSeconds+"s. Rebuilding prompts or videos will not create the missing story time. Replan with AI or adjust clip durations manually; the character library and earlier takes are preserved.","現在は"+totalSeconds+"秒、目標は"+currentEpisodeTiming.targetSeconds+"秒です。プロンプトや映像の再作成だけでは不足する物語尺は増えません。AIで再計画するか、各クリップ尺を手動調整してください。人物資料庫と旧テイクは保持されます。","目前為 "+totalSeconds+" 秒，目標為 "+currentEpisodeTiming.targetSeconds+" 秒。只重做提示詞或影片不會補上缺少的劇情；請先重新 AI 規劃，或手動調整片段時長。角色資料庫與舊影片版本會保留。")}</span></div><button className="primary" disabled={production.task_state==="paused"||!!busy} onClick={()=>void plan(true)}><Sparkles size={17}/>{t("按目标时长重新 AI 规划","Replan to target duration","目標尺に合わせてAIで再計画","依目標時長重新 AI 規劃")}</button></div>}
+      {productionPage==="storyboard"&&!!production.segments.length&&Math.abs(totalSeconds-currentEpisodeTiming.targetSeconds)>1&&<div className={"storyboard-fallback-warning card"+(legacyOnlyReady?" legacy-duration":"")}><div><strong>{legacyOnlyReady?t("旧版成片时长与当前目标不同","Legacy film length differs from the current target","旧版完成映像の尺が現在の目標と異なります","舊版成片時長與目前目標不同"):t("当前分镜总时长没有对齐本集目标","Storyboard duration does not match the episode target","絵コンテの合計尺が話の目標と一致していません","目前分鏡總時長未對齊本集目標")}</strong><span>{legacyOnlyReady?t("现有分镜与成片是 "+totalSeconds+" 秒，仍可正常查看和使用；当前目标为 "+currentEpisodeTiming.targetSeconds+" 秒。只有确实要补足时长时才需要重新规划，旧视频不会被删除。","The existing storyboard and film are "+totalSeconds+"s and remain usable; the current target is "+currentEpisodeTiming.targetSeconds+"s. Replan only if you actually want to fill the duration. Existing takes will not be deleted.","既存の絵コンテと完成版は"+totalSeconds+"秒で、そのまま使用できます。現在の目標は"+currentEpisodeTiming.targetSeconds+"秒です。尺を補いたい場合だけ再計画してください。旧テイクは削除されません。","現有分鏡與成片為 "+totalSeconds+" 秒，仍可正常查看和使用；目前目標為 "+currentEpisodeTiming.targetSeconds+" 秒。只有確實要補足時長時才需要重新規劃，舊影片不會被刪除。"):t("目前是 "+totalSeconds+" 秒，目标是 "+currentEpisodeTiming.targetSeconds+" 秒。直接重做提示词或视频不会增加缺少的剧情；请先重新 AI 规划，或手动调整片段时长。角色资料库和旧视频版本会保留。","The storyboard is "+totalSeconds+"s, while the target is "+currentEpisodeTiming.targetSeconds+"s. Rebuilding prompts or videos will not create the missing story time. Replan with AI or adjust clip durations manually; the character library and earlier takes are preserved.","現在は"+totalSeconds+"秒、目標は"+currentEpisodeTiming.targetSeconds+"秒です。プロンプトや映像の再作成だけでは不足する物語尺は増えません。AIで再計画するか、各クリップ尺を手動調整してください。人物資料庫と旧テイクは保持されます。","目前為 "+totalSeconds+" 秒，目標為 "+currentEpisodeTiming.targetSeconds+" 秒。只重做提示詞或影片不會補上缺少的劇情；請先重新 AI 規劃，或手動調整片段時長。角色資料庫與舊影片版本會保留。")}</span></div><button className="primary" disabled={production.task_state==="paused"||!!busy} onClick={()=>void plan(true)}><Sparkles size={17}/>{legacyOnlyReady?t("可选：按目标时长重新规划","Optional: replan to target","任意：目標尺へ再計画","可選：依目標時長重新規劃"):t("按目标时长重新 AI 规划","Replan to target duration","目標尺に合わせてAIで再計画","依目標時長重新 AI 規劃")}</button></div>}
       <section className="production-timings card" hidden={productionPage!=="output"} aria-label={t("制作耗时","Production timings","制作所要時間","製作耗時")}>
         <div className="production-timings-title"><Clock3 size={19}/><div><strong>{t("制作耗时记录","Production timing","制作時間の記録","製作耗時記錄")}</strong><span>{t("显示本机实际完成用时；视频为当前采用版本累计，等待和模型装载也计入总耗时。","Actual local elapsed time. Video is the sum of adopted takes; total elapsed time includes waiting and model loading.","このPCでの実測時間です。映像は採用テイクの合計で、待機とモデル読込も総時間に含みます。","顯示本機實際完成用時；影片為目前採用版本累計，等待和模型載入也計入總耗時。")}</span></div></div>
         <div className="production-timing-grid"><div><span>{t("剧集规划","Episode planning","エピソード計画","劇集規劃")}</span><strong>{formatSeconds(outputs?.timings.episode_plan_seconds??production.timings?.episode_plan_seconds)}</strong></div><div><span>{t("分镜 / 剧本规划","Storyboard planning","絵コンテ計画","分鏡／劇本規劃")}</span><strong>{formatSeconds(outputs?.timings.storyboard_plan_seconds??production.timings?.storyboard_plan_seconds)}</strong></div><div><span>{t("视频提示词","Video prompts","映像プロンプト","影片提示詞")}</span><strong>{formatSeconds(outputs?.timings.prompt_generation_seconds)}</strong></div><div><span>{t("视频生成（采用版本）","Video renders (adopted)","映像生成（採用分）","影片生成（採用版本）")}</span><strong>{formatSeconds(outputs?.timings.video_generation_seconds)}</strong></div><div><span>{t("最终合并","Final assembly","最終結合","最終合併")}</span><strong>{formatSeconds(outputs?.timings.merge_seconds??production.timings?.merge_seconds)}</strong></div></div>
@@ -2020,6 +2203,9 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           <div className="production-auto-keyframes-head"><div><strong>{t("自动接续上一段结尾","Continue from the preceding clip automatically","前のクリップの結末から自動継続","自動接續上一段結尾")}</strong><p>{t("默认关闭。开启后按分镜顺序生成时，下一段会使用上一段已采用视频保存的 .mmh3 动作与声音状态；首段会自动保存续接状态。前段未完成或没有有效状态时会停下提示，不会偷偷改成普通新镜头。只支持内置 H3 参考图流程；续接段最多 13 秒新画面，合片会自动去掉重叠开头。","Off by default. In storyboard order, each following clip uses the adopted preceding take's verified .mmh3 motion and audio state. The first clip saves that state. Missing state stops with an explanation rather than silently starting a new shot. Built-in H3 reference workflows only; continued clips support up to 13 seconds of new footage. Assembly removes the repeated opening.","初期設定はオフ。順番に生成すると前クリップの採用テイクに保存された.mmH3の動きと音声を継承します。元データがなければ停止します。内蔵H3参照フロー専用、継続部分の新規映像は最大13秒です。結合時に重複部分を除きます。","預設關閉。按分鏡順序生成時，下一段使用上一段採用影片儲存的 .mmh3 動作與聲音狀態；首段會儲存續接狀態。前段未完成或無有效狀態時會停止提示，不會暗中改為新鏡頭。僅支援內置 H3 參考圖流程；續接段最多 13 秒新畫面，合片會去掉重疊開頭。")}</p></div><label className="auto-merge"><input type="checkbox" checked={!!production.auto_continue_previous} onChange={e=>updateField("auto_continue_previous",e.target.checked)}/><span>{production.auto_continue_previous?t("已开启","On","オン","已開啟"):t("关闭","Off","オフ","關閉")}</span></label></div>
         </div>
         <div className="production-auto-keyframes">
+          <div className="production-auto-keyframes-head"><div><strong>{t("视频生成后自动质检","Automatic post-render quality review","映像生成後の自動品質検査","影片生成後自動質檢")}</strong><p>{t("新视频完成后检查媒体、首中末帧、角色数量与重复、身份和画风、手机道具及远程人物空间关系。不合格版本不会自动采用，也不会自行重做；你可以查看证据后选择“人工判定合格”，或批准修复并重做（每段最多 3 次）。视觉模型不可用时只做基础检查并提示人工复核。","After a new take finishes, check its media, sampled frames, cast count/duplicates, identity/style, phone and prop handling, and remote-character staging. Rejected takes are neither adopted nor rerendered automatically. After reviewing the evidence, you may accept the take manually or approve a repair rerender (up to three per clip). If vision is unavailable, only deterministic checks run and manual review is requested.","新しいテイクの完了後、メディア、先頭・中間・最終フレーム、人物数と重複、同一性・画風、端末・小道具、遠隔人物の空間関係を確認します。不合格テイクは自動採用も自動再生成もしません。証拠を確認後、手動合格にするか、修正再生成（各クリップ最大3回）を承認できます。視覚モデルが使えない場合は基本検査のみ行います。","新影片完成後檢查媒體、首中末影格、角色數量與重複、身份和畫風、手機道具及遠端人物空間關係。不合格版本不會自動採用，也不會自行重做；你可查看證據後選擇「人工判定合格」，或批准修復並重做（每段最多 3 次）。視覺模型不可用時只做基礎檢查並提示人工複核。")}</p></div><label className="auto-merge"><input type="checkbox" checked={production.auto_quality_review!==false} onChange={e=>updateField("auto_quality_review",e.target.checked)}/><span>{production.auto_quality_review!==false?t("已开启","On","オン","已開啟"):t("关闭","Off","オフ","關閉")}</span></label></div>
+        </div>
+        <div className="production-auto-keyframes">
           <div className="production-auto-keyframes-head"><div><strong>{t("自动补环境关键帧","Automatic environment keyframes","背景キーフレームの自動補完","自動補環境關鍵影格")}</strong><p>{t("默认关闭。开启后，一键生成会在提示词和视频之前，为缺少环境参考的新场景最多生成 3 张背景图；已有参考图或片段关键帧时跳过。不会占用 H3 的 9 个参考图位。","Off by default. When enabled, one-click production first makes up to three background images for new locations missing environment references. Existing references and keyframes are skipped. These do not use H3's nine image slots.","初期設定はオフ。オンにすると、一括制作時に背景参照のない新しい場所へ最大3枚の背景画像を先に生成します。既存の参照やキーフレームは省略し、H3の9画像枠は使用しません。","預設關閉。開啟後，一鍵生成會先為缺少環境參考的新場景補最多 3 張背景圖；已有參考圖或關鍵影格則跳過，不佔 H3 的 9 個參考圖位。")}</p></div><label className="auto-merge"><input type="checkbox" checked={!!production.auto_keyframes_enabled} onChange={e=>updateField("auto_keyframes_enabled",e.target.checked)}/><span>{production.auto_keyframes_enabled?t("已开启","On","オン","已開啟"):t("关闭","Off","オフ","關閉")}</span></label></div>
           {production.auto_keyframes_enabled&&<div className="production-auto-keyframes-controls"><label>{t("本地生图模型","Local image model","ローカル画像モデル","本地生圖模型")}<select value={production.auto_keyframe_model} onChange={e=>updateField("auto_keyframe_model",e.target.value)}>{Array.from(new Set([production.auto_keyframe_model,...models])).filter(Boolean).map(model=><option key={model} value={model}>{model}{!models.includes(model)?t(" · 当前未检测到"," · not detected","・未検出"," · 目前未偵測到"):""}</option>)}</select></label><button onClick={()=>void run(t("检查自动关键帧建议","Preview automatic keyframes","自動キーフレーム案を確認","檢查自動關鍵影格建議"),async()=>{const saved=await save();const result=await api("/productions/"+saved.id+"/keyframe-suggestions") as {suggestions:{segment_id:string;index:number;reason:string;prompt:string}[]};setAutoKeyframeSuggestions(result.suggestions);})}>{t("预览建议","Preview suggestions","候補を確認","預覽建議")}</button></div>}
           {production.auto_keyframes_enabled&&autoKeyframeSuggestions.length>0&&<div className="production-auto-keyframes-preview"><strong>{t("本次预计补图","Suggested images","生成候補","本次預計補圖")}</strong>{autoKeyframeSuggestions.map(item=><div key={item.segment_id}><b>{t("第 "+item.index+" 段","Clip "+item.index,"クリップ "+item.index,"第 "+item.index+" 段")}</b><span>{t("新场景缺少环境参考图","New location lacks an environment reference","新しい場所に背景参照がありません","新場景缺少環境參考圖")}</span></div>)}</div>}
@@ -2034,30 +2220,40 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <section className="segment-list" id="production-storyboards" hidden={productionPage!=="storyboard"}>
         {production.planner==="local_heuristic"&&!!production.segments.length&&<div className="storyboard-fallback-warning card"><div><strong>{t("当前是故障兜底分镜，不建议直接生成视频","This is a recovery storyboard. Do not render it yet.","現在は障害時の代替絵コンテです。このまま映像化しないでください。","目前是故障備援分鏡，不建議直接生成影片")}</strong><span>{t("本地 AI 上次没有完成写回，这些片段可能只是原文机械切分。请重新 AI 规划；角色资料库和已有视频版本不会被删除。","Local AI did not finish the previous plan, so these clips may be mechanical source slices. Replan with AI; the character library and existing video versions are preserved.","前回のローカルAI計画が完了せず、原文を機械的に分割した可能性があります。AIで再計画してください。キャラクター資料庫と既存の映像版は保持されます。","本地 AI 上次沒有完成寫回，這些片段可能只是原文機械切分。請重新 AI 規劃；角色資料庫和已有影片版本不會被刪除。")}</span></div><button className="primary" disabled={production.task_state==="paused"||!!busy} onClick={()=>void plan(true)}><Sparkles size={17}/>{t("重新 AI 规划本集分镜","Replan this episode with AI","この話をAIで再計画","重新 AI 規劃本集分鏡")}</button></div>}
         <div className="production-storyboard-head card"><div><span className="eyebrow">STORYBOARD CLIPS</span><h2><Clapperboard size={20}/>{t("当前集分镜制作","Current episode storyboard","現在話の絵コンテ制作","目前集分鏡製作")}</h2><p>{t("先按约 10 秒估算段数，再由剧情把每段调整到 5–15 秒，并让总生成时长贴合本集目标。AI 拆段后仍可人工增删、排序和编辑。","Count is estimated at roughly 10s per clip, then story needs vary each clip within 5–15s while total generated duration follows the episode target. You can still add, remove, reorder and edit after AI planning.","約10秒を基準に本数を見積もり、物語に応じて各クリップを5〜15秒で調整し、合計生成尺を話の目標に合わせます。AI計画後も追加・削除・並べ替え・編集が可能です。","先按約 10 秒估算段數，再由劇情把每段調整到 5–15 秒，並讓總生成時長貼合本集目標。AI 拆段後仍可人工增刪、排序和編輯。")}</p></div><div className="storyboard-head-actions"><span>{production.segments.length} {t("段","clips","件","段")} · {totalSeconds}/{currentEpisodeTiming.targetSeconds}s</span><button disabled={production.task_state==="paused"||!!busy||production.segments.length>=64} onClick={()=>addSegment()}><Plus size={16}/>{t("新增片段","Add clip","クリップを追加","新增片段")}</button></div></div>
+        {!!production.segments.length&&<div className={production.preflight_report?.status==="error"?"storyboard-contract-summary error":production.preflight_report?.status==="warning"?"storyboard-contract-summary warning":"storyboard-contract-summary ok"}>
+          <div><strong>{t("剧本覆盖","Script coverage","脚本カバレッジ","劇本覆蓋")}</strong><span>{production.coverage_report?.status==="error"?t("发现漏项、重复、对白或顺序问题","Missing, duplicate, dialogue or order issue found","欠落・重複・台詞・順序の問題あり","發現漏項、重複、對白或順序問題"):t("原场景、段落、对白与剧情事件已绑定","Scenes, paragraphs, dialogue and events are bound","場面・段落・台詞・出来事を紐付け済み","原場景、段落、對白與劇情事件已綁定")}</span></div>
+          <div><strong>{t("相邻连续性","Adjacent continuity","隣接連続性","相鄰連續性")}</strong><span>{production.continuity_report?.status==="error"?t("存在角色、视线、轴线、动作或道具冲突","Cast, eyeline, axis, action or prop conflict","人物・視線・軸・動作・小道具の衝突あり","存在角色、視線、軸線、動作或道具衝突"):t("已检查首尾状态与剪辑契约","Boundary state and edit contracts checked","境界状態と編集契約を確認済み","已檢查首尾狀態與剪輯契約")}</span></div>
+          <div><strong>{t("镜头质量预检","Shot quality preflight","ショット品質事前確認","鏡頭品質預檢")}</strong><span>{production.preflight_report?.status==="error"?t("存在生成前必须修正的冲突","Blocking contradictions must be fixed before generation","生成前に修正すべき矛盾があります","存在生成前必須修正的衝突"):production.preflight_report?.status==="warning"?t("可以生成，但建议先简化镜头","Generation is allowed, but simplifying the shot is recommended","生成できますが、先にショットの簡略化を推奨します","可以生成，但建議先簡化鏡頭"):t("动作、机位、对白与角色承载量已检查","Action, camera, dialogue and cast capacity checked","動作・カメラ・台詞・人物数を確認済み","動作、機位、對白與角色承載量已檢查")}</span></div>
+          {production.coverage_report?.counts&&<em>{production.coverage_report.counts.scenes} {t("场","scenes","場面","場")} · {production.coverage_report.counts.paragraphs} {t("段原文","source rows","原文行","段原文")} · {production.coverage_report.counts.dialogue} {t("句对白","dialogue lines","台詞","句對白")}</em>}
+        </div>}
         {!!production.segments.length&&<section className="storyboard-keyframe-planner card"><div className="section-title"><div><span className="eyebrow">AI KEYFRAME REVIEW</span><h3>{t("分镜关键帧建议与批量生图","Keyframe review & batch images","キーフレーム候補と一括生成","分鏡關鍵影格建議與批量生圖")}</h3><p>{t("本地 LLM 按剧情、动作、出场角色和画风判断哪些段需要补图。先审核提示词，确认后再逐张提交 ComfyUI；已有关键帧自动跳过。","The local LLM reviews story, action, cast and visual style. Edit its prompts before submitting images sequentially to ComfyUI. Clips with existing keyframes are skipped.","ローカルLLMが物語・動作・出演者・画風を確認します。プロンプトを編集後、ComfyUIへ順番に送信します。既存画像のあるクリップは省略します。","本地 LLM 按劇情、動作、出場角色和畫風判斷哪些段需要補圖。先審核提示詞，再逐張提交 ComfyUI；已有關鍵影格會跳過。")}</p></div><div className="production-actions"><button disabled={production.task_state==="paused"||!!busy} onClick={()=>void analyseKeyframes()}><Sparkles size={16}/>{t("AI 分析需要的关键帧","AI review keyframes","AIで画像候補を分析","AI 分析需要的關鍵影格")}</button><button className="primary" disabled={production.task_state==="paused"||!!busy||!keyframeSuggestions.length||!models.includes(imageModel)} onClick={()=>void generateSuggestedKeyframes()}><ImagePlus size={16}/>{t("批量生成建议图","Generate suggested images","候補画像を一括生成","批量生成建議圖")}</button></div></div>
           {keyframeSuggestions.map(item=><div className="storyboard-keyframe-suggestion" key={item.segment_id}><div><strong>{t("第 "+item.index+" 段","Clip "+item.index,"クリップ "+item.index,"第 "+item.index+" 段")}</strong><small>{item.reason}</small><button className="icon" title={t("删除此建议","Remove suggestion","候補を削除","刪除此建議")} onClick={()=>setKeyframeSuggestions(rows=>rows.filter(row=>row.segment_id!==item.segment_id))}><X size={16}/></button></div><textarea rows={3} value={item.prompt} onChange={e=>setKeyframeSuggestions(rows=>rows.map(row=>row.segment_id===item.segment_id?{...row,prompt:e.target.value}:row))}/></div>)}
         </section>}
-        {!!production.segments.length&&<div className="storyboard-batch-bar card"><div className="storyboard-batch-copy"><span className="eyebrow">EPISODE AUTOMATION</span><strong>{t("整集制作控制台","Episode production console","エピソード制作コンソール","整集製作控制台")}</strong><span>{t("中断后可从缺失处续跑；“全部重做”才会建立新版本，旧提示词与视频仍然保留。","Interrupted runs resume from missing work. Only Rebuild all creates new versions; earlier prompts and video takes remain available.","中断後は不足分から再開できます。「すべて再作成」のみ新しい版を作り、以前のプロンプトと映像を保持します。","中斷後可從缺失處續跑；「全部重做」才會建立新版本，舊提示詞與影片仍然保留。")}</span><div className="storyboard-batch-progress"><span className={ready===production.segments.length?"complete":""}>{t("H3 工程","H3 projects","H3プロジェクト","H3 專案")} <b>{ready}/{production.segments.length}</b></span><span className={(outputs?.ready_count||0)===production.segments.length?"complete":""}>{t("视频","Videos","映像","影片")} <b>{outputs?.ready_count||0}/{production.segments.length}</b></span><span className={outputs?.final_ready?"complete":""}>{t("最终成片","Final film","最終映像","最終成片")} <b>{outputs?.final_ready?t("已完成","Ready","完成","已完成"):t("待合并","Pending","未結合","待合併")}</b></span></div></div>
-          <div className="storyboard-batch-main-actions"><button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm()}><Film size={18}/>{bulkAction==="all"?t("正在续跑本集…","Resuming this episode…","この話を再開中…","正在續跑本集…"):production.segments.some(segment=>segment.status==="stale")?t("更新并重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段","Update and remake "+production.segments.filter(segment=>segment.status==="stale").length+" clips",production.segments.filter(segment=>segment.status==="stale").length+" 件を更新して再制作","更新並重做 "+production.segments.filter(segment=>segment.status==="stale").length+" 段"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
+        {!!production.segments.length&&<div className={"storyboard-batch-bar card"+(legacyOnlyReady?" legacy-ready":"")}><div className="storyboard-batch-copy"><span className="eyebrow">EPISODE AUTOMATION</span><strong>{t("整集制作控制台","Episode production console","エピソード制作コンソール","整集製作控制台")}</strong><span>{legacyOnlyReady?t("旧版视频和成片均可继续使用；升级到新规则是可选操作，不会自动重做。","Legacy takes and the assembled film remain usable. Upgrading to the new rules is optional and never starts automatically.","旧版映像と完成版はそのまま使用できます。新ルールへの更新は任意で、自動再生成は始まりません。","舊版影片和成片都可繼續使用；升級到新規則是可選操作，不會自動重做。"):t("中断后可从缺失处续跑；“全部重做”才会建立新版本，旧提示词与视频仍然保留。","Interrupted runs resume from missing work. Only Rebuild all creates new versions; earlier prompts and video takes remain available.","中断後は不足分から再開できます。「すべて再作成」のみ新しい版を作り、以前のプロンプトと映像を保持します。","中斷後可從缺失處續跑；「全部重做」才會建立新版本，舊提示詞與影片仍然保留。")}</span><div className="storyboard-batch-progress"><span className={ready===production.segments.length?"complete":""}>{t("当前 H3 工程","Current H3 projects","現在のH3プロジェクト","目前 H3 專案")} <b>{ready}/{production.segments.length}</b></span>{legacyUpgradeCount>0&&<span className="legacy"><b>{legacyUpgradeCount}</b> {t("段旧版可用 · 可选升级","legacy clips usable · optional upgrade","件の旧版を使用可能・更新は任意","段舊版可用 · 可選升級")}</span>}{legacyReviewRunning&&<span className="legacy"><LoaderCircle className="spin" size={12}/>{t("旧视频后台质检中","Reviewing legacy takes","旧版映像を検査中","舊影片背景質檢中")}</span>}<span className={(outputs?.ready_count||0)===production.segments.length?"complete":""}>{t("视频","Videos","映像","影片")} <b>{outputs?.ready_count||0}/{production.segments.length}</b></span><span className={outputs?.final_ready?"complete":""}>{t("最终成片","Final film","最終映像","最終成片")} <b>{outputs?.final_ready?t("已完成","Ready","完成","已完成"):t("待合并","Pending","未結合","待合併")}</b></span></div></div>
+          <div className="storyboard-batch-main-actions"><button className="primary batch-all" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>legacyOnlyReady?setProductionPage("output"):void generateEpisodeFilm()}>{automationActive?<LoaderCircle className="spin" size={18}/>:<Film size={18}/>} {automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="all"?t("正在启动本集…","Starting this episode…","この話を開始中…","正在啟動本集…"):legacyOnlyReady?t("查看旧版视频与成片","View legacy videos and film","旧版映像と完成版を見る","查看舊版影片與成片"):blockingStaleCount>0?t("更新并重做 "+blockingStaleCount+" 段","Update and remake "+blockingStaleCount+" clips",blockingStaleCount+" 件を更新して再制作","更新並重做 "+blockingStaleCount+" 段"):(outputs?.uncertain_jobs||0)>0?t("核对并继续本集","Check & resume episode","確認してこの話を続行","核對並繼續本集"):outputs?.final_ready?t("检查并补齐本集","Check episode","この話を確認","檢查並補齊本集"):(outputs?.ready_count||0)>=production.segments.length?t("合并本集成片","Assemble episode","この話を結合","合併本集成片"):(outputs?.ready_count||0)>0?t("继续完成本集 · 还差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段","Resume episode · "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" clips left","この話を続行・残り "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 件","繼續完成本集 · 尚差 "+Math.max(0,production.segments.length-(outputs?.ready_count||0))+" 段"):t("一键完成本集","Complete this episode","この話を一括完成","一鍵完成本集")}</button>
             <button className={production.task_state==="paused"?"batch-task-toggle resume":"batch-task-toggle pause"} disabled={taskStateBusy||(production.task_state==="paused"&&!!busy)} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>{production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存…","Saving…","保存中…","正在儲存…"):production.task_state==="paused"?t("恢复任务","Resume task","タスクを再開","恢復任務"):busy?t("当前步骤后暂停","Pause after current item","現在の処理後に停止","目前步驟後暫停"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span></button></div>
           <div className="storyboard-batch-actions">
             <div className="batch-action-group batch-action-primary"><span>{t("补齐缺失","Fill missing","不足分を補完","補齊缺失")}</span><div>
-              <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts()}><Sparkles size={16}/>{bulkAction==="prompts"?t("生成中…","Generating…","生成中…","生成中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>
-              <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllVideos()}><Play size={16}/>{bulkAction==="videos"?t("生成中…","Generating…","生成中…","生成中…"):t("视频","Videos","映像","影片")}</button>
-              <button disabled={production.task_state==="paused"||!!busy} onClick={()=>void prepareMissing()}><Check size={16}/>{t("H3 工程","H3 projects","H3プロジェクト","H3 專案")}</button>
+              <button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts()}><Sparkles size={16}/>{bulkAction==="prompts"?t("生成中…","Generating…","生成中…","生成中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>
+              <button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllVideos()}><Play size={16}/>{bulkAction==="videos"?t("生成中…","Generating…","生成中…","生成中…"):t("视频","Videos","映像","影片")}</button>
+              <button disabled={production.task_state==="paused"||!!busy} onClick={()=>void prepareMissing()}><Check size={16}/>{legacyOnlyReady?t("升级 H3 工程","Upgrade H3 projects","H3プロジェクトを更新","升級 H3 專案"):t("H3 工程","H3 projects","H3プロジェクト","H3 專案")}</button>
             </div></div>
-            <div className="batch-action-group batch-action-maintenance"><span>{t("全部重做","Rebuild all","すべて再作成","全部重做")}</span><div>
-              <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts(true)}><RefreshCw size={16}/>{bulkAction==="redo-prompts"?t("重做中…","Rebuilding…","再作成中…","重做中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>
-              <button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllVideos(true)}><RefreshCw size={16}/>{bulkAction==="redo-videos"?t("重做中…","Rebuilding…","再作成中…","重做中…"):t("视频","Videos","映像","影片")}</button>
+            <div className="batch-action-group batch-action-maintenance"><span>{t("维护与升级","Maintenance & upgrades","保守と更新","維護與升級")}</span><div>
+              <button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllPrompts(true)}><RefreshCw size={16}/>{bulkAction==="redo-prompts"?t("重做中…","Rebuilding…","再作成中…","重做中…"):t("提示词","Prompts","プロンプト","提示詞")}</button>
+              <button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateAllVideos(true)}><RefreshCw size={16}/>{bulkAction==="redo-videos"?t("重做中…","Rebuilding…","再作成中…","重做中…"):t("视频","Videos","映像","影片")}</button>
+              {legacyUpgradeCount>0&&<button className="legacy-upgrade-action" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void upgradeLegacyClips()}><RefreshCw size={16}/>{t("升级旧版 "+legacyUpgradeCount+" 段","Upgrade "+legacyUpgradeCount+" legacy clips","旧版 "+legacyUpgradeCount+" 件を更新","升級舊版 "+legacyUpgradeCount+" 段")}</button>}
+              {(legacyUnreviewedCount>0||legacyReviewRunning)&&<button className="legacy-review-action" disabled={production.task_state==="paused"||!!busy||legacyReviewRunning||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void reviewLegacyVideos()}>{legacyReviewRunning?<LoaderCircle className="spin" size={16}/>:<Check size={16}/>} {legacyReviewRunning?t("后台质检旧视频…","Reviewing legacy takes…","旧版映像を検査中…","背景質檢舊影片…"):t("只质检旧视频 "+legacyUnreviewedCount,"Review "+legacyUnreviewedCount+" legacy takes","旧版映像 "+legacyUnreviewedCount+" 件だけ検査","只質檢舊影片 "+legacyUnreviewedCount)}</button>}
             </div></div>
           </div>
         </div>}
-        {production.segments.map((segment,segmentPosition)=>{const isOpen=openSegmentId===segment.id;const outputRow=outputs?.segments.find(row=>row.segment_id===segment.id);const hasRender=!!outputRow?.candidates.length;const keyframes=segment.keyframe_asset_ids||[segment.image_asset_id].filter(Boolean) as string[];const effectiveWorkflowId=production.video_quality==="lora8"&&(segment.workflow_profile_id||"builtin")==="builtin"?"h3_ref8_lora_accel":segment.workflow_profile_id||"builtin";const segmentSummary=(segment.story||segment.action).replace(/\s+/g," ").trim();return <article className={"segment-card "+segment.status+(isOpen?" expanded":" collapsed")} key={segment.id}>
-          <header><div className="segment-number">{String(segment.index).padStart(2,"0")}</div>
+        {!!production.segments.length&&<div className={"segment-selection-toolbar card"+(selectedSegmentIds.length?" has-selection":"")}><div><span className="eyebrow">SELECTIVE REBUILD</span><strong>{t("选中分镜批量更新","Update selected clips","選択クリップを一括更新","選取分鏡批量更新")}</strong><small>{t("需要更新的分镜会以橙色边框和醒目标记显示；也可勾选任意其它分镜。不会重新规划分镜。","Clips needing an update use an amber border and prominent badge. You may select any other clips too. The storyboard is not replanned.","更新が必要なクリップはオレンジの枠と目立つ表示になります。任意のクリップも選択でき、絵コンテは再計画しません。","需要更新的分鏡會以橙色邊框和醒目標記顯示；也可勾選任意其他分鏡。不會重新規劃分鏡。")}</small></div><div className="segment-selection-summary"><span><b>{updateCandidateIds.length}</b>{t(" 段建议更新"," clips suggested"," 件を更新推奨"," 段建議更新")}</span><span><b>{selectedSegmentIds.length}</b>{t(" 段已选"," selected"," 件選択済み"," 段已選")}</span></div><div className="segment-selection-actions"><button disabled={!updateCandidateIds.length||!!busy||automationActive} onClick={selectUpdateCandidates}><Check size={16}/>{updateCandidateIds.length>0&&updateCandidateIds.every(id=>selectedSegmentSet.has(id))?t("取消需更新选择","Deselect suggested","推奨選択を解除","取消需更新選擇"):t("全选需更新 "+updateCandidateIds.length,"Select suggested "+updateCandidateIds.length,"更新推奨を全選択 "+updateCandidateIds.length,"全選需更新 "+updateCandidateIds.length)}</button><button disabled={!selectedSegmentIds.length||!!busy} onClick={()=>setSelectedSegmentIds([])}><X size={16}/>{t("清除选择","Clear","選択解除","清除選擇")}</button><button className="primary" disabled={!selectedSegmentIds.length||production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void regenerateSelectedSegments()}>{bulkAction==="selected"?<LoaderCircle className="spin" size={17}/>:<RefreshCw size={17}/>} {bulkAction==="selected"?t("正在更新选中分镜…","Updating selection…","選択クリップを更新中…","正在更新選取分鏡…"):t("更新提示词并重做视频","Update prompts & rerender","プロンプト更新と映像再生成","更新提示詞並重做影片")}</button></div></div>}
+        {production.segments.map((segment,segmentPosition)=>{const isOpen=openSegmentId===segment.id;const outputRow=outputs?.segments.find(row=>row.segment_id===segment.id);const legacyUpgrade=!!outputRow?.legacy_upgrade;const needsUpdate=segment.status==="stale"||!!segment.stale_reasons?.length||legacyUpgrade;const isSelected=selectedSegmentSet.has(segment.id);const hasRender=!!outputRow?.candidates.length;const keyframes=segment.keyframe_asset_ids||[segment.image_asset_id].filter(Boolean) as string[];const effectiveWorkflowId=production.video_quality==="lora8"&&(segment.workflow_profile_id||"builtin")==="builtin"?"h3_ref8_lora_accel":segment.workflow_profile_id||"builtin";const segmentSummary=(segment.story||segment.action).replace(/\s+/g," ").trim();const updateSummary=segment.stale_reasons?.[0]||t("该分镜仍可使用旧视频，也可以升级到当前生成规则。","The old take remains usable, or update this clip to the current generation rules.","旧テイクは使用できますが、現在の生成ルールへ更新できます。","此分鏡仍可使用舊影片，也可以升級到目前生成規則。");return <article className={"segment-card "+(needsUpdate?"update-recommended":segment.status)+(isSelected?" batch-selected":"")+(isOpen?" expanded":" collapsed")} key={segment.id}>
+          <header><label className="segment-select-control" title={t("选择本段进行批量更新","Select this clip for batch update","このクリップを一括更新に選択","選擇本段進行批量更新")}><input type="checkbox" checked={isSelected} onChange={()=>toggleSegmentSelection(segment.id)}/><span>{t("选择","Select","選択","選擇")}</span></label><div className="segment-number">{String(segment.index).padStart(2,"0")}</div>
             <div className="segment-heading"><input className="segment-title" value={segment.title} onChange={e=>updateSegment(segment.id,"title",e.target.value)}/>{!isOpen&&<small title={segmentSummary}>{segmentSummary||t("尚无剧情摘要","No story summary yet","物語要約はまだありません","尚無劇情摘要")}</small>}</div>
             <label className="duration"><input type="number" min={5} max={15} step={1} value={segment.duration}
               onChange={e=>updateSegment(segment.id,"duration",Math.max(5,Math.min(15,Number(e.target.value)||5)))}/><span>{t("秒","sec","秒","秒")}</span></label>
-            <span className={"status "+(segment.status==="ready"&&!segment.video_prompt?.trim()?"missing-prompt":segment.status)}>{segment.status==="ready"?(segment.video_prompt?.trim()?t("已准备","Ready","準備済み","已準備"):t("缺提示词","Prompt missing","プロンプト未生成","缺提示詞")):segment.status==="stale"?t("需重建","Rebuild","再構築","需重建"):t("未准备","Not ready","未準備","未準備")}</span><div className="segment-row-tools">{!isOpen&&<div className="segment-quick-actions"><button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,true)} title={t("重做本段提示词","Regenerate clip prompt","このプロンプトを再生成","重做本段提示詞")}><RefreshCw size={14}/>{t("提示词","Prompt","プロンプト","提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateVideo(segment)} title={t("重做本段视频","Regenerate clip video","この映像を再生成","重做本段影片")}><Play size={14}/>{t("视频","Video","映像","影片")}</button></div>}<div className="segment-structure-actions"><button className="icon" disabled={segmentPosition===0||production.task_state==="paused"} onClick={()=>moveSegment(segment.id,-1)} title={t("上移片段","Move clip up","上へ移動","上移片段")}><ArrowUp size={15}/></button><button className="icon" disabled={segmentPosition===production.segments.length-1||production.task_state==="paused"} onClick={()=>moveSegment(segment.id,1)} title={t("下移片段","Move clip down","下へ移動","下移片段")}><ArrowDown size={15}/></button><button className="icon danger" disabled={production.task_state==="paused"} onClick={()=>deleteSegment(segment)} title={t("删除片段","Delete clip","クリップを削除","刪除片段")}><Trash2 size={15}/></button><button className="segment-toggle icon" onClick={()=>setOpenSegmentId(isOpen?null:segment.id)} title={isOpen?t("收起分镜","Collapse clip","クリップを閉じる","收起分鏡"):t("编辑分镜","Edit clip","クリップを編集","編輯分鏡")}>{isOpen?<ChevronUp size={18}/>:<ChevronDown size={18}/>}</button></div></div></header>
+            <span className={"status "+(needsUpdate?"update-recommended":segment.status==="ready"&&!segment.video_prompt?.trim()?"missing-prompt":segment.status)}>{needsUpdate?t("建议更新 · 旧视频保留","Update suggested · old take kept","更新推奨・旧版保持","建議更新 · 舊影片保留"):segment.status==="ready"?(segment.video_prompt?.trim()?t("已准备","Ready","準備済み","已準備"):t("缺提示词","Prompt missing","プロンプト未生成","缺提示詞")):t("未准备","Not ready","未準備","未準備")}</span><div className="segment-row-tools">{!isOpen&&<div className="segment-quick-actions"><button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,true)} title={t("重做本段提示词","Regenerate clip prompt","このプロンプトを再生成","重做本段提示詞")}><RefreshCw size={14}/>{t("提示词","Prompt","プロンプト","提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateVideo(segment)} title={t("重做本段视频","Regenerate clip video","この映像を再生成","重做本段影片")}><Play size={14}/>{t("视频","Video","映像","影片")}</button></div>}<div className="segment-structure-actions"><button className="icon" disabled={segmentPosition===0||production.task_state==="paused"||automationActive} onClick={()=>moveSegment(segment.id,-1)} title={t("上移片段","Move clip up","上へ移動","上移片段")}><ArrowUp size={15}/></button><button className="icon" disabled={segmentPosition===production.segments.length-1||production.task_state==="paused"||automationActive} onClick={()=>moveSegment(segment.id,1)} title={t("下移片段","Move clip down","下へ移動","下移片段")}><ArrowDown size={15}/></button><button className="icon danger" disabled={production.task_state==="paused"||automationActive} onClick={()=>deleteSegment(segment)} title={t("删除片段","Delete clip","クリップを削除","刪除片段")}><Trash2 size={15}/></button><button className="segment-toggle icon" onClick={()=>setOpenSegmentId(isOpen?null:segment.id)} title={isOpen?t("收起分镜","Collapse clip","クリップを閉じる","收起分鏡"):t("编辑分镜","Edit clip","クリップを編集","編輯分鏡")}>{isOpen?<ChevronUp size={18}/>:<ChevronDown size={18}/>}</button></div></div></header>
+          {!isOpen&&needsUpdate&&<p className="segment-update-summary" title={updateSummary}><strong>{t("更新原因：","Why: ","更新理由：","更新原因：")}</strong>{updateSummary}</p>}
           {isOpen&&<><p className="duration-reason">{segment.duration_reason}</p>
           {production.auto_continue_previous&&segment.index>1&&<div className="segment-card-selection"><strong>{t("上一段衔接","Previous clip link","前クリップとの接続","上一段銜接")}</strong><label><input type="checkbox" checked={segment.continue_previous!==false} onChange={e=>updateSegment(segment.id,"continue_previous",e.target.checked)}/> {t("使用上一段结尾的动作与声音","Carry preceding motion and audio","前の動きと音声を引き継ぐ","使用上一段結尾的動作與聲音")}</label><em>{t("换场或时间跳转时取消；此段将重新开镜。更改后需重做本段视频。","Uncheck for a location or time cut. This clip starts fresh; regenerate its video after changing.","場所や時間が飛ぶ場合はオフにします。このクリップは新しいショットになり、変更後は映像の再生成が必要です。","換場或時間跳轉時取消；此段會重新開鏡。更改後需重做本段影片。")}</em></div>}
           <div className={segment.card_selection_source==="local_ai"?"segment-card-selection ai":"segment-card-selection"}>
@@ -2078,6 +2274,11 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
             <label>{t("结束画面 / 衔接状态","Ending frame / continuity state","終了画面 / 継続状態","結束畫面 / 銜接狀態")}<input value={segment.ending} onChange={e=>updateSegment(segment.id,"ending",e.target.value)}/></label></div>
           <label>{t("本段故事事实","Story facts for this clip","このクリップの物語上の事実","本段故事事實")}<textarea rows={3} value={segment.story} onChange={e=>updateSegment(segment.id,"story",e.target.value)}/></label>
           <label>{t("可见动作","Visible action","画面に見える動作","可見動作")}<textarea rows={4} value={segment.action} onChange={e=>updateSegment(segment.id,"action",e.target.value)}/></label>
+          <section className={segment.preflight_issues?.some(row=>row.severity==="error")?"segment-contract error":segment.preflight_issues?.length?"segment-contract warning":"segment-contract"}>
+            <div className="segment-contract-head"><div><strong>{t("镜头质量预检 · 剧本与剪辑契约","Shot preflight · source & edit contract","ショット事前確認・原文と編集契約","鏡頭品質預檢 · 劇本與剪輯契約")}</strong><span>{t("统一检查漏剧情、对白、角色空间、动作密度、机位、剪辑关系与连续性；错误会阻止生成，警告仅提醒。","One check covers story/dialogue coverage, character planes, action density, camera, edits and continuity. Errors block generation; warnings advise only.","物語・台詞・人物空間・動作密度・カメラ・編集・連続性を一括確認します。エラーは生成を止め、警告は助言のみです。","統一檢查漏劇情、對白、角色空間、動作密度、機位、剪輯關係與連續性；錯誤會阻止生成，警告僅提醒。")}</span></div><em>{segment.preflight_issues?.some(row=>row.severity==="error")?t("需要修正","Fix required","修正が必要","需要修正"):segment.preflight_issues?.length?t("建议优化","Review advised","確認推奨","建議最佳化"):t("检查通过","Passed","確認済み","檢查通過")}</em></div>
+            <div className="segment-contract-grid"><span><b>{t("原文绑定","Source binding","原文紐付け","原文綁定")}</b>{segment.source_refs?.scene_ids.length||0} {t("场","scenes","場面","場")} · {segment.source_refs?.paragraph_ids.length||0} {t("段","rows","行","段")} · {segment.source_refs?.dialogue_ids.length||0} {t("句对白","lines","台詞","句對白")} · {segment.source_refs?.event_ids.length||0} {t("个事件","events","出来事","個事件")}</span><span><b>{t("镜头职责 / 景别","Shot role / size","役割 / サイズ","鏡頭職責 / 景別")}</b>{segment.shot_contract?.role||"master"} · {segment.shot_contract?.shot_size||"medium"}</span><span><b>{t("剪辑关系 / 原因","Edit relation / reason","編集関係 / 理由","剪輯關係 / 原因")}</b>{segment.shot_contract?.relation_previous||"hard_cut"} · {segment.shot_contract?.edit_reason||"continuity"}</span><span><b>{t("摄影机轴线","Camera axis","カメラ軸","攝影機軸線")}</b>{segment.shot_contract?.camera_axis||t("未额外指定","not additionally specified","追加指定なし","未額外指定")}</span></div>
+            {(segment.preflight_issues||[]).map((issue,index)=><p className={issue.severity} key={issue.code+index}>{issue.message}</p>)}
+          </section>
           <div className="dialogue-head"><strong>{t("精确对白","Exact dialogue","正確な台詞","精確對白")}</strong><button onClick={()=>addDialogue(segment.id)}><Plus size={15}/> {t("添加","Add","追加","新增")}</button></div>
           {segment.dialogue.map((line,i)=><div className="dialogue-row" key={i}>
             <input value={line.speaker} onChange={e=>updateDialogue(segment.id,i,"speaker",e.target.value)} placeholder={t("说话人","Speaker","話者","說話人")}/>
@@ -2099,12 +2300,12 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
               {videoWorkflows.map(workflow=><option key={workflow.id} value={workflow.id} disabled={!workflow.modes.includes(production.source_mode||"ref2va")||(production.video_quality==="lora8"&&workflow.id==="builtin")}>{workflow.id==="h3_ref8_lora_accel"?t("8步 LoRA 加速","8-step LoRA acceleration","8ステップLoRA加速","8步 LoRA 加速"):workflow.name}{workflow.modes.includes(production.source_mode||"ref2va")?"":t(" · 不支持当前输入模式"," · incompatible mode","・現在の入力モード非対応"," · 不支援目前輸入模式")}</option>)}</select><small>{t("每段可独立选择。更换后会标记工程需重建；内置流程始终保留。","Choose independently per clip. Changing it marks the H3 project for rebuild; the built-in workflow is always retained.","クリップごとに選択できます。変更後はH3プロジェクトの再構築が必要になり、内蔵フローは常に残ります。","每段可獨立選擇。更換後會標記專案需重建；內置流程始終保留。")}</small></label>
             <label>{t("视频提示词修改要求","Video prompt revision request","映像プロンプトの修正指示","影片提示詞修改要求")}<textarea rows={3} value={segment.prompt_direction||""} onChange={e=>updateSegment(segment.id,"prompt_direction",e.target.value)} placeholder={t("例如：镜头保持稳定，先给女生反应，再让男生把书递过去；不要新增对白。","Example: keep the camera steady, show her reaction first, then let him pass the book; add no dialogue.","例：カメラを安定させ、先に彼女の反応、その後で彼が本を渡す。台詞は追加しない。","例如：鏡頭保持穩定，先給女生反應，再讓男生把書遞過去；不要新增對白。")}/></label>
             {segment.video_prompt?<label>{t("最终 H3 视频提示词（同步预览）","Final H3 video prompt · synced preview","最終H3映像プロンプト・同期プレビュー","最終 H3 影片提示詞（同步預覽）")}<textarea className="compiled-prompt-preview" rows={7} readOnly value={segment.video_prompt}/></label>:<p className="segment-prompt-empty">{t("H3 工程已经建立，但本段尚未生成视频提示词。点击下方“生成视频提示词”即可补齐。","The H3 project exists, but this clip has no video prompt yet. Use Generate video prompt below to build it.","H3プロジェクトはありますが、このクリップの映像プロンプトは未生成です。下の「映像プロンプトを生成」で作成できます。","H3 專案已建立，但本段尚未生成影片提示詞。點擊下方「生成影片提示詞」即可補齊。")}</p>}
-            <div className="segment-prompt-actions"><button className="primary" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,true)}><Sparkles size={16}/>{segment.video_prompt?t("重新生成本段提示词","Regenerate this clip prompt","このプロンプトを再生成","重新生成本段提示詞"):t("生成视频提示词","Generate video prompt","映像プロンプトを生成","生成影片提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,false)}><RefreshCw size={16}/>{t("不用 AI 重建","Rebuild without AI","AIなしで再構築","不用 AI 重建")}</button><span><Clock3 size={14}/>{t("提示词","Prompt","プロンプト","提示詞")} {formatSeconds(segment.prompt_seconds)} · H3 {formatSeconds(segment.prepare_seconds)}</span></div>
+            <div className="segment-prompt-actions"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,true)}><Sparkles size={16}/>{segment.video_prompt?t("重新生成本段提示词","Regenerate this clip prompt","このプロンプトを再生成","重新生成本段提示詞"):t("生成视频提示词","Generate video prompt","映像プロンプトを生成","生成影片提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void rebuildPrompt(segment,false)}><RefreshCw size={16}/>{t("不用 AI 重建","Rebuild without AI","AIなしで再構築","不用 AI 重建")}</button><span><Clock3 size={14}/>{t("提示词","Prompt","プロンプト","提示詞")} {formatSeconds(segment.prompt_seconds)} · H3 {formatSeconds(segment.prepare_seconds)}</span></div>
           </section>
           <footer><button disabled={production.task_state==="paused"} onClick={()=>addSegment(segmentPosition)}><Plus size={17}/>{t("在后面插入片段","Insert clip after","後ろにクリップを挿入","在後面插入片段")}</button><button disabled={production.task_state==="paused"&&!segment.project_id} onClick={()=>void prepareOne(segment,true)}><Clapperboard size={17}/>{segment.project_id?t("更新并打开 H3","Update and open H3","H3を更新して開く","更新並開啟 H3"):t("创建并打开 H3","Create and open H3","H3を作成して開く","建立並開啟 H3")}</button>
             <button disabled={production.task_state==="paused"} onClick={()=>void prepareOne(segment,false)}><Save size={17}/> {t("只准备工程","Prepare only","準備のみ","只準備專案")}</button>
-            <button className="primary" disabled={production.task_state==="paused"||!!busy||(outputs?.active_jobs||0)>0} onClick={()=>void generateVideo(segment)}><Play size={17}/>{hasRender?t("重新生成本段视频","Regenerate this clip","このクリップを再生成","重新生成本段影片"):t("生成本段视频","Generate this clip","このクリップを生成","生成本段影片")}</button></footer>
-          {!!segment.stale_reasons?.length&&<p className="stale-note">{segment.stale_reasons.join("；")}</p>}</>}
+            <button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateVideo(segment)}><Play size={17}/>{hasRender?t("重新生成本段视频","Regenerate this clip","このクリップを再生成","重新生成本段影片"):t("生成本段视频","Generate this clip","このクリップを生成","生成本段影片")}</button></footer>
+          {!!segment.stale_reasons?.length&&<p className={legacyUpgrade?"stale-note legacy-upgrade-note":"stale-note"}>{legacyUpgrade?t("旧视频与旧成片仍可使用；以下内容只说明当前 H3 工程尚未升级：","The existing video and film remain usable. The following only explains why the current H3 project has not been upgraded: ","既存の映像と完成版は引き続き使用できます。以下は現在のH3プロジェクトが未更新である理由だけを示します：","舊影片與舊成片仍可使用；以下內容只說明目前 H3 專案尚未升級：")+segment.stale_reasons.join("；"):segment.stale_reasons.join("；")}</p>}</>}
         </article>})}
       </section>
       <section className="production-results card" id="production-video-overview" hidden={productionPage!=="output"}>
@@ -2112,22 +2313,39 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           <p>{t("每个分镜默认采用最新成功版本，也可手动指定。只有采用版本齐全后才会按分镜顺序合成最终影片。","Each clip adopts its latest successful take by default, or you can choose one manually. The final film is assembled in storyboard order only after every adopted take is ready.","各クリップは最新の成功テイクを既定で採用し、手動選択も可能です。全採用テイクが揃うと絵コンテ順に最終映像を結合します。","每個分鏡預設採用最新成功版本，也可手動指定。只有採用版本齊全後才會按分鏡順序合成最終影片。")}</p></div>
           <div className="production-result-actions"><span className="auto-merge-status">{production.auto_merge!==false?t("自动合片已开启","Auto-assembly on","自動結合オン","自動合片已開啟"):t("自动合片已关闭","Auto-assembly off","自動結合オフ","自動合片已關閉")}</span>
             <button onClick={()=>void refreshOutputs()} disabled={outputsLoading}><RefreshCw className={outputsLoading?"spin":""} size={16}/>{t("刷新结果","Refresh results","結果を更新","重新整理結果")}</button>
-            <button className="primary" disabled={production.task_state==="paused"||!outputs?.all_ready||merging} onClick={()=>void buildFilm(false)}><Film size={17}/>{merging?t("正在合片…","Assembling…","結合中…","正在合片…"):t("立即合并最终成片","Assemble final film","最終映像を結合","立即合併最終成片")}</button></div></div>
+            <button className="primary" disabled={production.task_state==="paused"||!outputs?.all_ready||!outputs?.quality_ready||merging} onClick={()=>void buildFilm(false)}><Film size={17}/>{merging?t("正在合片…","Assembling…","結合中…","正在合片…"):t("立即合并最终成片","Assemble final film","最終映像を結合","立即合併最終成片")}</button></div></div>
         {!outputs?<div className="production-output-empty">{t("正在读取本项目的视频结果…","Reading this production's video results…","この制作の映像結果を読み込み中…","正在讀取本專案的影片結果…")}</div>:<>
-          <div className="production-output-summary"><strong>{outputs.ready_count}/{outputs.segment_count}</strong><span>{t("个分镜已有采用版本","clips have adopted takes","クリップに採用テイクあり","個分鏡已有採用版本")}</span><strong>{outputs.estimated_seconds}s</strong><span>{t("预计成片时长（已扣续写重叠）","estimated film length after continuation overlap","継続重複を除いた推定尺","預計成片時長（已扣續寫重疊）")}</span>{outputs.active_jobs>0&&<><strong>{outputs.active_jobs}</strong><span>{t("个视频任务正在处理","video job in progress","件の映像処理中","個影片任務正在處理")}</span></>}{outputs.uncertain_jobs>0&&<><strong>{outputs.uncertain_jobs}</strong><span>{t("个中断任务等待核对","interrupted job awaiting a check","件の中断タスクを確認待ち","個中斷任務等待核對")}</span></>}</div>
-          <div className="production-output-list">{outputs.segments.map(row=>{const readyTakes=row.candidates.filter(job=>job.status==="succeeded"&&job.video_url);const selected=row.selected;const activeJob=row.candidates.find(job=>["preparing","queued","running","uncertain"].includes(job.status));const isUncertain=activeJob?.status==="uncertain";const segment=production.segments.find(item=>item.id===row.segment_id);return <article className={selected?"production-output-row ready":"production-output-row"} key={row.segment_id}>
+          <div className="production-output-summary"><strong>{outputs.ready_count}/{outputs.segment_count}</strong><span>{t("个分镜已有采用版本","clips have adopted takes","クリップに採用テイクあり","個分鏡已有採用版本")}</span><strong>{outputs.estimated_seconds}s</strong><span>{t("预计成片时长（已扣续写重叠）","estimated film length after continuation overlap","継続重複を除いた推定尺","預計成片時長（已扣續寫重疊）")}</span>{outputs.quality_pending_count>0&&<><strong>{outputs.quality_pending_count}</strong><span>{t("个采用版本等待质检","adopted takes awaiting review","件の採用テイクを品質検査待ち","個採用版本等待質檢")}</span></>}{outputs.active_jobs>0&&<><strong>{outputs.active_jobs}</strong><span>{t("个视频任务正在处理","video job in progress","件の映像処理中","個影片任務正在處理")}</span></>}{outputs.uncertain_jobs>0&&<><strong>{outputs.uncertain_jobs}</strong><span>{t("个中断任务等待核对","interrupted job awaiting a check","件の中断タスクを確認待ち","個中斷任務等待核對")}</span></>}</div>
+          {!!qualityOverrideTargets.length&&<section className={"production-quality-batch"+(selectedQualityRunIds.length?" has-selection":"")}><div><span className="eyebrow">HUMAN QC RELEASE</span><strong>{t("批量人工判定","Batch human acceptance","一括手動判定","批量人工判定")}</strong><p>{t("只放行你明确勾选并已查看证据的不合格版本。原质检问题永久保留；不会修改提示词，也不会重做视频。","Only explicitly selected rejected takes are released after you review their evidence. Original QC findings remain permanently; prompts and videos are not changed.","証拠を確認して明示的に選択した不合格テイクだけを承認します。元の検査結果は保持され、プロンプトや映像は変更されません。","只放行你明確勾選並已查看證據的不合格版本。原質檢問題永久保留；不會修改提示詞，也不會重做影片。")}</p></div><div className="production-quality-batch-count"><b>{selectedQualityRunIds.length}</b><span>/ {qualityOverrideTargets.length} {t("已选","selected","選択済み","已選")}</span></div><div className="production-quality-batch-actions"><label className="production-quality-select-all"><input type="checkbox" checked={qualityOverrideTargets.every(item=>selectedQualityRunSet.has(item.run_id))} disabled={!!busy||automationActive||outputs.active_jobs>0} onChange={e=>setSelectedQualityRunIds(e.target.checked?qualityOverrideTargets.map(item=>item.run_id):[])}/><span>{t("全选不合格 "+qualityOverrideTargets.length,"Select all rejected "+qualityOverrideTargets.length,"不合格を全選択 "+qualityOverrideTargets.length,"全選不合格 "+qualityOverrideTargets.length)}</span></label><button disabled={!selectedQualityRunIds.length||!!busy} onClick={()=>setSelectedQualityRunIds([])}><X size={15}/>{t("清除选择","Clear","選択解除","清除選擇")}</button><button className="primary" disabled={!selectedQualityRunIds.length||production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>void acceptSelectedQualityOverrides()}><Check size={16}/>{t("批量判定合格 "+selectedQualityRunIds.length,"Accept selected "+selectedQualityRunIds.length,"選択を一括承認 "+selectedQualityRunIds.length,"批量判定合格 "+selectedQualityRunIds.length)}</button></div></section>}
+          <div className="production-output-list">{outputs.segments.map(row=>{const readyTakes=row.candidates.filter(job=>job.status==="succeeded"&&job.video_url);const selected=row.selected;const qualityTake=readyTakes.find(job=>job.quality_review?.status==="failed"&&!job.quality_review?.accepted)||selected;const quality=qualityTake?.quality_review;const qualitySelectable=!!qualityTake&&quality?.status==="failed"&&!quality.accepted;const qualitySelected=qualitySelectable&&selectedQualityRunSet.has(qualityTake.id);const activeJob=row.candidates.find(job=>["preparing","queued","running","uncertain"].includes(job.status));const isUncertain=activeJob?.status==="uncertain";const segment=production.segments.find(item=>item.id===row.segment_id);const preceding=outputs.segments[row.index-2]?.selected;return <React.Fragment key={row.segment_id}>
+            {row.boundary&&<section className={"continuity-review "+row.boundary.status}>
+              <div className="continuity-review-head"><div><span className="eyebrow">CUT CONTINUITY REVIEW</span><strong>{t("剪辑工作台 · 上一段末帧 / 下一段首帧","Edit bench · previous last / next first","編集台・前の最終 / 次の開始","剪輯工作台 · 上一段末幀／下一段首幀")}</strong><small>{row.boundary.frames_ready?t("来自当前采用视频的实际帧","Actual frames from the currently adopted takes","現在の採用テイクの実フレーム","來自目前採用影片的實際影格"):t("正在后台提取首尾帧…","Extracting boundary frames in the background…","境界フレームを抽出中…","正在背景擷取首尾影格…")}</small></div><em>{row.boundary.status==="error"?t("连续性冲突","Continuity conflict","連続性の衝突","連續性衝突"):row.boundary.status==="warning"?t("建议复核","Review advised","確認推奨","建議複核"):t("未发现明显跳变","No obvious jump found","明確な飛びなし","未發現明顯跳變")}</em></div>
+              <div className="continuity-review-body">
+                <div className="continuity-review-visuals">
+                  <div className="continuity-frame-pair"><figure><img src={row.boundary.previous_last_url} alt={t("上一段最后一帧","Previous last frame","前クリップの最終フレーム","上一段最後一影格")}/><figcaption><b>{String(Math.max(1,row.index-1)).padStart(2,"0")}</b><span>{t("上一段末帧","Previous out frame","前の最終フレーム","上一段末幀")}</span></figcaption></figure><span>→</span><figure><img src={row.boundary.next_first_url} alt={t("下一段第一帧","Next first frame","次クリップの開始フレーム","下一段第一影格")}/><figcaption><b>{String(row.index).padStart(2,"0")}</b><span>{t("下一段首帧","Next in frame","次の開始フレーム","下一段首幀")}</span></figcaption></figure></div>
+                  <details className="continuity-middle-frames"><summary>{t("查看中间代表帧","Show representative middle frames","中間代表フレームを見る","查看中間代表影格")}</summary><div><img src={row.boundary.previous_middle_url} alt=""/><img src={row.boundary.next_middle_url} alt=""/></div></details>
+                </div>
+                <aside className="continuity-review-panel">
+                  <div className="continuity-review-facts"><span className="cast-fact"><b>{t("计划角色","Planned cast","計画人物","計畫角色")}</b>{row.boundary.planned_cast.previous_end.join(", ")||t("无","none","なし","無")} <i>→</i> {row.boundary.planned_cast.next_start.join(", ")||t("无","none","なし","無")}</span>{row.boundary.metrics.brightness_delta!=null&&<span><b>{t("亮度差","Brightness","明るさ差","亮度差")}</b>{Math.round(row.boundary.metrics.brightness_delta)}</span>}{row.boundary.metrics.temperature_delta!=null&&<span><b>{t("色温差","Temperature","色温差","色溫差")}</b>{Math.round(row.boundary.metrics.temperature_delta)}</span>}</div>
+                  {!!row.boundary.issues.length?<div className="continuity-review-issues">{row.boundary.issues.slice(0,6).map((issue,index)=><p className={issue.severity} key={issue.code+index}>{issue.message}</p>)}</div>:<p className="continuity-review-clear"><Check size={14}/>{t("基础连续性检查通过","Basic continuity checks passed","基本連続性チェック合格","基礎連續性檢查通過")}</p>}
+                  <div className="continuity-review-actions"><button onClick={()=>void boundaryAction(row,"save")} disabled={production.task_state==="paused"||!!busy}><Save size={14}/>{t("保存连续性帧","Save continuity frame","連続性フレームを保存","儲存連續性影格")}</button><button className="primary" onClick={()=>void boundaryAction(row,"use_next")} disabled={production.task_state==="paused"||!!busy||!preceding?.can_continue} title={!preceding?.can_continue?t("上一段没有已验证的 MMH3 状态；先保存帧复核，或开启自动续接后重做上一段。","The preceding take has no verified MMH3 state. Save its frame for review, or rerender it with automatic continuation enabled.","前のテイクに検証済みMMH3状態がありません。フレームを保存して確認するか、自動継続を有効にして前のクリップを再生成してください。","上一段沒有已驗證的 MMH3 狀態；先儲存影格複核，或開啟自動續接後重做上一段。") : ""}><Play size={14}/>{t("用于下一镜头","Use for next shot","次ショットに使用","用於下一鏡頭")}</button><button onClick={()=>void boundaryAction(row,"hard_cut")} disabled={production.task_state==="paused"||!!busy}><X size={14}/>{t("改为普通硬切","Use a hard cut","通常のハードカット","改為普通硬切")}</button></div>
+                </aside>
+              </div>
+            </section>}
+            <article className={(selected?"production-output-row ready":"production-output-row")+(qualitySelected?" quality-selected":"")}>
             <div className="production-output-index">{String(row.index).padStart(2,"0")}</div>
             <div className="production-output-media">{selected?<video controls playsInline preload="metadata" src={selected.scene_video_url||selected.video_url||""}/>:<div className="production-video-placeholder"><Video size={24}/><span>{row.project_id?t("尚无完成的视频","No completed video yet","完成した映像はまだありません","尚無完成的影片"):t("先创建 H3 工程","Create the H3 project first","先にH3プロジェクトを作成","先建立 H3 專案")}</span></div>}</div>
             <div className="production-output-info"><strong>{row.title}</strong><span>{selected?t("采用版本","Adopted take","採用テイク","採用版本")+" · "+(selected.seed!=null?"Seed "+selected.seed:t("已完成","Ready","完成","已完成"))+" · "+formatSeconds(selected.elapsed_seconds):t("等待本段生成完成","Waiting for this clip","このクリップの生成待ち","等待本段生成完成")}</span>
+              {quality&&quality.required&&<section className={"production-quality-review "+quality.status+(quality.accepted?" accepted-override":"")}><div className="production-quality-head"><strong>{quality.status==="failed"?(quality.accepted?t("人工判定合格 · 原质检问题保留","Accepted by human · original QC findings retained","手動合格・元の検査結果を保持","人工判定合格 · 原質檢問題保留"):t("质检未通过 · 未采用","Review failed · not adopted","品質検査不合格・未採用","質檢未通過 · 未採用")):quality.status==="pending"||quality.status==="reviewing"?t("等待视频质检","Waiting for quality review","品質検査待ち","等待影片質檢"):quality.status==="manual_review"?t("基础检查完成 · 请人工复核","Basic checks complete · review manually","基本検査完了・手動確認","基礎檢查完成 · 請人工複核"):quality.status==="warning"?t("质检通过 · 有复核建议","Review passed · notes","品質検査合格・確認事項あり","質檢通過 · 有複核建議"):t("质检通过","Quality review passed","品質検査合格","質檢通過")}</strong><div className="production-quality-head-meta"><span>{qualityTake?.seed!=null?"Seed "+qualityTake.seed:""}</span>{qualitySelectable&&<label className="production-quality-select"><input type="checkbox" checked={qualitySelected} onChange={e=>{const runId=qualityTake!.id;setSelectedQualityRunIds(current=>e.target.checked?[...new Set([...current,runId])]:current.filter(id=>id!==runId));}}/><i>{qualitySelected?t("已选择","Selected","選択済み","已選擇"):t("加入批量","Add to batch","一括に追加","加入批量")}</i></label>}</div></div><p>{quality.summary}</p>{quality.accepted&&quality.overridden_at&&<p className="production-quality-override-note">{t("你已查看证据并人工放行；原始告警仍保留用于追溯。","You reviewed the evidence and manually released this take; the original findings remain for audit.","証拠を確認して手動承認しました。元の警告は追跡用に保持されます。","你已查看證據並人工放行；原始警告仍保留供追溯。")}</p>}{!!quality.issues?.length&&<div className="production-quality-issues">{quality.issues.slice(0,6).map((issue,index)=><p className={issue.severity} key={issue.code+index}><b>{issue.code.replaceAll("_"," ")}</b><span>{issue.message}</span>{issue.confidence!=null&&<em>{Math.round(issue.confidence*100)}%</em>}</p>)}</div>}{quality.repair_direction&&<div className="production-quality-repair"><b>{t("建议修复要求","Suggested repair","修正案","建議修復要求")}</b><span>{quality.repair_direction}</span></div>}<div className="production-quality-actions"><button disabled={!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void reviewTake(row,qualityTake)}><RefreshCw size={14}/>{t("重新质检","Review again","再検査","重新質檢")}</button>{quality.status==="failed"&&!quality.accepted&&<button disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void acceptQualityOverride(row,qualityTake)}><Check size={14}/>{t("人工判定合格","Accept after review","手動で合格","人工判定合格")}</button>}{quality.status==="failed"&&quality.repair_direction&&!quality.accepted&&<button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void approveQualityRepair(row,qualityTake)}><RefreshCw size={14}/>{t("批准修复并重做","Approve repair and rerender","修正と再生成を承認","批准修復並重做")}</button>}</div></section>}
               <div className="production-output-dialogue"><b>{t("本段对白 · 对照视频听","Clip dialogue · check against the video","このクリップの台詞・映像と照合","本段對白 · 對照影片聽")}</b>{segment?.dialogue?.length?segment.dialogue.map((line,index)=><p key={index}><strong>{line.speaker||t("未署名","Unknown speaker","話者未設定","未署名")}{line.voiceover?" · "+t("画外音","off-screen","画面外","畫外音"):""}</strong><span>{line.text}</span></p>):<small>{t("本段无对白；检查动作、音效和画面连续性。","No dialogue in this clip; check action, sound and visual continuity.","このクリップに台詞はありません。動作・音・映像の連続性を確認してください。","本段無對白；檢查動作、音效和畫面連續性。")}</small>}</div>
               {(activeJob?.output_folder||selected?.output_folder)&&<code className="production-output-folder">ComfyUI/output/{activeJob?.output_folder||selected?.output_folder}</code>}
               {activeJob&&<div className="production-active-job">{isUncertain?<RefreshCw size={15}/>:<LoaderCircle className="spin" size={15}/>}<span><b>{activeJob.stage||activeJob.status}</b> · {formatSeconds(activeJob.elapsed_seconds)}</span>{isUncertain?<button onClick={()=>void run(t("核对中断的视频任务","Check interrupted video task","中断した映像タスクを確認","核對中斷的影片任務"),async()=>{await api("/video/runs/"+activeJob.id+"/resolve",{},undefined,"POST",{timeoutMs:45000});await refreshOutputs(production.id,true);setNotice(t("已核对该任务；若 ComfyUI 中没有原任务，现在可以从本段重新生成。","The task was checked. If no original ComfyUI job remains, this clip can now be generated again.","タスクを確認しました。元のComfyUIタスクがなければ、このクリップを再生成できます。","已核對該任務；若 ComfyUI 中沒有原任務，現在可以從本段重新生成。"));})}><RefreshCw size={13}/>{t("核对并解锁","Check & unlock","確認して解除","核對並解鎖")}</button>:<button onClick={()=>void stopVideo(activeJob)}><Square size={13}/>{t("停止","Stop","停止","停止")}</button>}</div>}
               <label>{t("本段采用版本","Adopted take for this clip","このクリップの採用テイク","本段採用版本")}<select value={selected?.id||""} disabled={!readyTakes.length} onChange={e=>void selectVideo(row,e.target.value)}>
-                {!readyTakes.length&&<option value="">{t("暂无成功版本","No successful take","成功テイクなし","暫無成功版本")}</option>}{readyTakes.map((job,i)=><option key={job.id} value={job.id}>{t("版本","Take","テイク","版本")} {readyTakes.length-i}{job.seed!=null?" · Seed "+job.seed:""}{row.selection==="latest"&&job.id===selected?.id?t(" · 最新自动采用"," · latest auto choice"," · 最新を自動採用"," · 最新自動採用"):""}</option>)}</select></label>
-              <div><span>{row.candidates.length} {t("个生成记录","render records","件の生成履歴","個生成記錄")}</span><span className="production-row-actions">{segment&&<><button disabled={production.task_state==="paused"||!!busy||outputs.active_jobs>0} onClick={()=>void rebuildPrompt(segment,true)}><Sparkles size={14}/>{t("重做提示词","Regenerate prompt","プロンプトを再生成","重做提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||outputs.active_jobs>0} onClick={()=>void generateVideo(segment)}><RefreshCw size={14}/>{t("重做视频","Regenerate video","映像を再生成","重做影片")}</button></>}{row.project_id&&<button onClick={async()=>{await onOpenProject(row.project_id!);onStudio();}}>{t("打开本段 H3","Open clip in H3","このクリップをH3で開く","開啟本段 H3")}</button>}</span></div></div>
-          </article>})}</div>
+                {!readyTakes.length&&<option value="">{t("暂无成功版本","No successful take","成功テイクなし","暫無成功版本")}</option>}{readyTakes.map((job,i)=><option key={job.id} value={job.id} disabled={job.quality_review?.status==="failed"&&!job.quality_review?.accepted}>{t("版本","Take","テイク","版本")} {readyTakes.length-i}{job.seed!=null?" · Seed "+job.seed:""}{job.quality_review?.status==="failed"&&!job.quality_review?.accepted?t(" · 质检未通过"," · QC rejected","・品質検査不合格"," · 質檢未通過"):job.quality_review?.status==="failed"&&job.quality_review?.accepted?t(" · 人工放行"," · human accepted","・手動承認"," · 人工放行"):row.selection==="latest"&&job.id===selected?.id?t(" · 最新自动采用"," · latest auto choice"," · 最新を自動採用"," · 最新自動採用"):""}</option>)}</select></label>
+              <div><span>{row.candidates.length} {t("个生成记录","render records","件の生成履歴","個生成記錄")}</span><span className="production-row-actions">{segment&&<><button disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>void rebuildPrompt(segment,true)}><Sparkles size={14}/>{t("重做提示词","Regenerate prompt","プロンプトを再生成","重做提示詞")}</button><button disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>void generateVideo(segment)}><RefreshCw size={14}/>{t("重做视频","Regenerate video","映像を再生成","重做影片")}</button></>}{row.project_id&&<button onClick={async()=>{await onOpenProject(row.project_id!);onStudio();}}>{t("打开本段 H3","Open clip in H3","このクリップをH3で開く","開啟本段 H3")}</button>}</span></div></div>
+            </article></React.Fragment>})}</div>
           <div className={outputs.final_ready?"production-final ready":"production-final"}><div><span className="eyebrow">FINAL FILM</span><h3>{t("项目最终成片","Final production film","プロジェクト最終映像","專案最終成片")}</h3>
-            <p>{outputs.final_ready?t("已按分镜顺序完成；若更换任一采用版本，会生成新的成片。","Assembled in storyboard order. Changing any adopted take creates a new film.","絵コンテ順に完成しました。採用テイクを変更すると新しい映像を作成します。","已按分鏡順序完成；若更換任一採用版本，會生成新的成片。"):outputs.all_ready?t("采用版本已齐全，可以开始合片。","All adopted takes are ready for assembly.","採用テイクが揃い、結合できます。","採用版本已齊全，可以開始合片。"):t("缺少的分镜会保留为空，不会拿错误项目的视频补位。","Missing clips stay empty; videos from another project are never substituted.","不足クリップは空欄のままにし、別プロジェクトの映像で代用しません。","缺少的分鏡會保留為空，不會拿錯誤專案的影片補位。")}</p></div>
+            <p>{outputs.final_ready?t("已按分镜顺序完成；若更换任一采用版本，会生成新的成片。","Assembled in storyboard order. Changing any adopted take creates a new film.","絵コンテ順に完成しました。採用テイクを変更すると新しい映像を作成します。","已按分鏡順序完成；若更換任一採用版本，會生成新的成片。"):outputs.all_ready&&!outputs.quality_ready?t("视频版本已齐全，正在等待生成后质检完成；不合格版本须经你人工放行或修复后才能进入最终成片。","All takes exist and are waiting for post-render review. A rejected take needs your manual acceptance or an approved repair before final assembly.","映像テイクは揃い、生成後の品質検査待ちです。不合格テイクは手動承認または修正後に最終映像へ使用できます。","影片版本已齊全，正在等待生成後質檢完成；不合格版本須經你人工放行或修復後才能進入最終成片。"):outputs.all_ready?t("采用版本已齐全，可以开始合片。","All adopted takes are ready for assembly.","採用テイクが揃い、結合できます。","採用版本已齊全，可以開始合片。"):t("缺少的分镜会保留为空，不会拿错误项目的视频补位。","Missing clips stay empty; videos from another project are never substituted.","不足クリップは空欄のままにし、別プロジェクトの映像で代用しません。","缺少的分鏡會保留為空，不會拿錯誤專案的影片補位。")}</p></div>
             {outputs.final_ready&&outputs.final_url&&<div className="production-final-player"><video controls playsInline preload="metadata" src={outputs.final_url}/><div className="production-film-location"><strong>{t("已自动保存在本机，无需再下载","Saved locally; no download required","ローカルに保存済み・ダウンロード不要","已自動儲存在本機，無需再下載")}</strong><code title={outputs.file_path||""}>{outputs.file_path}</code><div className="production-actions"><button onClick={()=>void openProductionFilmFolder()} disabled={!!busy}><FolderOpen size={16}/>{t("打开文件位置","Open file location","保存場所を開く","開啟檔案位置")}</button>{outputs.download_url&&<a href={outputs.download_url}><Download size={16}/>{t("另存副本","Download a copy","コピーを保存","另存副本")}</a>}</div></div></div>}</div>
         </>}
       </section>

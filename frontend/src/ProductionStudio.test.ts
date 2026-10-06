@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { productionDialogueExport, productionKeyframeSize, productionStoryExport, segmentHasCompletedVideo, segmentNeedsVideoPrompt, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { productionDialogueExport, productionKeyframeSize, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -28,6 +28,23 @@ describe("production text exports",()=>{
 });
 
 describe("episode batch production",()=>{
+  it("targets only checked clips and keeps storyboard order",()=>{
+    const clips:any[]=[{id:"clip-1"},{id:"clip-2"},{id:"clip-3"}];
+    expect(selectedClipTargets(clips,["clip-3","clip-1"]).map(item=>item.id)).toEqual(["clip-1","clip-3"]);
+    expect(selectedClipTargets(clips,[])).toEqual([]);
+  });
+
+  it("targets only explicit unaccepted QC rejections for batch release",()=>{
+    const outputs:any={segments:[
+      {segment_id:"clip-1",index:1,title:"Rejected",candidates:[{id:"run-1",status:"succeeded",video_url:"/1.mp4",quality_review:{status:"failed",accepted:false}}]},
+      {segment_id:"clip-2",index:2,title:"Already accepted",candidates:[{id:"run-2",status:"succeeded",video_url:"/2.mp4",quality_review:{status:"failed",accepted:true}}]},
+      {segment_id:"clip-3",index:3,title:"Passed",candidates:[{id:"run-3",status:"succeeded",video_url:"/3.mp4",quality_review:{status:"passed",accepted:false}}]},
+    ]};
+    expect(qualityAcceptanceTargets(outputs)).toEqual([
+      {segment_id:"clip-1",run_id:"run-1",index:1,title:"Rejected"},
+    ]);
+  });
+
   it("skips only a prompt that is current, prepared, and non-stale",()=>{
     const current:any={video_prompt:"A complete prompt",status:"ready",project_id:"project-1",stale_reasons:[]};
     expect(segmentNeedsVideoPrompt(current)).toBe(false);

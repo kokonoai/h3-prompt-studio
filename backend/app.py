@@ -13,6 +13,8 @@ import time
 import uuid
 import zipfile
 import httpx
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,14 +22,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageStat, UnidentifiedImageError
 
 from .projects import new_project, safe_id, atomic_json, check_project, merge_plan, merge_assist, ALLOWED_SHOT_FIELDS
 from .resources import ResourceManager, ResourceError, local_url, gpu_snapshot
+from .lmstudio import LMStudioError
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get('H3_STUDIO_DATA', ROOT / 'data')).resolve()
-for folder in ('projects', 'assets', 'history', 'exports', 'productions', 'production_archive', 'production_films', 'video_library_films', 'series', 'series_archive', 'series_films', 'card_collections', 'card_collection_archive', 'video_workflows', 'library/templates', 'library/versions'):
+for folder in ('projects', 'assets', 'history', 'exports', 'productions', 'production_archive', 'production_films', 'production_frames', 'production_quality', 'video_library_films', 'series', 'series_archive', 'series_films', 'card_collections', 'card_collection_archive', 'video_workflows', 'library/templates', 'library/versions'):
     (DATA / folder).mkdir(parents=True, exist_ok=True)
 Image.MAX_IMAGE_PIXELS = 40_000_000
 TOKEN, BRIDGE_TOKEN = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
@@ -41,7 +44,11 @@ MOTION_LAB = None
 PRODUCTIONS = None
 SERIES = None
 VIDEO_WORKFLOWS = None
+PRODUCTION_AUTOMATION = None
 VIDEO_FILE_LOCKS = {}
+PRODUCTION_FRAME_JOBS = set()
+PRODUCTION_QUALITY_JOBS = {}
+PRODUCTION_FRAME_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix='h3-review-frames')
 FILM_ASSEMBLY_VERSION = 2
 DEFAULT_SETTINGS = {'lm_url': 'http://127.0.0.1:11434/v1', 'model': '', 'context_length': 8192,
                     'comfy_urls': ['http://127.0.0.1:8188', 'http://127.0.0.1:8000', 'http://127.0.0.1:8010'], 'persona': 'universal', 'last_project': '',
@@ -62,7 +69,22 @@ def client():
     return _assistant_client(SETTINGS['lm_url'])
 
 RESOURCES = ResourceManager(lambda: copy.deepcopy(SETTINGS), client, state_path=DATA / 'resource_state.json')
-app = FastAPI(title='H3 Prompt Studio', version='1.23.1', docs_url='/api/docs')
+
+
+@asynccontextmanager
+async def app_lifespan(_app):
+    # Functions referenced here are resolved after the module has finished
+    # loading, when FastAPI actually enters the lifespan.
+    threading.Thread(target=lambda: production_automation_manager().recover(), daemon=True,
+                     name='h3-production-recovery').start()
+    try:
+        yield
+    finally:
+        if PRODUCTION_AUTOMATION is not None:
+            PRODUCTION_AUTOMATION.shutdown()
+
+
+app = FastAPI(title='H3 Prompt Studio', version='1.23.1', docs_url='/api/docs', lifespan=app_lifespan)
 BRIDGE_PORTS = ('8188', '8000', '8010')
 LOCAL_ORIGINS = [f'http://{host}:{port}' for host in ('127.0.0.1', 'localhost') for port in (8766, 8188, 8010, 8000)]
 app.add_middleware(CORSMiddleware, allow_origins=LOCAL_ORIGINS, allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], allow_headers=['Content-Type', 'X-H3-Bridge', 'X-H3-Token'])
@@ -132,6 +154,17 @@ async def bad_value(request, exc):
 @app.exception_handler(ResourceError)
 async def resource_error(request, exc):
     return JSONResponse({'detail': str(exc)}, status_code=409)
+
+@app.exception_handler(LMStudioError)
+async def local_ai_error(request, exc):
+    # LMStudioError is the historical shared client exception name; Ollama
+    # uses the same safe transport boundary. Never expose that implementation
+    # detail as if the user selected the wrong provider.
+    provider = 'Ollama' if ':11434' in str(SETTINGS.get('lm_url', '')) else 'LM Studio'
+    message = str(exc)[:1200]
+    if not message.lower().startswith(provider.lower()):
+        message = f'{provider}: {message}'
+    return JSONResponse({'detail': message, 'code': exc.code}, status_code=502)
 
 @app.exception_handler(Exception)
 async def unexpected_error(request, exc):
@@ -676,6 +709,29 @@ def production_manager():
         return PRODUCTIONS
 
 
+def production_automation_manager():
+    global PRODUCTION_AUTOMATION
+    with STATE_LOCK:
+        if PRODUCTION_AUTOMATION is None:
+            from .production_automation import ProductionAutomationManager
+            PRODUCTION_AUTOMATION = ProductionAutomationManager(
+                list_productions=lambda: production_manager().list(),
+                get_production=lambda ident: production_manager().get(ident),
+                update_automation=lambda ident, changes: production_manager().update_automation(ident, changes),
+                outputs=lambda ident: production_outputs(ident),
+                generate_prompt=lambda production_id, segment_id: production_segment_prompt(
+                    production_id, segment_id, {'use_ai': True, '_automation': True}),
+                submit_video=lambda production_id, segment_id, request_id: production_segment_video(
+                    production_id, segment_id,
+                    {'request_id': request_id, 'new_seed': True, '_automation': True}),
+                get_run=lambda run_id: video_manager().refresh(run_id),
+                resolve_run=lambda run_id: video_manager().resolve_missing(run_id),
+                review_quality=lambda production_id: review_production_quality(production_id),
+                build_film=lambda production_id: build_production_film(production_id),
+            )
+        return PRODUCTION_AUTOMATION
+
+
 def series_manager():
     global SERIES
     with STATE_LOCK:
@@ -833,11 +889,18 @@ def card_collection_apply(production_id: str, collection_id: str):
 
 @app.patch('/api/productions/{production_id}')
 def production_update(production_id: str, body: dict):
+    current = production_manager().get(production_id)
+    if (current.get('automation', {}).get('status') in ('running', 'retrying')
+            and set(body) - {'task_state'}):
+        raise ValueError('Pause the background production before changing its script, cards, storyboard or render settings.')
     return production_manager().update(production_id, body)
 
 
 @app.delete('/api/productions/{production_id}')
 def production_delete(production_id: str):
+    current = production_manager().get(production_id)
+    if current.get('automation', {}).get('status') in ('running', 'retrying'):
+        raise ValueError('Pause the background production before deleting this episode.')
     return production_manager().delete(production_id)
 
 @app.post('/api/productions/{production_id}/cards/{kind}/{card_id}/assets')
@@ -933,7 +996,9 @@ def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
-                              timed_clip_groups, timed_group_story)
+                              storyboard_output_token_budget,
+                              timed_clip_groups, timed_group_story,
+                              validate_planned_chunk_source_contract)
     started = time.monotonic()
     production = production_manager().assert_active(production_id)
     story = current_episode_story(production)
@@ -943,7 +1008,7 @@ def production_plan(production_id: str, body: dict):
     if use_ai:
         production = _generate_production_text_cards(production_id, False)
         story = current_episode_story(production)
-    planned, planner, warning = None, 'local_heuristic', None
+    planned, planner, warning = None, 'local_manual', None
     if use_ai:
         try:
             def generate(model):
@@ -953,14 +1018,57 @@ def production_plan(production_id: str, body: dict):
                 source_groups = timed_clip_groups(story)
                 pieces = ([timed_group_story(group) for group in source_groups]
                           if source_groups else storyboard_planning_chunks(story))
-                segments, previous_ending = [], ''
+                segments, previous_ending, previous_contract = [], '', {}
                 for index, piece in enumerate(pieces):
                     RESOURCES.stage = f'Planning story part {index + 1} of {len(pieces)}'
-                    answer = client().complete_json(
-                        model, PLANNER_SYSTEM,
-                        planning_payload(production, piece, index + 1, len(pieces), previous_ending),
-                        production_schema_for_story(piece), max_tokens=4096, temperature=0.25)
-                    new_segments = answer['segments']
+                    payload = planning_payload(production, piece, index + 1, len(pieces), previous_ending,
+                                               previous_contract)
+                    timing = episode_timing_targets(production, index + 1, len(pieces), piece)
+                    # Each segment carries source, cast, continuity and edit
+                    # contracts. Scale within the local client's real 4,096
+                    # output-token ceiling, then verify and retry this source
+                    # part before moving on to the next one.
+                    feasible = timing.get('feasible_clip_count') or {}
+                    # Reserve for the largest valid split of this source part,
+                    # not only the nominal ten-second recommendation. Dense
+                    # story text may legitimately need the second clip.
+                    clip_count = max(
+                        1, int(timing.get('recommended_clip_count') or 1),
+                        int(feasible.get('maximum') or 1))
+                    output_budget = storyboard_output_token_budget(clip_count)
+                    coverage_error = None
+                    for attempt in range(2):
+                        request = payload
+                        if attempt:
+                            retry = json.loads(payload)
+                            retry['validation_retry'] = (
+                                'The previous response violated the storyboard schema or source-coverage contract. '
+                                'Return a fresh complete plan. Assign every source_manifest paragraph, dialogue and '
+                                'event ID exactly once and in order. Do not shorten story coverage. Keep story to one '
+                                'or two concise sentences (at most 3000 characters), setting to one sentence, action '
+                                'to at most three sentences, and ending to one sentence. Exact authored dialogue stays '
+                                'only in the structured dialogue list; never paste the full screenplay into story. Diagnostic: ' +
+                                str(coverage_error)[:1200])
+                            request = json.dumps(retry, ensure_ascii=False, indent=2)
+                            RESOURCES.stage = f'Retrying source coverage for story part {index + 1} of {len(pieces)}'
+                        answer = client().complete_json(
+                            model, PLANNER_SYSTEM, request,
+                            production_schema_for_story(piece), max_tokens=output_budget,
+                            temperature=0.12 if attempt else 0.25)
+                        new_segments = answer['segments']
+                        try:
+                            new_segments = validate_planned_chunk_source_contract(
+                                piece, index + 1, new_segments)
+                            break
+                        except ValueError as exc:
+                            coverage_error = exc
+                            if attempt:
+                                raise
+                    # Keep an immutable source-part binding outside model prose.
+                    # apply_plan uses it to prove paragraph/dialogue/event
+                    # coverage and to reject cross-part reordering.
+                    for segment in new_segments:
+                        segment['_source_chunk'] = index + 1
                     if source_groups:
                         # Fit and tag each authored block before joining the
                         # whole episode.  The tag is internal and is discarded
@@ -974,6 +1082,17 @@ def production_plan(production_id: str, body: dict):
                     if len(segments) > 64:
                         raise ValueError('This story needs more than 64 H3 clips. Split it into episodes before planning.')
                     previous_ending = segments[-1]['ending'] if segments else previous_ending
+                    if segments:
+                        last = segments[-1]
+                        previous_contract = {
+                            'ending_state': last.get('continuity_state', {}).get('ending_state', last.get('ending', '')),
+                            'cast_timeline': last.get('cast_timeline', {}),
+                            'positions_end': last.get('continuity_state', {}).get('positions_end', []),
+                            'prop_holders_end': last.get('continuity_state', {}).get('prop_holders_end', []),
+                            'ending_composition': last.get('shot_contract', {}).get('ending_composition', ''),
+                            'shot_size': last.get('shot_contract', {}).get('shot_size', ''),
+                            'camera_axis': last.get('shot_contract', {}).get('camera_axis', ''),
+                        }
                 if source_groups:
                     return segments
                 target = episode_timing_targets(production, story=story)['episode_target_seconds']
@@ -981,8 +1100,14 @@ def production_plan(production_id: str, body: dict):
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)
             planner = 'local_ai'
         except Exception as exc:
-            warning = f'Local AI planning was unavailable, so safe dynamic timing was used instead: {str(exc)[:360]}'
-    if planned is None:
+            warning = (
+                'Local AI storyboard planning did not complete. No mechanical fallback was saved and the existing '
+                'storyboard was preserved. Fix the reported cause, then run AI planning again: ' + str(exc)[:500])
+            failed = production_manager().get(production_id)
+            failed['planner_warning'] = warning
+            production_manager().save(failed)
+            raise ValueError(warning) from exc
+    if not use_ai:
         target = episode_timing_targets(production, story=story)['episode_target_seconds']
         planned = fallback_segments(story, target, production['language'])
     production_manager().apply_plan(production_id, planned, planner, warning)
@@ -998,7 +1123,7 @@ def production_episode_plan(production_id: str, body: dict):
         raise ValueError('use_ai must be true or false.')
     if use_ai:
         production = _generate_production_text_cards(production_id, False)
-    planned, planner, warning = None, 'local_heuristic', None
+    planned, planner, warning = None, 'local_manual', None
     if use_ai:
         try:
             def generate(model):
@@ -1019,8 +1144,14 @@ def production_episode_plan(production_id: str, body: dict):
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)
             planner = 'local_ai'
         except Exception as exc:
-            warning = f'Local AI episode planning was unavailable, so a safe ordered outline was used instead: {str(exc)[:360]}'
-    if planned is None:
+            warning = (
+                'Local AI episode planning did not complete. No mechanical fallback was saved and the existing '
+                'episode plan was preserved. Fix the reported cause, then run AI planning again: ' + str(exc)[:500])
+            failed = production_manager().get(production_id)
+            failed['episode_planner_warning'] = warning
+            production_manager().save(failed)
+            raise ValueError(warning) from exc
+    if not use_ai:
         planned = fallback_episodes(production)
     production_manager().apply_episode_plan(production_id, planned, planner, warning)
     return production_manager().record_timing(production_id, 'episode_plan_seconds', time.monotonic() - started)
@@ -1058,6 +1189,449 @@ def _production_video_job_counts(segments):
     }
 
 
+def _production_review_folder(production_id, segment_id, run_id):
+    # Every path component is a canonical UUID, so there is no unresolved user
+    # path to escape this dedicated result root. Avoid resolving a not-yet-made
+    # temporary test root on Windows, where ACL aliases can compare unequal.
+    return ((DATA / 'production_frames').resolve() / safe_id(production_id) /
+            safe_id(segment_id) / safe_id(run_id))
+
+
+def _review_image_metrics(path):
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert('RGB')
+        image.thumbnail((96, 96))
+        means = ImageStat.Stat(image).mean
+        histogram = image.histogram()
+        compact = []
+        for channel in range(3):
+            values = histogram[channel * 256:(channel + 1) * 256]
+            total = max(1, sum(values))
+            compact.extend(round(sum(values[start:start + 16]) / total, 6)
+                           for start in range(0, 256, 16))
+        return {
+            'brightness': round(.2126 * means[0] + .7152 * means[1] + .0722 * means[2], 2),
+            'temperature': round(means[0] - means[2], 2),
+            'rgb_mean': [round(value, 2) for value in means],
+            'histogram': compact,
+        }
+
+
+def _ensure_production_review_frames(production_id, segment_id, run_id):
+    """Extract actual first/middle/last scene frames once per successful take."""
+    folder = _production_review_folder(production_id, segment_id, run_id)
+    metadata = folder / 'frames.json'
+    with STATE_LOCK:
+        lock = VIDEO_FILE_LOCKS.setdefault('review-frames:' + safe_id(run_id), threading.Lock())
+    with lock:
+        if metadata.is_file():
+            try:
+                saved = json.loads(metadata.read_text(encoding='utf-8'))
+                if all((folder / f'{kind}.png').is_file() for kind in ('first', 'middle', 'last')):
+                    return saved
+            except (OSError, ValueError, KeyError):
+                pass
+        folder.mkdir(parents=True, exist_ok=True)
+        source = scene_video_path(run_id)
+        try:
+            probe = media_probe(source)
+            duration = float(probe.get('format', {}).get('duration') or 0)
+        except (ValueError, TypeError, KeyError):
+            duration = 0
+        if duration <= 0:
+            duration = float(video_manager().get(run_id).get('new_seconds') or
+                             video_manager().get(run_id).get('duration') or 5)
+        specs = {
+            'first': ['-ss', '0'],
+            'middle': ['-ss', f'{max(.05, duration / 2):.3f}'],
+            # Decode only the ending window then reverse it so the first output
+            # is the actual last decodable frame, not a guessed timestamp.
+            'last': ['-sseof', f'-{min(1.0, max(.1, duration)):.3f}'],
+        }
+        for kind, seek in specs.items():
+            output = folder / f'{kind}.png'
+            if output.is_file() and output.stat().st_size:
+                continue
+            temporary = folder / f'.{kind}-{uuid.uuid4().hex}.png'
+            filters = ('reverse,' if kind == 'last' else '') + 'scale=min(960\\,iw):-2'
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', *seek,
+                 '-i', str(source), '-an', '-vf', filters, '-frames:v', '1', str(temporary)],
+                capture_output=True, timeout=60,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
+                temporary.unlink(missing_ok=True)
+                raise ValueError('A continuity review frame could not be extracted from this completed take.')
+            temporary.replace(output)
+        result = {
+            'run_id': safe_id(run_id), 'duration': round(duration, 3),
+            'metrics': {kind: _review_image_metrics(folder / f'{kind}.png')
+                        for kind in ('first', 'middle', 'last')},
+            'created_at': time.time(),
+        }
+        atomic_json(metadata, result)
+        return result
+
+
+def _schedule_production_review_frames(production_id, segment_id, run_id):
+    folder = _production_review_folder(production_id, segment_id, run_id)
+    key = (safe_id(production_id), safe_id(segment_id), safe_id(run_id))
+    if (folder / 'frames.json').is_file():
+        return
+    with STATE_LOCK:
+        if key in PRODUCTION_FRAME_JOBS:
+            return
+        PRODUCTION_FRAME_JOBS.add(key)
+
+    def extract():
+        try:
+            _ensure_production_review_frames(*key)
+        except Exception:
+            # A playable take remains valid even if optional editorial frames
+            # cannot be decoded. The on-demand endpoint will return a useful
+            # error and can retry after the file becomes available.
+            pass
+        finally:
+            with STATE_LOCK:
+                PRODUCTION_FRAME_JOBS.discard(key)
+    PRODUCTION_FRAME_EXECUTOR.submit(extract)
+
+
+def _production_review_descriptor(production_id, segment_id, run_id):
+    folder = _production_review_folder(production_id, segment_id, run_id)
+    root = (f'/api/productions/{safe_id(production_id)}/segments/{safe_id(segment_id)}'
+            f'/runs/{safe_id(run_id)}/frames')
+    metadata = None
+    if (folder / 'frames.json').is_file():
+        try:
+            metadata = json.loads((folder / 'frames.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            metadata = None
+    return {
+        'status': 'ready' if metadata else 'extracting',
+        'first_url': root + '/first', 'middle_url': root + '/middle', 'last_url': root + '/last',
+        'metrics': metadata.get('metrics') if metadata else None,
+    }
+
+
+def _production_quality_path(production_id, segment_id, run_id):
+    root = (DATA / 'production_quality').resolve()
+    path = (root / safe_id(production_id) / safe_id(segment_id) /
+            (safe_id(run_id) + '.json')).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError('The quality review path is outside the local result folder.')
+    return path
+
+
+def _production_quality_descriptor(production_id, segment_id, run_id):
+    path = _production_quality_path(production_id, segment_id, run_id)
+    if not path.is_file():
+        # Historical takes predate automatic review and remain adoptable. Only
+        # newly submitted takes receive a durable pending record.
+        return {'status': 'legacy', 'required': False, 'accepted': True,
+                'legacy_take': True,
+                'summary': 'Created before automatic post-render review.', 'issues': []}
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {'status': 'pending', 'required': True, 'accepted': False,
+                'summary': 'Quality review metadata needs to be rebuilt.', 'issues': []}
+    return value
+
+
+def _save_production_quality(production_id, segment_id, run_id, value):
+    path = _production_quality_path(production_id, segment_id, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = {**copy.deepcopy(value), 'production_id': safe_id(production_id),
+             'segment_id': safe_id(segment_id), 'run_id': safe_id(run_id),
+             'updated_at': time.time()}
+    atomic_json(path, value)
+    return value
+
+
+def _require_production_quality(production_id, segment_id, run_id):
+    current = _production_quality_descriptor(production_id, segment_id, run_id)
+    if current.get('required'):
+        return current
+    return _save_production_quality(production_id, segment_id, run_id, {
+        'status': 'pending', 'required': True, 'accepted': False,
+        'summary': 'Waiting for post-render quality review.', 'issues': [],
+        'repair_direction': '', 'reviewed_at': None,
+    })
+
+
+def _quality_reference_rows(production, segment):
+    selected = {str(value).strip().casefold() for value in
+                segment.get('card_selection', {}).get('characters', []) if str(value).strip()}
+    cards = [card for card in production.get('cards', {}).get('characters', [])
+             if str(card.get('id') or '').casefold() in selected or
+             str(card.get('name') or '').casefold() in selected]
+    # A style reference helps detect a wholesale medium change but is never a
+    # subject reference. Keep it separately labelled.
+    style_cards = production.get('cards', {}).get('styles', [])[:1]
+    rows = []
+    for card in [*cards, *style_cards]:
+        for asset_id in card.get('asset_ids', []):
+            try:
+                meta = asset_meta(asset_id)
+                path = DATA / 'assets' / safe_id(asset_id) / meta['filename']
+                if meta.get('media_type') == 'image' and path.is_file():
+                    rows.append({'path': path, 'label': ('STYLE ' if card in style_cards else 'IDENTITY ') +
+                                 str(card.get('name') or 'reference')})
+                    break
+            except (ValueError, HTTPException, OSError, KeyError):
+                continue
+    return rows[:6]
+
+
+def _quality_visual_context(production, segment, references):
+    from .productions import (character_presence_roles,
+                              device_screen_geometry_lock, effective_cast_timeline)
+    character_rows = production.get('cards', {}).get('characters', [])
+    cards = {card['id']: card for card in character_rows}
+    selected_labels = {str(value).strip().casefold() for value in
+                       segment.get('card_selection', {}).get('characters', []) if str(value).strip()}
+    selected = [card for card in character_rows
+                if str(card.get('id') or '').casefold() in selected_labels or
+                str(card.get('name') or '').casefold() in selected_labels]
+    roles = character_presence_roles(production, segment)
+    timeline = effective_cast_timeline(production, segment)
+    role_names = {role: [cards[ident].get('name') for ident, value in roles.items()
+                         if value == role and ident in cards]
+                  for role in ('physical', 'display', 'imagined', 'offscreen', 'absent')}
+    display_names = role_names['display']
+    must_not_be_physical = list(dict.fromkeys(
+        role_names['display'] + role_names['imagined'] + role_names['offscreen'] +
+        timeline.get('offscreen', []) + timeline.get('mentioned_only', [])))
+    state = segment.get('continuity_state', {})
+    return {
+        'clip': {'index': segment.get('index'), 'title': segment.get('title'),
+                 'action': segment.get('action'), 'ending': segment.get('ending'),
+                 'device_view': segment.get('device_view')},
+        'required_visible_first': timeline.get('visible_start', []),
+        'required_visible_last': timeline.get('visible_end', []),
+        'enters': timeline.get('enters', []), 'exits': timeline.get('exits', []),
+        'display_only': display_names,
+        'imagined_only': role_names['imagined'],
+        'offscreen_only': role_names['offscreen'],
+        'must_not_be_physical': must_not_be_physical,
+        'device_geometry_contract': device_screen_geometry_lock(segment, display_names),
+        'characters': [{'name': card.get('name'), 'visible_traits': card.get('description'),
+                        'has_reference_image': any(row.get('label', '').endswith(str(card.get('name')))
+                                                   for row in references)}
+                       for card in selected],
+        'opening_state': state.get('opening_state'), 'ending_state': state.get('ending_state'),
+        'prop_holders_start': state.get('prop_holders_start', []),
+        'prop_holders_end': state.get('prop_holders_end', []),
+        'visual_style': production.get('style_bible') or production.get('visual_style_custom') or
+                        production.get('visual_style_preset'),
+        'sampling_limit': ('Only first/middle/last frames are supplied. Do not infer dialogue, sound, '
+                           'continuous motion, or off-screen events.'),
+    }
+
+
+def _review_production_take(production_id, segment_id, run_id, *, model=None,
+                            visual_error=None, force=False):
+    from .production_quality import (VISUAL_REVIEW_SCHEMA, VISUAL_REVIEW_SYSTEM,
+                                     contact_sheet, media_issues, normalise_visual_review,
+                                     repair_direction)
+    production = production_manager().get(safe_id(production_id))
+    segment = next((row for row in production['segments']
+                    if row['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    run = video_manager().get(safe_id(run_id))
+    if (run.get('project_id') != segment.get('project_id') or
+            run.get('status') != 'succeeded' or not run.get('video_url')):
+        raise ValueError('Quality review needs a completed take from this exact production clip.')
+    existing = _production_quality_descriptor(production['id'], segment['id'], run['id'])
+    if (not force and existing.get('required') and
+            existing.get('status') in ('passed', 'warning', 'failed', 'manual_review')):
+        return existing
+    _save_production_quality(production['id'], segment['id'], run['id'], {
+        'status': 'reviewing', 'required': True, 'accepted': False,
+        'summary': 'Inspecting the completed take.', 'issues': [],
+        'repair_direction': '', 'reviewed_at': None,
+    })
+    frames = _ensure_production_review_frames(production['id'], segment['id'], run['id'])
+    probe = media_probe(scene_video_path(run['id']))
+    deterministic = media_issues(probe, float(segment.get('duration') or 0),
+                                 bool(segment.get('dialogue')))
+    references = _quality_reference_rows(production, segment)
+    visual = {'status': 'passed', 'summary': '', 'observed_cast_counts': {}, 'issues': []}
+    error_text = str(visual_error or '').strip()
+    if model:
+        try:
+            folder = _production_review_folder(production['id'], segment['id'], run['id'])
+            data_url = contact_sheet({kind: folder / f'{kind}.png'
+                                      for kind in ('first', 'middle', 'last')}, references)
+            context = _quality_visual_context(production, segment, references)
+            content = [
+                {'type': 'text', 'text': 'Inspect this sampled render against the bounded contract: ' +
+                 json.dumps(context, ensure_ascii=False)},
+                {'type': 'image_url', 'image_url': {'url': data_url}},
+            ]
+            raw = client().complete_json(model, VISUAL_REVIEW_SYSTEM, content,
+                                         VISUAL_REVIEW_SCHEMA, max_tokens=1600, temperature=.1)
+            visual = normalise_visual_review(
+                raw, has_identity_references=any(
+                    str(row.get('label') or '').startswith('IDENTITY ') for row in references),
+                expected_first=len(context['required_visible_first']),
+                expected_last=len(context['required_visible_last']))
+        except Exception as exc:
+            error_text = str(exc)[:600]
+    issues = [*deterministic, *visual.get('issues', [])]
+    hard = any(row.get('severity') == 'error' and float(row.get('confidence', 0)) >= .88
+               for row in issues)
+    if hard:
+        status = 'failed'
+    elif error_text:
+        status = 'manual_review'
+        issues.append({'severity': 'warning', 'code': 'visual_review_unavailable',
+                       'confidence': 1.0, 'frame': 'multiple',
+                       'message': 'Visual AI review was unavailable; deterministic media checks completed.',
+                       'repair_instruction': ''})
+    elif issues:
+        status = 'warning'
+    else:
+        status = 'passed'
+    summary = visual.get('summary') or (
+        'Deterministic checks passed; inspect the sampled frames manually.' if error_text else
+        'The sampled frames and media container passed the automatic checks.')
+    result = {
+        'status': status, 'required': True,
+        'accepted': status in ('passed', 'warning', 'manual_review'),
+        'legacy_take': bool(existing.get('legacy_take') or existing.get('status') == 'legacy'),
+        'summary': summary[:600], 'issues': issues[:16],
+        'observed_cast_counts': visual.get('observed_cast_counts', {}),
+        'repair_direction': repair_direction(issues),
+        'reviewed_at': time.time(), 'model': model or None,
+        'visual_error': error_text or None, 'frame_metrics': frames.get('metrics'),
+    }
+    return _save_production_quality(production['id'], segment['id'], run['id'], result)
+
+
+def review_production_quality(production_id, *, segment_id=None, run_id=None, force=False,
+                              legacy_only=False):
+    """Review pending adopted takes under one AI lease to avoid model thrashing."""
+    production = production_manager().get(safe_id(production_id))
+    overview = production_outputs(production['id'])
+    targets = []
+    for row in overview['segments']:
+        if segment_id and row['segment_id'] != safe_id(segment_id):
+            continue
+        selected = row.get('selected')
+        if run_id:
+            selected = next((job for job in row.get('candidates', [])
+                             if job.get('id') == safe_id(run_id)), None)
+        if not selected or selected.get('status') != 'succeeded':
+            continue
+        review = _production_quality_descriptor(production['id'], row['segment_id'], selected['id'])
+        if legacy_only and review.get('status') != 'legacy':
+            continue
+        if force or (review.get('required') and review.get('status') in ('pending', 'reviewing')):
+            targets.append((row['segment_id'], selected['id']))
+    if not targets:
+        return {'reviews': [], 'failed': [], 'pending': 0}
+
+    completed = []
+    try:
+        if not SETTINGS.get('model'):
+            raise ValueError('No local vision model is selected.')
+
+        def inspect(model):
+            for sid, rid in targets:
+                completed.append(_review_production_take(
+                    production['id'], sid, rid, model=model, force=force))
+            return completed
+
+        RESOURCES.run_ai(SETTINGS['model'], inspect)
+    except Exception as exc:
+        done = {row.get('run_id') for row in completed}
+        for sid, rid in targets:
+            if rid in done:
+                continue
+            completed.append(_review_production_take(
+                production['id'], sid, rid, visual_error=str(exc), force=True))
+    failed = [row for row in completed if row.get('status') == 'failed']
+    return {'reviews': completed, 'failed': failed, 'pending': 0}
+
+
+def _production_quality_batch_state(production_id):
+    with STATE_LOCK:
+        return copy.deepcopy(PRODUCTION_QUALITY_JOBS.get(safe_id(production_id)))
+
+
+def _run_production_quality_batch(production_id, legacy_only):
+    """Run an optional legacy review without holding the browser request open."""
+    production_id = safe_id(production_id)
+    try:
+        result = review_production_quality(
+            production_id, force=True, legacy_only=legacy_only)
+        state = {
+            'status': 'completed', 'legacy_only': legacy_only,
+            'reviewed_count': len(result.get('reviews', [])),
+            'failed_count': len(result.get('failed', [])),
+            'finished_at': time.time(), 'error': None,
+        }
+    except Exception as exc:
+        state = {
+            'status': 'failed', 'legacy_only': legacy_only,
+            'reviewed_count': 0, 'failed_count': 0,
+            'finished_at': time.time(), 'error': str(exc)[:1000],
+        }
+    with STATE_LOCK:
+        started = PRODUCTION_QUALITY_JOBS.get(production_id, {}).get('started_at')
+        PRODUCTION_QUALITY_JOBS[production_id] = {**state, 'started_at': started}
+
+
+def _histogram_distance(left, right):
+    if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return None
+    return round(sum(abs(float(a) - float(b)) for a, b in zip(left, right)) / 6, 3)
+
+
+def _production_boundary_report(production, previous_segment, segment, previous_run, run):
+    previous_frames = _production_review_descriptor(
+        production['id'], previous_segment['id'], previous_run['id'])
+    current_frames = _production_review_descriptor(production['id'], segment['id'], run['id'])
+    issues = [copy.deepcopy(row) for row in segment.get('continuity_issues', [])]
+    left = (previous_frames.get('metrics') or {}).get('last')
+    right = (current_frames.get('metrics') or {}).get('first')
+    if left and right:
+        brightness_delta = abs(float(left['brightness']) - float(right['brightness']))
+        temperature_delta = abs(float(left['temperature']) - float(right['temperature']))
+        histogram_delta = _histogram_distance(left.get('histogram'), right.get('histogram'))
+        if brightness_delta >= 38:
+            issues.append({'severity': 'warning', 'code': 'frame_brightness_jump',
+                           'message': f'Actual boundary brightness changes by {brightness_delta:.0f}/255.'})
+        if temperature_delta >= 32:
+            issues.append({'severity': 'warning', 'code': 'frame_temperature_jump',
+                           'message': f'Actual boundary color temperature changes sharply ({temperature_delta:.0f} RGB points).'})
+        if histogram_delta is not None and histogram_delta >= .28:
+            issues.append({'severity': 'warning', 'code': 'frame_look_jump',
+                           'message': 'Actual boundary color distribution changes strongly; verify style, wardrobe and location continuity.'})
+    else:
+        brightness_delta = temperature_delta = histogram_delta = None
+    timeline_previous = previous_segment.get('cast_timeline', {})
+    timeline_current = segment.get('cast_timeline', {})
+    return {
+        'previous_segment_id': previous_segment['id'], 'segment_id': segment['id'],
+        'previous_last_url': previous_frames['last_url'], 'next_first_url': current_frames['first_url'],
+        'previous_middle_url': previous_frames['middle_url'], 'next_middle_url': current_frames['middle_url'],
+        'frames_ready': previous_frames['status'] == 'ready' and current_frames['status'] == 'ready',
+        'planned_cast': {
+            'previous_end': timeline_previous.get('visible_end', []),
+            'next_start': timeline_current.get('visible_start', []),
+        },
+        'metrics': {'brightness_delta': brightness_delta, 'temperature_delta': temperature_delta,
+                    'histogram_delta': histogram_delta},
+        'issues': issues,
+        'status': ('error' if any(row.get('severity') == 'error' for row in issues) else
+                   'warning' if issues else 'ok'),
+    }
+
+
 def production_outputs(production_id, runs=None):
     """Join production clips to their local video runs without trusting client file paths."""
     production = production_manager().get(safe_id(production_id))
@@ -1069,8 +1643,11 @@ def production_outputs(production_id, runs=None):
         by_project.setdefault(run.get('project_id'), []).append(run)
     segments, selected_ids = [], []
     for segment in production['segments']:
-        candidates = by_project.get(segment.get('project_id'), [])
+        candidates = copy.deepcopy(by_project.get(segment.get('project_id'), []))
         ready = [run for run in candidates if run.get('status') == 'succeeded' and run.get('video_url')]
+        for run in ready:
+            run['quality_review'] = _production_quality_descriptor(
+                production['id'], segment['id'], run['id'])
         prompt_updated_at = segment.get('prompt_updated_at')
         if type(prompt_updated_at) in (int, float) and prompt_updated_at > 0:
             # A successful take made before the current prompt remains in the
@@ -1081,6 +1658,12 @@ def production_outputs(production_id, runs=None):
                                 and run['created_at'] >= prompt_updated_at]
         else:
             compatible_ready = ready
+        # A rejected take remains visible in version history.  It is excluded
+        # until a human explicitly overrides the review; pending takes remain
+        # selected so the review stage knows exactly which version to inspect.
+        compatible_ready = [run for run in compatible_ready
+                            if not (run.get('quality_review', {}).get('status') == 'failed' and
+                                    not run.get('quality_review', {}).get('accepted'))]
         manual_id = segment.get('selected_video_run_id')
         selected = next((run for run in compatible_ready if run['id'] == manual_id), None)
         selection = 'manual' if selected else 'latest'
@@ -1088,15 +1671,45 @@ def production_outputs(production_id, runs=None):
             selected = compatible_ready[0]
         if selected:
             selected_ids.append(selected['id'])
+        review_targets = {run['id'] for run in ([ready[0]] if ready else [])}
+        if selected:
+            review_targets.add(selected['id'])
+        for run in ready:
+            run['review_frames'] = _production_review_descriptor(
+                production['id'], segment['id'], run['id'])
+            if run['id'] in review_targets:
+                _schedule_production_review_frames(production['id'], segment['id'], run['id'])
         segments.append({
             'segment_id': segment['id'], 'index': segment['index'], 'title': segment['title'],
             'project_id': segment.get('project_id'), 'project_status': segment['status'],
             'candidates': candidates[:24], 'selected': selected, 'selection': selection,
+            'legacy_upgrade': bool(
+                segment.get('status') == 'stale' and selected and
+                (selected.get('quality_review', {}).get('status') == 'legacy' or
+                 selected.get('quality_review', {}).get('legacy_take'))),
         })
+    for index, row in enumerate(segments):
+        row['boundary'] = None
+        if index == 0 or not row.get('selected') or not segments[index - 1].get('selected'):
+            continue
+        row['boundary'] = _production_boundary_report(
+            production, production['segments'][index - 1], production['segments'][index],
+            segments[index - 1]['selected'], row['selected'])
     all_ready = bool(segments) and len(selected_ids) == len(segments)
+    pending_quality = [row for row in segments if row.get('selected') and
+                       row['selected'].get('quality_review', {}).get('required') and
+                       row['selected'].get('quality_review', {}).get('status') in ('pending', 'reviewing')]
+    quality_ready = all_ready and not pending_quality
+    legacy_upgrade_count = sum(bool(row.get('legacy_upgrade')) for row in segments)
+    blocking_stale_count = sum(
+        row.get('project_status') == 'stale' and not row.get('legacy_upgrade') for row in segments)
+    legacy_unreviewed_count = sum(
+        bool(row.get('selected') and
+             row['selected'].get('quality_review', {}).get('status') == 'legacy')
+        for row in segments)
     signature = hashlib.sha256(json.dumps(
         {'assembly_version': FILM_ASSEMBLY_VERSION, 'run_ids': selected_ids},
-        separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
+        separators=(',', ':')).encode()).hexdigest()[:20] if quality_ready else None
     output = DATA / 'production_films' / production['id'] / (signature + '.mp4') if signature else None
     final_ready = bool(output and output.is_file() and output.stat().st_size)
     adopted_video_seconds = round(sum(float((row['selected'] or {}).get('elapsed_seconds') or 0)
@@ -1104,7 +1717,13 @@ def production_outputs(production_id, runs=None):
     job_counts = _production_video_job_counts(segments)
     return {
         'production_id': production['id'], 'auto_merge': production.get('auto_merge', True),
+        'automation': copy.deepcopy(production.get('automation', {})),
+        'quality_batch': _production_quality_batch_state(production['id']),
         'segments': segments, 'selected_run_ids': selected_ids, 'all_ready': all_ready,
+        'quality_ready': quality_ready, 'quality_pending_count': len(pending_quality),
+        'legacy_upgrade_count': legacy_upgrade_count,
+        'legacy_unreviewed_count': legacy_unreviewed_count,
+        'blocking_stale_count': blocking_stale_count,
         'ready_count': len(selected_ids), 'segment_count': len(segments), 'signature': signature,
         'estimated_seconds': round(sum(float((row['selected'] or {}).get('new_seconds') or
                                               (row['selected'] or {}).get('duration') or 0)
@@ -1128,7 +1747,245 @@ def production_outputs(production_id, runs=None):
 
 @app.get('/api/productions/{production_id}/outputs')
 def production_outputs_get(production_id: str):
+    # GET never creates a new user-requested task. It only restarts a cursor
+    # that was already durably marked running before a page/server interruption.
+    production_automation_manager().ensure(safe_id(production_id))
     return production_outputs(production_id)
+
+
+@app.get('/api/productions/{production_id}/automation')
+def production_automation_get(production_id: str):
+    production_id = safe_id(production_id)
+    production_automation_manager().ensure(production_id)
+    production = production_manager().get(production_id)
+    return {'automation': production.get('automation', {}),
+            'outputs': production_outputs(production_id)}
+
+
+@app.post('/api/productions/{production_id}/automation/start')
+def production_automation_start(production_id: str, body: dict):
+    production_id = safe_id(production_id)
+    if not isinstance(body, dict) or set(body) - {'merge'}:
+        raise ValueError('Automation start accepts only the merge option.')
+    merge = body.get('merge', True)
+    if type(merge) is not bool:
+        raise ValueError('Automation merge must be true or false.')
+    automation = production_automation_manager().start(production_id, merge=merge)
+    return {'automation': automation, 'production': production_manager().get(production_id),
+            'outputs': production_outputs(production_id)}
+
+
+@app.get('/api/productions/{production_id}/segments/{segment_id}/runs/{run_id}/frames/{kind}')
+def production_review_frame(production_id: str, segment_id: str, run_id: str, kind: str):
+    if kind not in ('first', 'middle', 'last'):
+        raise HTTPException(404, 'Choose the first, middle or last review frame.')
+    production = production_manager().get(safe_id(production_id))
+    segment = next((row for row in production['segments']
+                    if row['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise HTTPException(404, 'Production clip not found.')
+    run = video_manager().get(safe_id(run_id))
+    if (run.get('project_id') != segment.get('project_id') or
+            run.get('status') != 'succeeded' or not run.get('video_url')):
+        raise HTTPException(404, 'This completed take does not belong to the selected production clip.')
+    _ensure_production_review_frames(production['id'], segment['id'], run['id'])
+    path = _production_review_folder(production['id'], segment['id'], run['id']) / f'{kind}.png'
+    return FileResponse(path, media_type='image/png')
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/runs/{run_id}/quality')
+def production_quality_review(production_id: str, segment_id: str, run_id: str, body: dict):
+    if not isinstance(body, dict) or set(body) - {'force'} or type(body.get('force', True)) is not bool:
+        raise ValueError('Quality review accepts only a boolean force option.')
+    result = review_production_quality(
+        production_id, segment_id=segment_id, run_id=run_id,
+        force=body.get('force', True))
+    return {'result': result, 'outputs': production_outputs(production_id)}
+
+
+@app.post('/api/productions/{production_id}/quality')
+def production_quality_review_batch(production_id: str, body: dict):
+    if (not isinstance(body, dict) or set(body) - {'legacy_only'} or
+            type(body.get('legacy_only', True)) is not bool):
+        raise ValueError('Batch quality review accepts only a boolean legacy_only option.')
+    production_id = safe_id(production_id)
+    production_manager().assert_active(production_id)
+    legacy_only = body.get('legacy_only', True)
+    with STATE_LOCK:
+        current = PRODUCTION_QUALITY_JOBS.get(production_id)
+        if current and current.get('status') == 'running':
+            return {'quality_batch': copy.deepcopy(current),
+                    'outputs': production_outputs(production_id)}
+        state = {
+            'status': 'running', 'legacy_only': legacy_only,
+            'reviewed_count': 0, 'failed_count': 0,
+            'started_at': time.time(), 'finished_at': None, 'error': None,
+        }
+        PRODUCTION_QUALITY_JOBS[production_id] = state
+    threading.Thread(
+        target=_run_production_quality_batch,
+        args=(production_id, legacy_only), daemon=True,
+        name='h3-production-quality-' + production_id[:8]).start()
+    return {'quality_batch': state, 'outputs': production_outputs(production_id)}
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/runs/{run_id}/quality/approve-repair')
+def production_quality_approve_repair(production_id: str, segment_id: str, run_id: str):
+    production = production_manager().assert_active(production_id)
+    segment = next((row for row in production['segments']
+                    if row['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    run = video_manager().get(safe_id(run_id))
+    if run.get('project_id') != segment.get('project_id'):
+        raise ValueError('This take does not belong to the selected production clip.')
+    review = _production_quality_descriptor(production['id'], segment['id'], run['id'])
+    if review.get('status') != 'failed' or not review.get('repair_direction'):
+        raise ValueError('Only a rejected take with an explicit repair direction can be approved for repair.')
+    updated = production_manager().apply_quality_repair(
+        production['id'], segment['id'], review['repair_direction'])
+    automation = production_automation_manager().start(
+        production['id'], merge=updated.get('auto_merge', True), requested_by='approved_quality_repair')
+    return {'production': production_manager().get(production['id']), 'automation': automation,
+            'outputs': production_outputs(production['id'])}
+
+
+@app.post('/api/productions/{production_id}/segments/{segment_id}/runs/{run_id}/quality/accept')
+def production_quality_accept_override(production_id: str, segment_id: str, run_id: str):
+    """Record a human acceptance without erasing the original QC evidence."""
+    production = production_manager().assert_active(production_id)
+    segment = next((row for row in production['segments']
+                    if row['id'] == safe_id(segment_id)), None)
+    if not segment:
+        raise ValueError('Production clip not found.')
+    run = video_manager().get(safe_id(run_id))
+    if (run.get('project_id') != segment.get('project_id') or
+            run.get('status') != 'succeeded' or not run.get('video_url')):
+        raise ValueError('Only a completed take from this exact production clip can be accepted.')
+    review = _production_quality_descriptor(production['id'], segment['id'], run['id'])
+    if review.get('status') != 'failed':
+        raise ValueError('Only a take rejected by quality review needs a human override.')
+    review = _save_production_quality(production['id'], segment['id'], run['id'], {
+        **review, 'accepted': True, 'overridden_at': time.time(),
+        'override_note': 'Accepted by the local user after reviewing the sampled-frame evidence.',
+    })
+    segment['selected_video_run_id'] = run['id']
+    production_manager().save(production)
+    automation = production_automation_manager().start(
+        production['id'], merge=production.get('auto_merge', True),
+        requested_by='human_quality_override')
+    return {'review': review, 'automation': automation,
+            'outputs': production_outputs(production['id'])}
+
+
+@app.post('/api/productions/{production_id}/quality/accept')
+def production_quality_accept_override_batch(production_id: str, body: dict):
+    """Human-release an explicit list of rejected takes in one transaction-like action.
+
+    The caller must name every segment/run pair.  This deliberately avoids an
+    implicit "accept every failure" endpoint and keeps each original QC record
+    intact for later audit.  All targets are validated before any record is
+    changed, and the automation/merge check is started only once for the batch.
+    """
+    if not isinstance(body, dict) or set(body) != {'items'}:
+        raise ValueError('Batch quality acceptance requires only an items list.')
+    items = body.get('items')
+    if not isinstance(items, list) or not 1 <= len(items) <= 64:
+        raise ValueError('Choose between 1 and 64 rejected takes to accept.')
+
+    production = production_manager().assert_active(production_id)
+    segments = {row['id']: row for row in production['segments']}
+    targets = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {'segment_id', 'run_id'}:
+            raise ValueError('Each accepted take needs exactly segment_id and run_id.')
+        segment_id = safe_id(item.get('segment_id'))
+        run_id = safe_id(item.get('run_id'))
+        pair = (segment_id, run_id)
+        if pair in seen:
+            raise ValueError('The same rejected take was selected more than once.')
+        seen.add(pair)
+        segment = segments.get(segment_id)
+        if not segment:
+            raise ValueError('A selected production clip was not found.')
+        run = video_manager().get(run_id)
+        if (run.get('project_id') != segment.get('project_id') or
+                run.get('status') != 'succeeded' or not run.get('video_url')):
+            raise ValueError('Only a completed take from its exact production clip can be accepted.')
+        review = _production_quality_descriptor(production['id'], segment_id, run_id)
+        if review.get('status') != 'failed' or review.get('accepted'):
+            raise ValueError('Every selected take must be an unaccepted quality-review rejection.')
+        targets.append((segment, run, review))
+
+    accepted = []
+    overridden_at = time.time()
+    for segment, run, review in targets:
+        saved = _save_production_quality(production['id'], segment['id'], run['id'], {
+            **review, 'accepted': True, 'overridden_at': overridden_at,
+            'override_note': (
+                'Accepted in a user-selected batch after reviewing the sampled-frame evidence.'),
+        })
+        segment['selected_video_run_id'] = run['id']
+        accepted.append({
+            'segment_id': segment['id'], 'run_id': run['id'], 'review': saved,
+        })
+
+    production_manager().save(production)
+    automation = production_automation_manager().start(
+        production['id'], merge=production.get('auto_merge', True),
+        requested_by='human_quality_override_batch')
+    return {
+        'accepted_count': len(accepted), 'accepted': accepted,
+        'automation': automation, 'outputs': production_outputs(production['id']),
+    }
+
+
+@app.post('/api/productions/{production_id}/boundaries/{segment_id}')
+def production_boundary_action(production_id: str, segment_id: str, body: dict):
+    production_manager().assert_active(production_id)
+    production = production_manager().get(safe_id(production_id))
+    segment = next((row for row in production['segments']
+                    if row['id'] == safe_id(segment_id)), None)
+    if not segment or segment['index'] <= 1:
+        raise ValueError('Choose a clip that has a preceding clip.')
+    previous = next((row for row in production['segments']
+                     if row['index'] == segment['index'] - 1), None)
+    action = body.get('action')
+    overview = production_outputs(production['id'])
+    previous_row = next((row for row in overview['segments']
+                         if previous and row['segment_id'] == previous['id']), None)
+    run = previous_row.get('selected') if previous_row else None
+    if not run:
+        raise ValueError('Adopt a completed take for the preceding clip first.')
+    asset_id = None
+    if action in ('save', 'use_next'):
+        frames = _ensure_production_review_frames(production['id'], previous['id'], run['id'])
+        existing_id = previous.get('ending_continuity_asset_id')
+        try:
+            existing = asset_meta(existing_id) if existing_id else None
+        except (ValueError, HTTPException, OSError, KeyError):
+            existing = None
+        if existing and existing.get('video_run_ending') == run['id']:
+            asset_id = existing['id']
+        else:
+            path = _production_review_folder(production['id'], previous['id'], run['id']) / 'last.png'
+            asset = store_asset(path.read_bytes(),
+                                f"{production['title']} clip {previous['index']:02d} continuity.png",
+                                'image/png')
+            asset.update(role='context', semantic_role='pose', enabled=True,
+                         production_id=production['id'], production_segment_id=previous['id'],
+                         video_run_ending=run['id'],
+                         description=('Actual adopted final frame saved for editorial continuity review. '
+                                      'It does not create another character identity.'))
+            atomic_json(DATA / 'assets' / asset['id'] / 'metadata.json', asset)
+            asset_id = asset['id']
+    updated = production_manager().apply_boundary_action(
+        production['id'], previous['id'], segment['id'], run['id'], action,
+        asset_id=asset_id, can_continue=bool(run.get('can_continue') and run.get('continuation_source')))
+    return {'production': updated, 'asset_id': asset_id,
+            'frames': frames if action in ('save', 'use_next') else None,
+            'outputs': production_outputs(production['id'])}
 
 
 @app.patch('/api/productions/{production_id}/segments/{segment_id}/video')
@@ -1145,6 +2002,10 @@ def production_select_video(production_id: str, segment_id: str, body: dict):
         if (run.get('project_id') != segment.get('project_id') or run.get('operation') == 'combine' or
                 run.get('status') != 'succeeded' or not run.get('video_url')):
             raise ValueError('Choose a completed take generated by this exact production clip.')
+        review = _production_quality_descriptor(production['id'], segment['id'], run['id'])
+        if review.get('status') == 'failed' and not review.get('accepted'):
+            raise ValueError(
+                'This take failed post-render quality review. Explicitly accept it or approve a repair first.')
         segment['selected_video_run_id'] = run['id']
     production_manager().save(production)
     return production_outputs(production_id)
@@ -1156,6 +2017,8 @@ def build_production_film(production_id):
         raise ValueError('Wait for the current ComfyUI video task to finish or stop it before assembling the final film.')
     if not overview['all_ready']:
         raise ValueError('Every storyboard clip needs a completed adopted take before the final film can be assembled.')
+    if not overview.get('quality_ready', True):
+        raise ValueError('Wait for post-render quality review to finish before assembling the final film.')
     if len(overview['segments']) > 100:
         raise ValueError('Assemble at most 100 clips in one production film.')
     folder = DATA / 'production_films' / safe_id(production_id)
@@ -1812,6 +2675,11 @@ def _production_prompt_instructions(production, segment):
     stable_cast = bool(visible_start) and visible_start == visible_end
     dense_cast = len(visible_start) >= 4
     remote_planes = any(role in ('display', 'offscreen', 'imagined') for role in roles.values())
+    preflight_warnings = [row.get('message', '') for row in segment.get('preflight_issues', [])
+                          if row.get('severity') == 'warning' and row.get('message')]
+    repairable_internal_cut = any(
+        row.get('code') == 'internal_cut'
+        for row in segment.get('preflight_issues', []) if isinstance(row, dict))
     return '\n'.join([
         'Turn this production clip into one precise, filmable H3 scene plan.',
         f"Keep exactly one scene and exactly {segment['duration']} seconds.",
@@ -1837,12 +2705,21 @@ def _production_prompt_instructions(production, segment):
         'Be concise: do not repeat the full Character Bible, card library, overview instructions or the same identity block inside action and performance.',
         'Keep exact spoken words only in structured dialogue; never copy or paraphrase them into action.',
         'Treat segment-only keyframes as planning context, never as extra H3 image inputs.',
+        ('SHOT PREFLIGHT WARNINGS TO RESOLVE WITHOUT CHANGING THE STORY: ' +
+         ' '.join(preflight_warnings[:6]) if preflight_warnings else ''),
+        ("CONTINUOUS CAMERA REPAIR REQUIRED: the authored action uses one editorial cut cue, but this H3 render "
+         "must be a single uninterrupted setup. Preserve every story event and its order while replacing the cut "
+         "with one physically plausible pan, rack focus, actor movement or continuous reframing. Output no Cut to, "
+         "match cut, montage, split shot or second camera angle."
+         if repairable_internal_cut else ''),
         ("This clip uses the previous saved motion and audio tail as a protected opening context. "
          "Previous planned final state: " + (previous.get('ending') or 'not specified')
          + ". Direct only the NEW action after that context; do not replay the preceding clip's events or dialogue."
          if production.get('auto_continue_previous') and segment.get('continue_previous', True) and previous else ''),
         ('Apply this user revision request: ' + segment['prompt_direction']) if segment.get('prompt_direction') else
         'Keep the current clip direction and make it concrete without changing its meaning.',
+        ('Apply this user-approved post-render repair without changing story or dialogue: ' +
+         segment['quality_repair_direction']) if segment.get('quality_repair_direction') else '',
     ]).strip()
 
 
@@ -1850,6 +2727,9 @@ def _production_prompt_instructions(production, segment):
 def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     from .compiler import compile_project
     production = production_manager().assert_active(production_id)
+    if (production.get('automation', {}).get('status') in ('running', 'retrying')
+            and body.get('_automation') is not True):
+        raise ValueError('The background episode queue owns prompt generation. Pause it before editing this clip.')
     use_ai = body.get('use_ai', True)
     if type(use_ai) is not bool:
         raise ValueError('use_ai must be true or false.')
@@ -1900,6 +2780,9 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
 def production_segment_video(production_id: str, segment_id: str, body: dict):
     from .compiler import compile_project
     production = production_manager().assert_active(production_id)
+    if (production.get('automation', {}).get('status') in ('running', 'retrying')
+            and body.get('_automation') is not True):
+        raise ValueError('The background episode queue owns video generation. Pause it before rendering this clip manually.')
     segment = next((item for item in production['segments'] if item['id'] == safe_id(segment_id)), None)
     if not segment:
         raise ValueError('Production clip not found.')
@@ -1956,6 +2839,8 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
         segment.get('prompt_seconds') or 0, project['id'])
     run = video_manager().submit(body.get('request_id'), project, compiled['prompt'], parent_run_id=parent_run_id)
     production = production_manager().set_video_run(production_id, segment_id, run['id'])
+    if production.get('auto_quality_review', True):
+        run['quality_review'] = _require_production_quality(production_id, segment_id, run['id'])
     return {'run': run, 'production': production}
 
 @app.get('/api/stories')
