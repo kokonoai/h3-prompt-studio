@@ -914,6 +914,10 @@ def card_collection_delete(collection_id: str):
 def card_collection_save(production_id: str, body: dict):
     return production_manager().save_card_collection(production_id, body.get('name'))
 
+@app.post('/api/productions/{production_id}/card-collection/current-episode')
+def card_collection_save_current_episode(production_id: str, body: dict):
+    return production_manager().save_current_episode_card_collection(production_id, body.get('name'))
+
 @app.post('/api/productions/{production_id}/card-collection/{collection_id}/apply')
 def card_collection_apply(production_id: str, collection_id: str):
     return production_manager().apply_card_collection(production_id, collection_id)
@@ -969,7 +973,7 @@ async def production_overview_asset(production_id: str, kind: str,
 def _generate_production_text_cards(production_id, force=False):
     from .productions import (CARD_KINDS, CARD_PLANNER_SCHEMA, CARD_PLANNER_SYSTEM,
                               card_plan_source_hash, card_planning_payload,
-                              planning_chunks)
+                              card_planning_chunks, split_truncated_card_chunk)
     manager = production_manager()
     production = manager.assert_active(production_id)
     if not force and production.get('card_plan_source_hash') == card_plan_source_hash(production):
@@ -980,16 +984,12 @@ def _generate_production_text_cards(production_id, force=False):
     # storyboard while keeping every authored identity untouched.
 
     def generate(model):
-        pieces = planning_chunks(production['brief'], limit=5000)
+        pieces = card_planning_chunks(production['brief'])
         combined = {'series_voice_style': '', **{kind: [] for kind in CARD_KINDS}}
         seen = {kind: set() for kind in CARD_KINDS}
         limits = {**{kind: 64 for kind in CARD_KINDS}, 'styles': 8}
-        for index, piece in enumerate(pieces):
-            RESOURCES.stage = f'Building text asset cards {index + 1} of {len(pieces)}'
-            answer = client().complete_json(
-                model, CARD_PLANNER_SYSTEM,
-                card_planning_payload(production, piece, index + 1, len(pieces)),
-                CARD_PLANNER_SCHEMA, max_tokens=4096, temperature=0.2)
+
+        def merge_answer(answer):
             if not combined['series_voice_style'] and answer.get('series_voice_style'):
                 combined['series_voice_style'] = answer['series_voice_style']
             for kind in CARD_KINDS:
@@ -1002,6 +1002,31 @@ def _generate_production_text_cards(production_id, force=False):
                         continue
                     seen[kind].add(key)
                     combined[kind].append(card)
+
+        index = 0
+        truncation_splits = 0
+        while index < len(pieces):
+            piece = pieces[index]
+            RESOURCES.stage = f'Building text asset cards {index + 1} of {len(pieces)}'
+            try:
+                answer = client().complete_json(
+                    model, CARD_PLANNER_SYSTEM,
+                    card_planning_payload(production, piece, index + 1, len(pieces)),
+                    CARD_PLANNER_SCHEMA, max_tokens=4096, temperature=0.2)
+            except LMStudioError as exc:
+                subdivisions = split_truncated_card_chunk(piece)
+                if (exc.code != 'response_truncated' or len(subdivisions) < 2
+                        or truncation_splits >= 32):
+                    raise
+                # Retry only the overflowing part. Already completed answers
+                # stay in memory and source order is unchanged.
+                pieces[index:index + 1] = subdivisions
+                truncation_splits += 1
+                RESOURCES.stage = (
+                    f'Text card part was too large; retrying as {len(subdivisions)} smaller parts')
+                continue
+            merge_answer(answer)
+            index += 1
         return combined
 
     try:

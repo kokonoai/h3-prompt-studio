@@ -34,6 +34,7 @@ After a backend update, wait for all renders to finish, then run `powershell -No
 2. Split a long episode into ordered project parts, e.g. `Episode 01 - Part 01` and `Episode 01 - Part 02`. Each project plans and renders its own clips.
 3. When a project adds or improves cards, click **Sync shared card set**. **Save library** saves only that project. In the next project, merge the updated set. Sync retains cards and assets from other projects; later nonempty fields on a matching card take priority, so review conflicting edits.
 4. Open **Script management**, create a script with your episode count, link the shared character records, add parts in viewing order, and save. Linking the set does not silently overwrite part cards.
+5. **Sync shared card set** is cumulative across episodes. To keep only the active episode, choose **Save current episode only**. Studio creates a separate set from cards actually referenced by the current storyboard, the episode cast, and linked voices. It leaves the original set and project link unchanged, and excludes project-wide overview sheets that may contain earlier cast.
 5. Once a project's adopted takes are ready, its storyboard film is saved locally. In **Script management**, you can **Assemble episode** without waiting for the rest, select at least two episodes and **Assemble selected**, or **Assemble full series** when every episode is ready. Missing clips are never replaced by unrelated outputs. Each result has **Open file location**; browser download is optional.
 
 ## Where films are saved

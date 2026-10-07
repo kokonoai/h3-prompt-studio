@@ -364,6 +364,13 @@ You are now the production bible editor. Analyse the supplied story or screenpla
 - Existing user content is protected by the application. Return complete useful proposals for blank or missing material, but do not rename existing cards.
 - Prefer one specific card over several near-duplicates. Do not create cards for unnamed extras unless they recur or affect continuity."""
 
+# Keep local structured output comfortably below the common 4K completion
+# ceiling. These limits are production guidance; schema validation still owns
+# the hard safety bounds.
+CARD_PLANNER_SYSTEM += """
+- Keep every description to one or two compact sentences and every notes field to one short sentence. Voice pace is a short phrase. Never repeat source prose, the character bible or another card inside a card.
+- Return only cards evidenced by this supplied story part or incomplete cards named in existing_cards. Empty arrays are correct. Do not repeat completed existing cards merely to acknowledge them."""
+
 
 def _text(value, name, limit, default=""):
     value = default if value is None else value
@@ -4144,6 +4151,92 @@ class ProductionManager:
         return {**value, "card_count": sum(len(rows) for rows in value["cards"].values()),
                 "overview_count": sum(bool(asset_id) for asset_id in value["overview_asset_ids"].values())}
 
+    def save_current_episode_card_collection(self, production_id, name):
+        """Save an independent set containing only cards used by the active episode.
+
+        The ordinary shared-set sync is intentionally cumulative across parts.  This
+        scoped export is different: it derives an exact episode subset from the
+        current storyboard and episode cast, never merges the linked historical set,
+        and never changes the production's existing shared-set link.
+        """
+        production = self.get(production_id)
+        selected_ids = {kind: set() for kind in CARD_KINDS}
+
+        # Segments belong to the active episode. Reuse the same resolver used by
+        # materialisation so explicit card selections, visible speakers and linked
+        # voices are interpreted consistently with the actual video prompts.
+        for segment in production["segments"]:
+            for kind, cards in self._relevant_cards(production, segment).items():
+                selected_ids[kind].update(card["id"] for card in cards)
+
+        episode = next((item for item in production["episodes"]
+                        if item["index"] == production["current_episode"]), None)
+        if episode:
+            selected_ids["characters"].update(episode["character_card_ids"])
+
+        # Before storyboard planning, the episode cast is still useful. The first
+        # style card is the renderer's active style and is therefore episode data.
+        if production["cards"]["styles"]:
+            selected_ids["styles"].add(production["cards"]["styles"][0]["id"])
+
+        by_id = {kind: {card["id"]: card for card in production["cards"][kind]}
+                 for kind in CARD_KINDS}
+        changed = True
+        while changed:
+            changed = False
+
+            def include(kind, card_id):
+                nonlocal changed
+                if card_id and card_id in by_id[kind] and card_id not in selected_ids[kind]:
+                    selected_ids[kind].add(card_id)
+                    changed = True
+
+            # A selected owned card requires its owner identity; a selected voice
+            # requires its speaker identity. Selected characters keep their linked
+            # voice authority so cross-clip speech remains stable.
+            for kind in ("wardrobe", "props"):
+                for card_id in tuple(selected_ids[kind]):
+                    include("characters", by_id[kind][card_id].get("owner_card_id"))
+            for card_id in tuple(selected_ids["voices"]):
+                include("characters", by_id["voices"][card_id].get("character_card_id"))
+            for card_id in tuple(selected_ids["characters"]):
+                include("voices", by_id["characters"][card_id].get("voice_card_id"))
+
+        cards = {
+            kind: [copy.deepcopy(card) for card in production["cards"][kind]
+                   if card["id"] in selected_ids[kind]]
+            for kind in CARD_KINDS
+        }
+        cards = normalise_cards(cards)
+        if not any(cards.values()):
+            raise ValueError(
+                "The current episode has no referenced cards yet. Plan its episode cast or storyboard first.")
+
+        ident = str(uuid.uuid4())
+        now = time.time()
+        default_name = f"{production['title']} - current episode cards"
+        value = {
+            "schema_version": 1,
+            "id": ident,
+            "name": _text(name, "collection name", 120, default_name) or default_name,
+            "cards": cards,
+            "series_voice_style": production["series_voice_style"],
+            # Project-wide overviews may contain people or assets from earlier
+            # episodes. Never leak them into an episode-only set.
+            "overview_asset_ids": empty_overview_assets(),
+            "updated_at": now,
+            "scope": "current_episode",
+            "source_production_id": production["id"],
+            "source_episode_index": production["current_episode"],
+        }
+        atomic_json(self.collection_directory / (ident + ".json"), value)
+        return {
+            **value,
+            "card_count": sum(len(rows) for rows in cards.values()),
+            "counts": {kind: len(cards[kind]) for kind in CARD_KINDS},
+            "overview_count": 0,
+        }
+
     def rename_card_collection(self, ident, name):
         collection = self.get_card_collection(ident)
         collection["name"] = _text(name, "collection name", 120)
@@ -5979,6 +6072,23 @@ def storyboard_planning_chunks(story):
     return planning_chunks(story, limit=2000)
 
 
+def card_planning_chunks(story):
+    """Use small card-planning parts and permit deterministic retry splits."""
+    return planning_chunks(story, limit=2200)
+
+
+def split_truncated_card_chunk(story):
+    """Split only the failed card part, preserving order and source text."""
+    if len(story) <= 450:
+        return [story]
+    target = max(400, min(1100, (len(story) + 1) // 2))
+    pieces = planning_chunks(story, limit=target)
+    if len(pieces) > 1:
+        return pieces
+    midpoint = max(1, len(story) // 2)
+    return [story[:midpoint].strip(), story[midpoint:].strip()]
+
+
 def planning_card_catalog(production):
     character_names = {card["id"]: card["name"] for card in production["cards"]["characters"]}
     catalog = {}
@@ -6085,6 +6195,19 @@ def episode_planning_payload(production, start_index, count, previous_ending="")
 
 
 def card_planning_payload(production, story=None, chunk_index=1, chunk_total=1):
+    def existing_card(card):
+        # Completed user cards are immutable in this operation. Their compact
+        # summary is enough to prevent duplicates without spending most of an
+        # 8K local context window resending the full reusable library.
+        return {
+            "name": card["name"],
+            "description": card["description"][:360],
+            "notes": card["notes"][:180],
+            "description_missing": not bool(card["description"]),
+            "notes_missing": not bool(card["notes"]),
+            "has_reference_media": bool(card["asset_ids"]),
+        }
+
     return json.dumps({
         "title": production["title"],
         "source_story_or_screenplay": story or production["brief"],
@@ -6093,17 +6216,17 @@ def card_planning_payload(production, story=None, chunk_index=1, chunk_total=1):
         "genre_and_visual_context": {
             "visual_style_preset": production.get("visual_style_preset", "cinematic_realism"),
             "custom_visual_style": production.get("visual_style_custom", ""),
-            "visual_style_bible": production.get("style_bible", ""),
+            "visual_style_bible": production.get("style_bible", "")[:3000],
             "narrative_style": production.get("narrative_style", "cinematic"),
-            "narrative_notes": production.get("narrative_notes", ""),
+            "narrative_notes": production.get("narrative_notes", "")[:1800],
         },
-        "existing_character_bible": production.get("character_bible", ""),
-        "existing_series_voice_style": production.get("series_voice_style", ""),
+        "existing_character_bible": production.get("character_bible", "")[:6000],
+        "existing_series_voice_style": production.get("series_voice_style", "")[:1800],
         "existing_cards": {
-            kind: [{"name": card["name"], "description": card["description"],
-                    "notes": card["notes"], "has_reference_media": bool(card["asset_ids"])}
-                   for card in production["cards"][kind]]
+            kind: [existing_card(card) for card in production["cards"][kind]]
             for kind in CARD_KINDS
         },
-        "merge_policy": "Fill blank text and add missing cards only. Never rewrite user text, rename cards or remove media.",
+        "merge_policy": ("Fill blank text and add missing cards only. Never rewrite user text, rename cards or remove media. "
+                         "Keep descriptions to at most two compact sentences and notes to one short sentence. "
+                         "Do not echo completed existing cards."),
     }, ensure_ascii=False, indent=2)

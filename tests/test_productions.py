@@ -9,7 +9,8 @@ from backend.compiler import compile_project
 from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
                                  _segment_hash_with_empty_prop_state,
                                  authored_internal_timing,
-                                 card_plan_source_hash, character_aliases, current_episode_story,
+                                 card_plan_source_hash, card_planning_chunks, card_planning_payload,
+                                 character_aliases, current_episode_story,
                                  character_presence_roles,
                                  continuity_visual_lock, device_screen_geometry_lock,
                                  effective_temporal_cast_lock, inscribed_prop_continuity_lock,
@@ -21,6 +22,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  reconcile_transition_contract,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
+                                 split_truncated_card_chunk,
                                  storyboard_output_token_budget,
                                  timed_clip_groups, timed_group_story, timed_story_beats,
                                  validate_planned_chunk_source_contract)
@@ -1195,6 +1197,57 @@ def test_shared_card_set_sync_preserves_other_parts_and_completes_placeholders(t
     assert len(third["cards"]["props"]) == 1
 
 
+def test_current_episode_card_set_excludes_historical_cards_and_keeps_original_link(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "The new hero enters the observatory."})
+    old_hero = _card("Old hero")
+    current_hero = _card("Current hero")
+    old_voice = _card("Old hero voice", character_card_id=old_hero["id"], voice_id="OLD_V1")
+    current_voice = _card("Current hero voice", character_card_id=current_hero["id"], voice_id="CURRENT_V1")
+    old_hero["voice_card_id"] = old_voice["id"]
+    current_hero["voice_card_id"] = current_voice["id"]
+    old_prop = _card("Old key", owner_card_id=old_hero["id"])
+    current_prop = _card("Current map", owner_card_id=current_hero["id"])
+    old_room = _card("Old library")
+    current_room = _card("Current observatory")
+    production["cards"]["characters"] = [old_hero, current_hero]
+    production["cards"]["voices"] = [old_voice, current_voice]
+    production["cards"]["props"] = [old_prop, current_prop]
+    production["cards"]["environments"] = [old_room, current_room]
+    production["cards"]["styles"] = [_card("Series style")]
+    production["episode_count"] = 2
+    production["episodes"] = [
+        {"title": "Past", "logline": "", "story": "Old hero uses the Old key.",
+         "character_card_ids": [old_hero["id"]], "continuity_notes": ""},
+        {"title": "Present", "logline": "", "story": "Current hero studies the Current map.",
+         "character_card_ids": [current_hero["id"]], "continuity_notes": ""},
+    ]
+    production["current_episode"] = 2
+    production = manager.save(production)
+    full = manager.save_card_collection(production["id"], "Complete history")
+    production = manager.get(production["id"])
+    production["segments"] = [_planned_clip(
+        "Map study", ["Current hero"],
+        {"visible_start": ["Current hero"], "visible_end": ["Current hero"],
+         "enters": [], "exits": [], "offscreen": [], "mentioned_only": []})]
+    production["segments"][0]["card_selection"]["props"] = ["Current map"]
+    production["segments"][0]["card_selection"]["environments"] = ["Current observatory"]
+    production = manager.save(production)
+
+    scoped = manager.save_current_episode_card_collection(production["id"], "Episode 2 only")
+
+    assert scoped["id"] != full["id"]
+    assert {card["name"] for card in scoped["cards"]["characters"]} == {"Current hero"}
+    assert {card["name"] for card in scoped["cards"]["voices"]} == {"Current hero voice"}
+    assert {card["name"] for card in scoped["cards"]["props"]} == {"Current map"}
+    assert {card["name"] for card in scoped["cards"]["environments"]} == {"Current observatory"}
+    assert {card["name"] for card in scoped["cards"]["styles"]} == {"Series style"}
+    assert not any(scoped["overview_asset_ids"].values())
+    assert manager.get(production["id"])["card_collection_id"] == full["id"]
+    assert {card["name"] for card in manager.get_card_collection(full["id"])["cards"]["characters"]} == {
+        "Old hero", "Current hero"}
+
+
 def test_auto_keyframe_suggestions_are_sparse_and_default_off(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "Two locations."})
@@ -1807,6 +1860,29 @@ def test_ai_text_card_plan_fills_gaps_without_overwriting_manual_cards(tmp_path)
     assert result["series_voice_style"].startswith("Natural ensemble")
     assert result["card_planner"] == "local_ai"
     assert result["card_plan_source_hash"] == card_plan_source_hash(result)
+
+
+def test_card_planning_batches_and_payload_stay_bounded_for_small_local_models(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": ("A enters the observatory. " * 240)})
+    production["style_bible"] = "STYLE " * 1900
+    production["character_bible"] = "CHARACTER " * 1900
+    production["series_voice_style"] = "VOICE " * 3000
+    production["cards"]["characters"] = [
+        _card("Existing hero", description="D" * 4000, notes="N" * 2000)
+    ]
+    production = manager.save(production)
+
+    chunks = card_planning_chunks(production["brief"])
+    payload = card_planning_payload(production, chunks[0], 1, len(chunks))
+    retry = split_truncated_card_chunk(chunks[0])
+
+    assert len(chunks) > 1
+    assert max(map(len, chunks)) <= 2200
+    assert len(retry) >= 2
+    assert "D" * 361 not in payload
+    assert "N" * 181 not in payload
+    assert len(payload) < 18000
 
 
 def test_manual_card_content_prevents_implicit_ai_card_generation(tmp_path):
