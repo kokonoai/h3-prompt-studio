@@ -68,7 +68,16 @@ when an extra independent physical instance exists. Do not penalize normal pose,
 crop, lighting, expression or camera changes. Missing identity references reduce
 confidence; text alone is not proof of an exact face. Use error only when the
 sampled pixels show a clear render-breaking contradiction. Provide one concrete
-repair instruction per issue and do not invent new story content."""
+repair instruction per issue and do not invent new story content.
+
+The context distinguishes physical_present_* from required_visible_*. A person
+may be physically present in the location while legitimately outside a close-up
+or insert frame. Never report a missing character from physical_present_* alone;
+only required_visible_first/last are exact boundary requirements. Likewise,
+only plot_critical_prop_holders are hard prop requirements. A continuity-only
+prop may be cropped or unused in this shot; report a clear contradiction only as
+a warning. Missing props and accessories are prop_or_device_error, not
+identity_drift."""
 
 
 def _fit(source: Image.Image, size: tuple[int, int]) -> Image.Image:
@@ -146,8 +155,22 @@ def media_issues(probe: dict, expected_duration: float, has_dialogue: bool) -> l
 
 
 def normalise_visual_review(value: dict, *, has_identity_references: bool,
-                            expected_first: int, expected_last: int) -> dict:
+                            expected_first, expected_last,
+                            continuity_prop_names=(), strict_prop_or_device=True) -> dict:
     """Apply conservative local policy to a schema-validated VLM response."""
+    def boundary_contract(value):
+        if isinstance(value, (list, tuple, set)):
+            names = [str(name).strip() for name in value if str(name).strip()]
+            return len(names), names
+        try:
+            return max(0, int(value)), []
+        except (TypeError, ValueError):
+            return 0, []
+
+    expected_first_count, expected_first_names = boundary_contract(expected_first)
+    expected_last_count, expected_last_names = boundary_contract(expected_last)
+    continuity_props = [str(name).strip() for name in continuity_prop_names
+                        if str(name).strip()]
     counts = value.get("observed_cast_counts", {})
     issues = []
     for raw in value.get("issues", [])[:10]:
@@ -159,11 +182,28 @@ def normalise_visual_review(value: dict, *, has_identity_references: bool,
         # Three samples cannot establish a mid-shot absence. Boundary absence
         # is actionable only where the contract explicitly requires a body.
         if code == "missing_required_character":
-            boundary_expected = ((frame == "first" and expected_first > 0) or
-                                 (frame == "last" and expected_last > 0))
-            if not boundary_expected or frame in ("middle", "multiple"):
+            boundary_count = (expected_first_count if frame == "first" else
+                              expected_last_count if frame == "last" else 0)
+            boundary_names = (expected_first_names if frame == "first" else
+                              expected_last_names if frame == "last" else [])
+            evidence_text = " ".join(str(issue.get(key) or "")
+                                     for key in ("message", "repair_instruction")).casefold()
+            names_match = (not boundary_names or
+                           any(name.casefold() in evidence_text for name in boundary_names))
+            if not boundary_count or not names_match or frame in ("middle", "multiple"):
                 issue["severity"] = "warning"
                 issue["confidence"] = min(confidence, .69)
+        evidence_text = " ".join(str(issue.get(key) or "")
+                                 for key in ("message", "repair_instruction")).casefold()
+        continuity_prop = next((name for name in continuity_props
+                                if name.casefold() in evidence_text), "")
+        if code in ("identity_drift", "prop_or_device_error") and continuity_prop:
+            issue["code"] = "prop_or_device_error"
+            issue["severity"] = "warning"
+            issue["confidence"] = min(confidence, .79)
+        elif code == "prop_or_device_error" and not strict_prop_or_device:
+            issue["severity"] = "warning"
+            issue["confidence"] = min(confidence, .79)
         if code == "identity_drift" and not has_identity_references:
             issue["severity"] = "warning"
             issue["confidence"] = min(confidence, .59)

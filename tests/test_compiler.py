@@ -225,6 +225,12 @@ def test_all_prompt_versions_lock_short_dialogue_and_unused_time(prompt_version)
     assert "exactly one structured dialogue line" in text
     assert "Do not fill unused clip duration with new voices" in text
     assert "After the final scripted line, only the explicitly requested non-speech ambience is audible" in text
+    assert text.rstrip().endswith(
+        "all mouths remain closed and only the requested non-vocal ambience or effects continue."
+    )
+    assert "Spoken-utterance count is exactly 1 utterance total (cue 1=Visitor)" in text
+    assert "Perform each existing tagged dialogue cue exactly once" in text
+    assert "sound-effect labels are silent metadata" in text
     assert "waits for an answer" not in text
     assert "waits for a response" not in text
     assert "no reply occurs within this clip" in text
@@ -237,6 +243,27 @@ def test_prompt_versions_lock_silent_clips(prompt_version):
     result = compile_project(p)
     assert result["valid"], result["issues"]
     assert "No audible dialogue, narration, singing" in result["prompt"]
+    assert "Spoken-utterance count is exactly zero" in result["prompt"]
+
+
+def test_final_audio_override_preserves_two_cues_once_and_orders_speakers():
+    p = project()
+    p["subjects"].append({"id": "s2", "name": "Companion", "asset_ids": ["b"],
+                          "description": "A distinct companion."})
+    p["assets"].append(asset("b"))
+    p["shots"][0]["visible_subject_ids"].append("s2")
+    p["shots"][0]["dialogue"] = [
+        dialogue("First exact line.", did="d1"),
+        dialogue("Second exact line.", speaker="s2", did="d2"),
+    ]
+
+    text = compile_project(p)["prompt"]
+
+    assert text.count("<d>") == 2
+    assert text.count("First exact line.") == 1
+    assert text.count("Second exact line.") == 1
+    assert "exactly 2 utterances total (cue 1=Visitor; cue 2=Companion)" in text
+    assert text.rfind("FINAL AUDIO OVERRIDE") > text.rfind("production_render_override:")
 
 
 def test_exact_fl_and_last_only_alignment():

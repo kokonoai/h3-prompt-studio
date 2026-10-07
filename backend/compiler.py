@@ -6,7 +6,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from .dialogue_audio import audible_speech_lock, clarify_unanswered_wait
+from .dialogue_audio import audible_speech_lock, clarify_unanswered_wait, final_audio_override
 from .identity_stability import visible_identity_lock
 from .scene_contract import contract_texts, map_contract_texts, render_scene_contract, validate_scene_contract
 
@@ -879,6 +879,16 @@ def compile_project(project: dict) -> dict:
         issue("error", "stale_prompt_translation", "h3_prompt_translation", language_error)
     elif delivery_prompt is not None:
         prompt = delivery_prompt
+    # Keep the exclusive speech contract as the final instruction even when a
+    # saved English delivery prompt or a production continuity block replaced
+    # the earlier rendering.  Do not repeat the dialogue words here: one tagged
+    # occurrence is intentional and reduces duplicate or improvised delivery.
+    prompt += "\n\n" + final_audio_override(
+        shots, {
+            sid: (_text(subject_map[sid].get("name")) or name(sid))
+            for sid in subject_map
+        }
+    )
     return result(prompt)
 
 

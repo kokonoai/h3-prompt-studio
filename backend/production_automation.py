@@ -328,10 +328,14 @@ class ProductionAutomationManager:
                                  current_segment_id=None, current_index=0,
                                  run_id=None, request_id=None,
                                  stage_detail="Reviewing completed takes")
-                    reviewed = self.review_quality(production_id)
-                    failed = reviewed.get("failed", []) if isinstance(reviewed, dict) else []
-                    if failed:
-                        raise RuntimeError(self._quality_attention_message(failed))
+                    # A failed take is quarantined by the quality reviewer.  It
+                    # must never be selected or merged automatically, but it
+                    # also must not prevent independent missing clips from
+                    # finishing.  The next scan excludes rejected clips and
+                    # continues the rest of the episode; once no runnable work
+                    # remains, ``quality_blocked`` below requests one human
+                    # decision for the quarantined results.
+                    self.review_quality(production_id)
                     continue
 
                 quality_blocked = self._quality_blocked_rows(overview, segments)

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { productionDialogueExport, productionKeyframeSize, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -53,6 +53,13 @@ describe("episode batch production",()=>{
     ]);
   });
 
+  it("keeps a rejected take visible for review without adopting it",()=>{
+    const rejected:any={id:"run-rejected",status:"succeeded",video_url:"/rejected.mp4",quality_review:{status:"failed",accepted:false}};
+    const accepted:any={id:"run-selected",status:"succeeded",video_url:"/selected.mp4",quality_review:{status:"passed",accepted:false}};
+    expect(productionOutputPreviewTake({selected:null,candidates:[rejected]} as any)).toBe(rejected);
+    expect(productionOutputPreviewTake({selected:accepted,candidates:[rejected,accepted]} as any)).toBe(accepted);
+  });
+
   it("skips only a prompt that is current, prepared, and non-stale",()=>{
     const current:any={video_prompt:"A complete prompt",status:"ready",project_id:"project-1",stale_reasons:[]};
     expect(segmentNeedsVideoPrompt(current)).toBe(false);
@@ -78,6 +85,21 @@ describe("episode batch production",()=>{
     expect(videoPromptTargets([ready,missing],true).map(item=>item.id)).toEqual(["ready","missing"]);
     expect(videoRenderTargets([ready,missing],outputs).map(item=>item.id)).toEqual(["missing"]);
     expect(videoRenderTargets([ready,missing],outputs,true).map(item=>item.id)).toEqual(["ready","missing"]);
+  });
+
+  it("explains durable progress without confusing adopted clips with the current review",()=>{
+    const automation:any={status:"running",stage:"quality",current_index:0,completed:1,total:30,merge:true};
+    const segments:any[]=[
+      {status:"ready",video_prompt:"prompt one",stale_reasons:[]},
+      {status:"ready",video_prompt:"prompt two",stale_reasons:[]},
+    ];
+    const outputs:any={segment_count:30,ready_count:1,segments:[
+      {index:1,candidates:[{status:"succeeded",video_url:"/one",quality_review:{status:"passed",accepted:true}}]},
+      {index:2,candidates:[{status:"succeeded",video_url:"/two",quality_review:{status:"reviewing",accepted:false}}]},
+    ]};
+    expect(productionAutomationSnapshot(automation,segments,outputs)).toMatchObject({
+      stage:"quality",currentIndex:2,total:30,promptReady:2,rendered:2,accepted:1,pendingReview:1,rejected:0,
+    });
   });
 });
 

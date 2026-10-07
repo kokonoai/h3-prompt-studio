@@ -1318,6 +1318,80 @@ def test_text_only_voice_bible_uses_only_current_speakers(tmp_path):
     assert project["shots"][0]["dialogue"][0]["delivery"].startswith("follow locked voice card A voice")
 
 
+def test_series_voice_roster_restores_only_the_current_speakers_rules(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source, "brief": "Pokke speaks while Nox listens.", "language": "en",
+        "series_voice_style": (
+            "Animated ensemble dialogue.\n"
+            "- Pokke should remain fast and bouncy, never robotic.\n"
+            "- Nox should remain smoky and dry, never growling.\n"
+            "#### The characters should have clearly differentiated voices:\n"
+            "Pokke: bright youthful momentum.\n"
+            "Nox: controlled quiet amusement."),
+    })
+    pokke, nox = _card("Pokke"), _card("Nox")
+    pokke_voice = _card("Pokke voice", character_card_id=pokke["id"],
+                        description="A quick animated voice.", voice_id="POKKE_V1")
+    nox_voice = _card("Nox voice", character_card_id=nox["id"],
+                      description="A smoky animated voice.", voice_id="NOX_V1")
+    production["cards"].update({"characters": [pokke, nox], "voices": [pokke_voice, nox_voice]})
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Reply", "story": "Pokke answers Nox.", "setting": "hall",
+        "action": "Pokke speaks while Nox listens.", "ending": "They wait.",
+        "duration": 5, "duration_reason": "one reply", "image_prompt": "Pokke and Nox",
+        "dialogue": [{"speaker": "Pokke", "text": "This way!", "language": "English",
+                      "voiceover": False}],
+        "card_selection": {"characters": ["Pokke", "Nox"]},
+    }], "local_ai")
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    context = project["custom_instructions"]
+    assert "Pokke should remain fast and bouncy, never robotic" in context
+    assert "Pokke: bright youthful momentum" in context
+    assert "Nox should remain smoky" not in context
+    assert "Nox: controlled quiet amusement" not in context
+
+
+def test_mimic_and_recorded_speakers_reuse_the_selected_voice_authority(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "A mirror bird mimics Pokke.",
+                                 "language": "en"})
+    pokke, bird = _card("Pokke"), _card("Mirror Bird")
+    pokke_voice = _card("Pokke voice", character_card_id=pokke["id"],
+                        description="Fast and bouncy.", voice_id="POKKE_V1")
+    production["cards"].update({"characters": [pokke, bird], "voices": [pokke_voice]})
+    manager.save(production)
+    clips = [{
+        "title": "Exact mimic", "story": "The Mirror Bird mimics Pokke's exact voice.",
+        "setting": "mirror hall", "action": "Pokke speaks, then the bird repeats the same words.",
+        "ending": "The bird tilts its head.", "duration": 6, "duration_reason": "one echo",
+        "image_prompt": "Pokke and the Mirror Bird",
+        "dialogue": [
+            {"speaker": "Pokke", "text": "That is mine.", "language": "English", "voiceover": False},
+            {"speaker": "Mirror Bird", "text": "That is mine.", "language": "English", "voiceover": False},
+        ],
+        "card_selection": {"characters": ["Pokke", "Mirror Bird"], "voices": ["Pokke voice"]},
+    }, {
+        "title": "Recorded reflection", "story": "A recorded reflection plays Pokke's voice.",
+        "setting": "mirror hall", "action": "A reflection recording says the saved line.",
+        "ending": "The reflection fades.", "duration": 5, "duration_reason": "one playback",
+        "image_prompt": "a bounded mirror recording",
+        "dialogue": [{"speaker": "Pokke reflection", "text": "Wait here.",
+                      "language": "English", "voiceover": False}],
+        "card_selection": {"characters": [], "voices": ["Pokke voice"]},
+    }]
+    production = manager.apply_plan(production["id"], clips, "local_ai")
+    first = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    first_delivery = [line["delivery"] for line in first["shots"][0]["dialogue"]]
+    assert all("Pokke voice" in delivery and "POKKE_V1" in delivery
+               for delivery in first_delivery)
+    production = manager.get(production["id"])
+    second = manager.materialise(production["id"], production["segments"][1]["id"])["project"]
+    assert "Pokke voice" in second["shots"][0]["dialogue"][0]["delivery"]
+    assert "POKKE_V1" in second["shots"][0]["dialogue"][0]["delivery"]
+
+
 def test_director_version_keeps_voice_metadata_scoped_and_classic_available(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({
@@ -1344,6 +1418,8 @@ def test_director_version_keeps_voice_metadata_scoped_and_classic_available(tmp_
     p = materialised["project"]
     assert p["prompt_version"] == "continuity_director"
     assert p["narrative_voice"]["cards"][0]["name"] == "Pokke voice"
+    assert p["narrative_voice"]["cards"][0]["voice_id"] == "POKKE"
+    assert "Pokke: brisk" in p["narrative_voice"]["cards"][0]["series_rules"]
     assert len(p["narrative_voice"]["cards"]) == 1
     assert "VOICE DIRECTION" not in p["custom_instructions"]
     assert not p["h3_verbatim_blocks"]
@@ -1352,6 +1428,8 @@ def test_director_version_keeps_voice_metadata_scoped_and_classic_available(tmp_
     text = compiled["prompt"]
     assert text.startswith("asset_roles:")
     assert "Brisk and bouncy" in text and "Smooth and smoky" not in text
+    assert "Stable recurring voice identity key: POKKE" in text
+    assert "Pokke: brisk" in text
     assert "Nox: smoky" not in text
 
 

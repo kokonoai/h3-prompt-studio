@@ -93,6 +93,27 @@ def auth(module):
     return {"X-H3-Token": module.TOKEN, "Origin": "http://127.0.0.1:8766"}
 
 
+def test_only_the_known_windows_proactor_disconnect_is_suppressed(server):
+    module, _client, _fake = server
+
+    class Reset10054(ConnectionResetError):
+        winerror = 10054
+
+    expected = {
+        'exception': Reset10054('peer closed'),
+        'handle': '<Handle _ProactorBasePipeTransport._call_connection_lost(None)>',
+    }
+    wrong_callback = {**expected, 'handle': '<Handle application_callback()>'}
+    real_failure = {
+        'exception': RuntimeError('application failed'),
+        'handle': '<Handle _ProactorBasePipeTransport._call_connection_lost(None)>',
+    }
+
+    assert module._benign_proactor_disconnect(expected) is True
+    assert module._benign_proactor_disconnect(wrong_callback) is False
+    assert module._benign_proactor_disconnect(real_failure) is False
+
+
 def test_production_video_job_counts_keep_lost_requests_separate(server):
     module, _client, _fake = server
     counts = module._production_video_job_counts([
@@ -132,6 +153,80 @@ def test_quality_context_separates_remote_panels_from_physical_cast(server):
     assert context['must_not_be_physical'] == ['Koko', 'Besi']
     assert 'REMOTE-CALL PANEL GEOMETRY LOCK' in context['device_geometry_contract']
     assert [row['name'] for row in context['characters']] == ['Koko', 'Besi']
+
+
+def test_quality_boundary_cast_repairs_entrance_conflicts_and_closeup_crops(server):
+    module, _client, _fake = server
+    timeline = {
+        'visible_start': ['Mimi', 'Pokke', 'Nox'],
+        'visible_end': ['Mimi', 'Pokke', 'Nox'],
+        'enters': ['Nox'], 'exits': [],
+    }
+    segment = {'shot_contract': {
+        'shot_size': 'close_up',
+        'opening_composition': "Mimi's profile facing the mirror",
+        'ending_composition': 'Ensemble reaction shot including Nox',
+    }}
+
+    present_first, required_first = module._quality_boundary_cast(
+        segment, timeline, ['Mimi', 'Pokke', 'Nox'], 'first')
+    present_last, required_last = module._quality_boundary_cast(
+        segment, timeline, ['Mimi', 'Pokke', 'Nox'], 'last')
+
+    assert present_first == ['Mimi', 'Pokke']
+    assert required_first == ['Mimi']
+    assert present_last == ['Mimi', 'Pokke', 'Nox']
+    assert required_last == ['Mimi', 'Pokke', 'Nox']
+
+
+def test_quality_boundary_cast_does_not_require_background_cast_in_reaction_closeup(server):
+    module, _client, _fake = server
+    timeline = {
+        'visible_start': ['Pokke', 'Bokka', 'Moko', 'Chappi'],
+        'visible_end': ['Pokke', 'Bokka', 'Moko', 'Chappi', 'Mirror Bird'],
+        'enters': ['Mirror Bird'], 'exits': [],
+    }
+    segment = {'shot_contract': {
+        'shot_size': 'close_up',
+        'opening_composition': 'Over-the-shoulder from Pokke to the wrench',
+        'ending_composition': "Close-up on Pokke's shocked expression",
+    }}
+
+    _, required_first = module._quality_boundary_cast(
+        segment, timeline, ['Pokke', 'Bokka', 'Moko', 'Chappi', 'Mirror Bird'], 'first')
+    _, required_last = module._quality_boundary_cast(
+        segment, timeline, ['Pokke', 'Bokka', 'Moko', 'Chappi', 'Mirror Bird'], 'last')
+
+    assert required_first == ['Pokke']
+    assert required_last == ['Pokke']
+
+
+def test_quality_prop_contract_only_makes_authored_visible_props_strict(server):
+    module, _client, _fake = server
+    segment = {
+        'story': 'Bokka admires herself in the Leaf Magic Mirror.',
+        'action': 'Bokka checks her bow in the Leaf Magic Mirror.',
+        'ending': 'Bokka looks upward.', 'image_prompt': '',
+        'shot_contract': {'opening_composition': 'Bokka facing the mirror',
+                          'ending_composition': 'Bokka looks up'},
+        'continuity_state': {
+            'prop_holders_start': [
+                {'prop': 'Leaf Magic Mirror', 'holder': 'Bokka'},
+                {'prop': 'Three-Button Remote', 'holder': 'Bokka'},
+            ],
+            'prop_holders_end': [
+                {'prop': 'Leaf Magic Mirror', 'holder': 'Bokka'},
+                {'prop': 'Three-Button Remote', 'holder': 'Bokka'},
+            ],
+        },
+    }
+
+    contract = module._quality_prop_contract(segment)
+
+    assert contract['critical_names'] == ['Leaf Magic Mirror']
+    assert contract['continuity_names'] == ['Three-Button Remote']
+    assert [row['prop'] for row in contract['critical_start']] == ['Leaf Magic Mirror']
+    assert [row['prop'] for row in contract['continuity_start']] == ['Three-Button Remote']
 
 
 def test_quality_reference_selection_accepts_canonical_card_names(server, monkeypatch):
@@ -251,6 +346,49 @@ def test_batch_legacy_review_returns_before_background_work(server, monkeypatch)
     assert response.json()['quality_batch']['status'] == 'running'
     assert response.json()['outputs']['production_id'] == production_id
     assert len(started) == 1
+
+
+def test_batch_rereview_accepts_only_completed_takes_from_this_production(server, monkeypatch):
+    module, client, _fake = server
+    production_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
+    started = []
+
+    class Productions:
+        def assert_active(self, ident):
+            assert ident == production_id
+            return {'id': ident}
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target, self.args = target, args
+
+        def start(self):
+            started.append((self.target, self.args))
+
+    overview = {
+        'production_id': production_id,
+        'segments': [{'candidates': [{'id': run_id, 'status': 'succeeded'}]}],
+    }
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module.threading, 'Thread', DeferredThread)
+    monkeypatch.setattr(module, 'production_outputs', lambda ident: {
+        **overview, 'production_id': ident})
+    module.PRODUCTION_QUALITY_JOBS.clear()
+
+    response = client.post(
+        f'/api/productions/{production_id}/quality', headers=auth(module),
+        json={'legacy_only': False, 'run_ids': [run_id]})
+
+    assert response.status_code == 200
+    assert response.json()['quality_batch']['target_count'] == 1
+    assert started[0][1] == (production_id, False, [run_id])
+
+    module.PRODUCTION_QUALITY_JOBS.clear()
+    rejected = client.post(
+        f'/api/productions/{production_id}/quality', headers=auth(module),
+        json={'legacy_only': False, 'run_ids': [str(uuid.uuid4())]})
+    assert rejected.status_code == 400
+    assert 'outside this production' in rejected.json()['detail'].lower()
 
 
 def test_rejected_take_becomes_adoptable_only_after_human_override(server, monkeypatch):

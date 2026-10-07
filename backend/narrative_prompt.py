@@ -173,6 +173,12 @@ def _voice_and_dialogue(project, shots, names, speaker_ids):
         if card:
             detail = ' '.join(_text(card.get(key)) for key in ('description', 'notes'))
             lines.append('Voice identity for ' + names[sid] + ': ' + (detail or 'keep the established named voice.')
+                         + (' Stable recurring voice identity key: ' + _text(card.get('voice_id')) + '.'
+                            if _text(card.get('voice_id')) else '')
+                         + (' Pace and rhythm: ' + _sentence(_text(card.get('pace')))
+                            if _text(card.get('pace')) else '')
+                         + (' Selected-speaker series rules: ' + _sentence(_text(card.get('series_rules')))
+                            if _text(card.get('series_rules')) else '')
                          + (' Uploaded clean voice audio takes priority for audible identity.' if card.get('has_audio') else ''))
     if audible:
         lines.append('Only ' + ', '.join(names[sid] for sid in audible) + ' speak' + ('s' if len(audible) == 1 else '')

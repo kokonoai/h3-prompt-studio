@@ -194,3 +194,92 @@ def test_resuming_does_not_rerender_a_rejected_take_without_human_approval():
     assert merged == []
     assert "not adopted or rerendered automatically" in state["automation"]["last_error"]
     assert "1 Rejected clip" in state["automation"]["last_error"]
+
+
+def test_rejected_take_does_not_stop_other_missing_clips_from_finishing():
+    state = {
+        "id": "production-1", "task_state": "active",
+        "segments": [
+            {"id": "segment-1", "index": 1, "status": "ready",
+             "stale_reasons": [], "video_prompt": "current"},
+            {"id": "segment-2", "index": 2, "status": "ready",
+             "stale_reasons": [], "video_prompt": "current"},
+        ],
+        "automation": {"status": "idle", "stage": "scan", "merge": True,
+                       "completed": 0, "total": 2, "current_index": 0,
+                       "attempt": 0, "last_error": ""},
+    }
+    rendered = set()
+    reviewed = set()
+    rejected = set()
+    submitted = []
+    merged = []
+    run_segments = {}
+
+    def outputs(_ident):
+        rows = []
+        for segment in state["segments"]:
+            segment_id = segment["id"]
+            if segment_id in rejected:
+                candidate = {
+                    "id": f"run-{segment_id}", "status": "succeeded",
+                    "quality_review": {"status": "failed", "accepted": False},
+                }
+                selected = None
+            elif segment_id in rendered:
+                candidate = {"id": f"run-{segment_id}", "status": "succeeded"}
+                selected = candidate
+            else:
+                candidate = None
+                selected = None
+            rows.append({
+                "segment_id": segment_id, "index": segment["index"],
+                "title": segment_id, "selected": selected,
+                "candidates": [candidate] if candidate else [],
+            })
+        pending = len(rendered - reviewed)
+        return {"segments": rows, "all_ready": False,
+                "quality_pending_count": pending}
+
+    def submit_video(_production_id, segment_id, request_id):
+        submitted.append(segment_id)
+        run_id = f"run-{segment_id}"
+        run_segments[run_id] = segment_id
+        return {"run": {"id": run_id, "status": "queued", "stage": "Queued"}}
+
+    def get_run(run_id):
+        rendered.add(run_segments[run_id])
+        return {"id": run_id, "status": "succeeded", "stage": "Video ready"}
+
+    def review_quality(_ident):
+        pending = sorted(rendered - reviewed)
+        assert pending
+        segment_id = pending[0]
+        reviewed.add(segment_id)
+        if segment_id == "segment-1":
+            rejected.add(segment_id)
+            return {"failed": [{"segment_id": segment_id}], "pending": 0}
+        return {"failed": [], "reviews": [{"segment_id": segment_id,
+                                              "status": "passed"}], "pending": 0}
+
+    manager = ProductionAutomationManager(
+        list_productions=lambda: [{"id": state["id"]}],
+        get_production=lambda _ident: copy.deepcopy(state),
+        update_automation=lambda _ident, changes: (
+            state["automation"].update(copy.deepcopy(changes)) or copy.deepcopy(state)),
+        outputs=outputs,
+        generate_prompt=lambda _production_id, _segment_id: None,
+        submit_video=submit_video, get_run=get_run,
+        resolve_run=lambda run_id: get_run(run_id),
+        build_film=lambda ident: merged.append(ident),
+        review_quality=review_quality, poll_interval=0, retry_delays=(0, 0, 0),
+    )
+
+    manager.start(state["id"])
+    wait_for(lambda: state["automation"]["status"] == "needs_attention")
+
+    assert submitted == ["segment-1", "segment-2"]
+    assert rejected == {"segment-1"}
+    assert reviewed == {"segment-1", "segment-2"}
+    assert merged == []
+    assert "not adopted or rerendered automatically" in state["automation"]["last_error"]

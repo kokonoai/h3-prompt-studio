@@ -2437,11 +2437,37 @@ def collective_speaker(value):
                    "众人", "大家", "全员", "所有人", "眾人", "全員", "みんな"}
 
 
+def series_voice_character_rules(value, character_name):
+    """Keep only one selected speaker's rules from a shared voice bible.
+
+    Series voice styles often contain both global acting direction and a long
+    per-character roster.  Sending the whole roster to every clip can summon
+    silent names or blur identities, while dropping it entirely loses useful
+    exclusions such as ``Pokke should not sound robotic``.  This narrow pass
+    retains only lines that explicitly name the current speaking character.
+    """
+    name = str(character_name or "").strip()
+    if not name:
+        return ""
+    selected = []
+    for raw in str(value or "").splitlines():
+        line = re.sub(r"^\s*(?:[-*]+|#{1,6})\s*", "", raw).strip()
+        if not line or not _name_occurs(name.casefold(), line.casefold()):
+            continue
+        if line.casefold() not in {item.casefold() for item in selected}:
+            selected.append(line)
+        if len(" ".join(selected)) >= 1200:
+            break
+    return " ".join(selected)[:1200]
+
+
 def voice_prompt_context(production, cards):
     """Build one non-rewritten block for the current clip's audible cast."""
     if not cards:
         return ""
     from .narrative_prompt import _brief_series_style
+    character_names = {card["id"]: card["name"]
+                       for card in production["cards"]["characters"]}
     audio_cards = [card["name"] for card in cards if card.get("asset_ids")]
     sections = [
         "VOICE DIRECTION — CURRENT CLIP ONLY",
@@ -2460,6 +2486,9 @@ def voice_prompt_context(production, cards):
         # classic H3 visual prompt. Selected voice cards below stay verbatim.
         sections.append("Series Voice Style:\n" + global_style)
     for card in cards:
+        character_name = character_names.get(card.get("character_card_id"), card["name"])
+        character_rules = series_voice_character_rules(
+            production.get("series_voice_style"), character_name)
         exact = "\n".join(part for part in (card.get("description", ""), card.get("notes", "")) if part)
         metadata = "; ".join(part for part in (
             "Voice ID: " + card.get("voice_id", "") if card.get("voice_id") else "",
@@ -2476,7 +2505,9 @@ def voice_prompt_context(production, cards):
                             "text-to-speech. This supplement adds continuity only and does not replace or rewrite the "
                             "verbatim card above.")
         sections.append("Voice Card — " + card["name"] + ":\n" + (exact or "Use the named stable voice identity.")
-                        + ("\n" + metadata if metadata else "") + supplement)
+                        + ("\n" + metadata if metadata else "")
+                        + ("\nSelected-speaker series rules: " + character_rules if character_rules else "")
+                        + supplement)
     return "\n\n".join(sections)
 
 
@@ -4773,6 +4804,30 @@ class ProductionManager:
         lines, visible_dialogue, selected_voices, selected_voice_ids = [], [], [], set()
         collective_subjects = []
         selected_names = {card["name"].strip().casefold() for card in relevant_cards["characters"]}
+        explicitly_selected_voice_names = {
+            str(name).strip().casefold()
+            for name in segment.get("card_selection", {}).get("voices", [])}
+        explicitly_selected_voices = [
+            card for card in production["cards"]["voices"]
+            if card["name"].strip().casefold() in explicitly_selected_voice_names]
+        scripted_voices_by_text = {}
+        for scripted_line in segment["dialogue"]:
+            scripted_key = scripted_line["speaker"].strip().casefold()
+            scripted_character = character_by_speaker_alias.get(scripted_key)
+            if scripted_character is None:
+                continue
+            scripted_voice = self._voice_for_subject(
+                production, scripted_character.get("subject_id", ""), scripted_character["name"])
+            words_key = re.sub(r"\s+", " ", scripted_line.get("text", "")).strip().casefold()
+            if scripted_voice and words_key:
+                scripted_voices_by_text.setdefault(words_key, []).append(scripted_voice)
+        voice_reuse_cue = re.search(
+            r"\b(?:mimic|imitat(?:e|es|ed|ing|ion)|repeat(?:s|ed|ing)?|echo(?:es|ed|ing)?|"
+            r"playback|recorded voice|voice recording|same voice|reflection)\b|"
+            r"模仿|复刻|復刻|重复|重複|原样|原樣|回放|录音|錄音|镜像|鏡像|倒影|同样的声音|同樣的聲音|"
+            r"物真似|繰り返|録音|再生音声|反射像",
+            "\n".join(str(segment.get(key, "")) for key in ("story", "action", "ending")),
+            re.IGNORECASE)
         for line in segment["dialogue"]:
             key = line["speaker"].strip().casefold()
             character = character_by_speaker_alias.get(key)
@@ -4789,6 +4844,17 @@ class ProductionManager:
                 subject["description"] = "Collective dialogue cue for the selected visible cast; not an additional character."
                 collective_subjects.append(subject)
             voice = None if is_collective else self._voice_for_subject(production, subject["id"], subject["name"])
+            if voice is None and not is_collective and voice_reuse_cue:
+                words_key = re.sub(r"\s+", " ", line.get("text", "")).strip().casefold()
+                repeated = list({candidate["id"]: candidate
+                                 for candidate in scripted_voices_by_text.get(words_key, [])}.values())
+                if len(repeated) == 1:
+                    voice = repeated[0]
+                else:
+                    unused_explicit = [candidate for candidate in explicitly_selected_voices
+                                       if candidate["id"] not in selected_voice_ids]
+                    if len(unused_explicit) == 1:
+                        voice = unused_explicit[0]
             if voice and voice["id"] not in selected_voice_ids:
                 selected_voice_ids.add(voice["id"])
                 selected_voices.append(voice)
@@ -4923,6 +4989,10 @@ class ProductionManager:
                         characters_by_id[card["character_card_id"]]["name"].strip().casefold()],
                     "name": card["name"], "description": card.get("description", ""),
                     "notes": card.get("notes", ""), "voice_id": card.get("voice_id", ""),
+                    "pace": card.get("pace", ""),
+                    "series_rules": series_voice_character_rules(
+                        production.get("series_voice_style", ""),
+                        characters_by_id[card["character_card_id"]]["name"]),
                     "has_audio": bool(card.get("asset_ids")),
                 } for card in selected_voices
                     if card.get("character_card_id") in characters_by_id

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -71,10 +73,38 @@ def client():
 RESOURCES = ResourceManager(lambda: copy.deepcopy(SETTINGS), client, state_path=DATA / 'resource_state.json')
 
 
+def _benign_proactor_disconnect(context):
+    """Recognise the noisy Windows callback raised after a peer disconnects.
+
+    Browser AbortController timeouts and local LM/Comfy services may close a
+    socket before asyncio's Proactor transport performs its final shutdown.
+    The request is already gone at that point.  Match the exact callback and
+    WinError only; ordinary connection and application exceptions must still
+    reach the event loop's normal exception handler.
+    """
+    exc = context.get('exception') if isinstance(context, dict) else None
+    handle = str(context.get('handle') or '') if isinstance(context, dict) else ''
+    code = getattr(exc, 'winerror', None) or getattr(exc, 'errno', None)
+    return (isinstance(exc, ConnectionResetError) and code == 10054 and
+            '_ProactorBasePipeTransport._call_connection_lost' in handle)
+
+
 @asynccontextmanager
 async def app_lifespan(_app):
     # Functions referenced here are resolved after the module has finished
     # loading, when FastAPI actually enters the lifespan.
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+
+    def handle_loop_exception(active_loop, context):
+        if _benign_proactor_disconnect(context):
+            return
+        if previous_exception_handler is not None:
+            previous_exception_handler(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_loop_exception)
     threading.Thread(target=lambda: production_automation_manager().recover(), daemon=True,
                      name='h3-production-recovery').start()
     try:
@@ -82,6 +112,7 @@ async def app_lifespan(_app):
     finally:
         if PRODUCTION_AUTOMATION is not None:
             PRODUCTION_AUTOMATION.shutdown()
+        loop.set_exception_handler(previous_exception_handler)
 
 
 app = FastAPI(title='H3 Prompt Studio', version='1.23.1', docs_url='/api/docs', lifespan=app_lifespan)
@@ -1384,6 +1415,74 @@ def _quality_reference_rows(production, segment):
     return rows[:6]
 
 
+def _quality_boundary_cast(segment, timeline, character_names, boundary):
+    """Separate physical presence from exact sampled-frame visibility.
+
+    Storyboard timelines describe who occupies the scene, not who survives a
+    close-up crop.  Quality review previously treated those as identical and
+    rejected valid reaction/insert shots for omitting background performers.
+    """
+    first = boundary == 'first'
+    source_key = 'visible_start' if first else 'visible_end'
+    transition_key = 'enters' if first else 'exits'
+    transition = {str(name).strip().casefold()
+                  for name in timeline.get(transition_key, []) if str(name).strip()}
+    present = [str(name).strip() for name in timeline.get(source_key, [])
+               if str(name).strip() and str(name).strip().casefold() not in transition]
+    contract = segment.get('shot_contract', {}) or {}
+    composition = str(contract.get(
+        'opening_composition' if first else 'ending_composition') or '')
+    composition_key = composition.casefold()
+    explicitly_framed = [name for name in character_names
+                         if str(name).strip() and str(name).strip().casefold() in composition_key]
+    ensemble = bool(re.search(
+        r'\b(?:ensemble|group|master|two[- ]shot|three[- ]shot|four[- ]shot|wide shot)\b|'
+        r'(?:群像|全员|全員|双人镜头|雙人鏡頭|三人镜头|三人鏡頭)',
+        composition, re.IGNORECASE))
+    if ensemble:
+        required = present
+    else:
+        present_keys = {name.casefold() for name in present}
+        required = [name for name in explicitly_framed if name.casefold() in present_keys]
+        # A solo physical shot remains a safe exact requirement even when the
+        # planner omitted a detailed composition sentence.
+        if not required and len(present) == 1:
+            required = present
+    return list(dict.fromkeys(present)), list(dict.fromkeys(required))
+
+
+def _quality_prop_contract(segment):
+    """Split plot-critical props from passive continuity inventory."""
+    state = segment.get('continuity_state', {}) or {}
+    holders = [*(state.get('prop_holders_start', []) or []),
+               *(state.get('prop_holders_end', []) or [])]
+    names = list(dict.fromkeys(
+        str(row.get('prop') or '').strip() for row in holders
+        if isinstance(row, dict) and str(row.get('prop') or '').strip()))
+    contract = segment.get('shot_contract', {}) or {}
+    authored = '\n'.join(str(segment.get(key) or '') for key in
+                         ('story', 'action', 'ending', 'image_prompt'))
+    authored += '\n' + str(contract.get('opening_composition') or '')
+    authored += '\n' + str(contract.get('ending_composition') or '')
+    authored_key = authored.casefold()
+    critical = [name for name in names if name.casefold() in authored_key]
+    continuity = [name for name in names if name not in critical]
+
+    def selected(rows, allowed):
+        keys = {name.casefold() for name in allowed}
+        return [row for row in rows or [] if isinstance(row, dict) and
+                str(row.get('prop') or '').strip().casefold() in keys]
+
+    return {
+        'critical_names': critical,
+        'continuity_names': continuity,
+        'critical_start': selected(state.get('prop_holders_start', []), critical),
+        'critical_end': selected(state.get('prop_holders_end', []), critical),
+        'continuity_start': selected(state.get('prop_holders_start', []), continuity),
+        'continuity_end': selected(state.get('prop_holders_end', []), continuity),
+    }
+
+
 def _quality_visual_context(production, segment, references):
     from .productions import (character_presence_roles,
                               device_screen_geometry_lock, effective_cast_timeline)
@@ -1404,25 +1503,37 @@ def _quality_visual_context(production, segment, references):
         role_names['display'] + role_names['imagined'] + role_names['offscreen'] +
         timeline.get('offscreen', []) + timeline.get('mentioned_only', [])))
     state = segment.get('continuity_state', {})
+    character_names = [card.get('name') for card in selected if card.get('name')]
+    present_first, required_first = _quality_boundary_cast(
+        segment, timeline, character_names, 'first')
+    present_last, required_last = _quality_boundary_cast(
+        segment, timeline, character_names, 'last')
+    prop_contract = _quality_prop_contract(segment)
+    device_contract = device_screen_geometry_lock(segment, display_names)
     return {
         'clip': {'index': segment.get('index'), 'title': segment.get('title'),
                  'action': segment.get('action'), 'ending': segment.get('ending'),
                  'device_view': segment.get('device_view')},
-        'required_visible_first': timeline.get('visible_start', []),
-        'required_visible_last': timeline.get('visible_end', []),
+        'physical_present_first': present_first,
+        'physical_present_last': present_last,
+        'required_visible_first': required_first,
+        'required_visible_last': required_last,
         'enters': timeline.get('enters', []), 'exits': timeline.get('exits', []),
         'display_only': display_names,
         'imagined_only': role_names['imagined'],
         'offscreen_only': role_names['offscreen'],
         'must_not_be_physical': must_not_be_physical,
-        'device_geometry_contract': device_screen_geometry_lock(segment, display_names),
+        'device_geometry_contract': device_contract,
         'characters': [{'name': card.get('name'), 'visible_traits': card.get('description'),
                         'has_reference_image': any(row.get('label', '').endswith(str(card.get('name')))
                                                    for row in references)}
                        for card in selected],
         'opening_state': state.get('opening_state'), 'ending_state': state.get('ending_state'),
-        'prop_holders_start': state.get('prop_holders_start', []),
-        'prop_holders_end': state.get('prop_holders_end', []),
+        'plot_critical_prop_holders_start': prop_contract['critical_start'],
+        'plot_critical_prop_holders_end': prop_contract['critical_end'],
+        'continuity_only_prop_holders_start': prop_contract['continuity_start'],
+        'continuity_only_prop_holders_end': prop_contract['continuity_end'],
+        'continuity_only_prop_names': prop_contract['continuity_names'],
         'visual_style': production.get('style_bible') or production.get('visual_style_custom') or
                         production.get('visual_style_preset'),
         'sampling_limit': ('Only first/middle/last frames are supplied. Do not infer dialogue, sound, '
@@ -1476,8 +1587,13 @@ def _review_production_take(production_id, segment_id, run_id, *, model=None,
             visual = normalise_visual_review(
                 raw, has_identity_references=any(
                     str(row.get('label') or '').startswith('IDENTITY ') for row in references),
-                expected_first=len(context['required_visible_first']),
-                expected_last=len(context['required_visible_last']))
+                expected_first=context['required_visible_first'],
+                expected_last=context['required_visible_last'],
+                continuity_prop_names=context['continuity_only_prop_names'],
+                strict_prop_or_device=bool(
+                    context['plot_critical_prop_holders_start'] or
+                    context['plot_critical_prop_holders_end'] or
+                    context['device_geometry_contract']))
         except Exception as exc:
             error_text = str(exc)[:600]
     issues = [*deterministic, *visual.get('issues', [])]
@@ -1511,26 +1627,33 @@ def _review_production_take(production_id, segment_id, run_id, *, model=None,
     return _save_production_quality(production['id'], segment['id'], run['id'], result)
 
 
-def review_production_quality(production_id, *, segment_id=None, run_id=None, force=False,
-                              legacy_only=False):
+def review_production_quality(production_id, *, segment_id=None, run_id=None, run_ids=None,
+                              force=False, legacy_only=False):
     """Review pending adopted takes under one AI lease to avoid model thrashing."""
     production = production_manager().get(safe_id(production_id))
     overview = production_outputs(production['id'])
+    requested_run_ids = {safe_id(value) for value in (run_ids or [])}
     targets = []
     for row in overview['segments']:
         if segment_id and row['segment_id'] != safe_id(segment_id):
             continue
-        selected = row.get('selected')
+        candidates = [row.get('selected')]
         if run_id:
-            selected = next((job for job in row.get('candidates', [])
-                             if job.get('id') == safe_id(run_id)), None)
-        if not selected or selected.get('status') != 'succeeded':
-            continue
-        review = _production_quality_descriptor(production['id'], row['segment_id'], selected['id'])
-        if legacy_only and review.get('status') != 'legacy':
-            continue
-        if force or (review.get('required') and review.get('status') in ('pending', 'reviewing')):
-            targets.append((row['segment_id'], selected['id']))
+            candidates = [next((job for job in row.get('candidates', [])
+                                if job.get('id') == safe_id(run_id)), None)]
+        elif requested_run_ids:
+            candidates = [job for job in row.get('candidates', [])
+                          if job.get('id') in requested_run_ids]
+        for selected in candidates:
+            if not selected or selected.get('status') != 'succeeded':
+                continue
+            review = _production_quality_descriptor(
+                production['id'], row['segment_id'], selected['id'])
+            if legacy_only and review.get('status') != 'legacy':
+                continue
+            if force or (review.get('required') and
+                         review.get('status') in ('pending', 'reviewing')):
+                targets.append((row['segment_id'], selected['id']))
     if not targets:
         return {'reviews': [], 'failed': [], 'pending': 0}
 
@@ -1562,12 +1685,12 @@ def _production_quality_batch_state(production_id):
         return copy.deepcopy(PRODUCTION_QUALITY_JOBS.get(safe_id(production_id)))
 
 
-def _run_production_quality_batch(production_id, legacy_only):
+def _run_production_quality_batch(production_id, legacy_only, run_ids=None):
     """Run an optional legacy review without holding the browser request open."""
     production_id = safe_id(production_id)
     try:
         result = review_production_quality(
-            production_id, force=True, legacy_only=legacy_only)
+            production_id, force=True, legacy_only=legacy_only, run_ids=run_ids)
         state = {
             'status': 'completed', 'legacy_only': legacy_only,
             'reviewed_count': len(result.get('reviews', [])),
@@ -1805,12 +1928,24 @@ def production_quality_review(production_id: str, segment_id: str, run_id: str, 
 
 @app.post('/api/productions/{production_id}/quality')
 def production_quality_review_batch(production_id: str, body: dict):
-    if (not isinstance(body, dict) or set(body) - {'legacy_only'} or
-            type(body.get('legacy_only', True)) is not bool):
-        raise ValueError('Batch quality review accepts only a boolean legacy_only option.')
+    if (not isinstance(body, dict) or set(body) - {'legacy_only', 'run_ids'} or
+            type(body.get('legacy_only', True)) is not bool or
+            not isinstance(body.get('run_ids', []), list) or
+            len(body.get('run_ids', [])) > 64 or
+            any(not isinstance(value, str) for value in body.get('run_ids', []))):
+        raise ValueError('Batch quality review accepts legacy_only and up to 64 run_ids.')
     production_id = safe_id(production_id)
     production_manager().assert_active(production_id)
     legacy_only = body.get('legacy_only', True)
+    run_ids = list(dict.fromkeys(safe_id(value) for value in body.get('run_ids', [])))
+    if run_ids:
+        legacy_only = False
+        known = {job.get('id') for row in production_outputs(production_id).get('segments', [])
+                 for job in row.get('candidates', [])
+                 if job.get('status') == 'succeeded'}
+        unknown = [value for value in run_ids if value not in known]
+        if unknown:
+            raise ValueError('Batch quality review contains a take outside this production.')
     with STATE_LOCK:
         current = PRODUCTION_QUALITY_JOBS.get(production_id)
         if current and current.get('status') == 'running':
@@ -1818,13 +1953,14 @@ def production_quality_review_batch(production_id: str, body: dict):
                     'outputs': production_outputs(production_id)}
         state = {
             'status': 'running', 'legacy_only': legacy_only,
+            'target_count': len(run_ids) if run_ids else None,
             'reviewed_count': 0, 'failed_count': 0,
             'started_at': time.time(), 'finished_at': None, 'error': None,
         }
         PRODUCTION_QUALITY_JOBS[production_id] = state
     threading.Thread(
         target=_run_production_quality_batch,
-        args=(production_id, legacy_only), daemon=True,
+        args=(production_id, legacy_only, run_ids or None), daemon=True,
         name='h3-production-quality-' + production_id[:8]).start()
     return {'quality_batch': state, 'outputs': production_outputs(production_id)}
 

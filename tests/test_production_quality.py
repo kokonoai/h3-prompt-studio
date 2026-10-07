@@ -69,6 +69,56 @@ def test_sampled_absence_and_unreferenced_identity_are_only_warnings():
     assert not repair_direction(identity["issues"])
 
 
+def test_boundary_absence_is_hard_only_for_the_character_required_in_frame():
+    wrong_person = normalise_visual_review(_visual_review({
+        "code": "missing_required_character", "severity": "error", "confidence": 1,
+        "frame": "first", "message": "Nox is missing from the first frame.",
+        "repair_instruction": "Add Nox to the first frame.",
+    }), has_identity_references=True, expected_first=["Mimi"], expected_last=["Mimi"])
+    required_person = normalise_visual_review(_visual_review({
+        "code": "missing_required_character", "severity": "error", "confidence": 1,
+        "frame": "first", "message": "Mimi is missing from the first frame.",
+        "repair_instruction": "Add Mimi to the first frame.",
+    }), has_identity_references=True, expected_first=["Mimi"], expected_last=["Mimi"])
+
+    assert wrong_person["status"] == "warning"
+    assert wrong_person["issues"][0]["confidence"] == .69
+    assert required_person["status"] == "failed"
+
+
+def test_passive_continuity_prop_cannot_be_misclassified_as_identity_failure():
+    result = normalise_visual_review(_visual_review({
+        "code": "identity_drift", "severity": "error", "confidence": 1,
+        "frame": "multiple",
+        "message": "Bokka is missing the required Three-Button Remote in her right hand.",
+        "repair_instruction": "Add the Three-Button Remote to Bokka's right hand.",
+    }), has_identity_references=True, expected_first=["Bokka"], expected_last=["Bokka"],
+        continuity_prop_names=["Three-Button Remote"], strict_prop_or_device=True)
+
+    assert result["status"] == "warning"
+    assert result["issues"][0]["code"] == "prop_or_device_error"
+    assert result["issues"][0]["confidence"] == .79
+    assert not repair_direction(result["issues"])
+
+
+def test_noncritical_prop_or_device_issue_is_warning_but_real_duplicate_stays_hard():
+    prop = normalise_visual_review(_visual_review({
+        "code": "prop_or_device_error", "severity": "error", "confidence": .97,
+        "frame": "first", "message": "A passive prop is not visible.",
+        "repair_instruction": "Show the prop.",
+    }), has_identity_references=True, expected_first=[], expected_last=[],
+        strict_prop_or_device=False)
+    duplicate = normalise_visual_review(_visual_review({
+        "code": "duplicate_character", "severity": "error", "confidence": .97,
+        "frame": "last", "message": "Mimi appears as two independent bodies.",
+        "repair_instruction": "Keep one physical Mimi.",
+    }), has_identity_references=True, expected_first=[], expected_last=[],
+        strict_prop_or_device=False)
+
+    assert prop["status"] == "warning"
+    assert duplicate["status"] == "failed"
+
+
 def test_contact_sheet_contains_generated_samples_and_references(tmp_path):
     frames = {}
     for index, kind in enumerate(("first", "middle", "last")):
