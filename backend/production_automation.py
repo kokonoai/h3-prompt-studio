@@ -18,6 +18,12 @@ PROMPT_REPAIR_MARKERS = (
     "directions inherited from an older clip",
     "outdated character-reference assignment",
     "production clip is stale",
+    # The saved delivery-language prompt is derived from the English scene
+    # prompt. Scene or language edits invalidate that derivative, but this is
+    # normal rebuildable work, not a reason to stop the full-episode queue.
+    "scene changed after its english h3 prompt was created",
+    "saved h3 language pass is invalid",
+    "project dialogue language changed",
     "shot_contract.relation_previous disagrees with transition_mode",
     # Adjacent-state failures can be repaired without changing story/cast: the
     # materialiser converts the unsafe continuation to a hard cut, rebuilds the

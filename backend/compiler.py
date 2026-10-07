@@ -869,26 +869,26 @@ def compile_project(project: dict) -> dict:
     render_override = _text(project.get("production_render_override", ""))
     if render_override:
         prompt += "\n\nproduction_render_override:\n" + render_override
-    # AI planning data remains editable in the project's language.  A saved,
-    # source-bound delivery prompt may replace this raw multilingual rendering
-    # only after the final language pass has verified English direction and the
-    # project's selected spoken language.
-    from .prompt_language import saved_delivery_prompt
-    delivery_prompt, language_error = saved_delivery_prompt(project, prompt)
-    if language_error:
-        issue("error", "stale_prompt_translation", "h3_prompt_translation", language_error)
-    elif delivery_prompt is not None:
-        prompt = delivery_prompt
-    # Keep the exclusive speech contract as the final instruction even when a
-    # saved English delivery prompt or a production continuity block replaced
-    # the earlier rendering.  Do not repeat the dialogue words here: one tagged
-    # occurrence is intentional and reduces duplicate or improvised delivery.
+    # The final speech boundary is part of the immutable source sent through the
+    # language pass.  It must be appended before source hashing; otherwise the
+    # first raw compile includes this tail while the next compile validates the
+    # saved hash against a prompt without it and falsely reports a changed scene.
     prompt += "\n\n" + final_audio_override(
         shots, {
             sid: (_text(subject_map[sid].get("name")) or name(sid))
             for sid in subject_map
         }
     )
+    # AI planning data remains editable in the project's language.  A saved,
+    # source-bound delivery prompt may replace this complete raw multilingual
+    # rendering only after the final language pass has verified English
+    # direction and the project's selected spoken language.
+    from .prompt_language import saved_delivery_prompt
+    delivery_prompt, language_error = saved_delivery_prompt(project, prompt)
+    if language_error:
+        issue("error", "stale_prompt_translation", "h3_prompt_translation", language_error)
+    elif delivery_prompt is not None:
+        prompt = delivery_prompt
     return result(prompt)
 
 

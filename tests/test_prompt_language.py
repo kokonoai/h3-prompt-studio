@@ -105,6 +105,7 @@ def test_compiler_uses_only_a_current_source_bound_language_pass():
     compiled = compile_project(project)
     assert compiled["valid"]
     assert compiled["prompt"] == translated
+    assert compiled["prompt"].count("FINAL AUDIO OVERRIDE") == 1
     project["shots"][0]["action"] += " 她挥手。"
     stale = compile_project(project)
     assert not stale["valid"]

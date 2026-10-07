@@ -129,6 +129,12 @@ def test_persisted_running_cursor_is_recovered_after_process_restart():
 def test_failure_classification_is_narrow_and_safe():
     assert is_prompt_repairable("This production clip is stale. Regenerate it.")
     assert is_prompt_repairable(
+        "The scene changed after its English H3 prompt was created. Generate the prompt again.")
+    assert is_prompt_repairable(
+        "The saved H3 language pass is invalid. Generate the prompt again.")
+    assert is_prompt_repairable(
+        "The project dialogue language changed. Generate the prompt again.")
+    assert is_prompt_repairable(
         "shot_contract.relation_previous disagrees with transition_mode.")
     assert is_prompt_repairable(
         "Continuous clip adds characters at its opening: Nox")
@@ -145,6 +151,21 @@ def test_unsafe_continuation_rebuilds_prompt_once_then_continues():
         "Continuous clip adds characters at its opening: Nox "
         "Continuous clip loses characters at its opening: Mr. Tsukiguma"
     ])
+
+    manager.start(state["id"])
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    assert len(submitted_ids) == 2
+    assert merged == [state["id"]]
+    assert state["automation"]["last_error"] == ""
+
+
+def test_stale_delivery_language_prompt_is_rebuilt_then_video_continues():
+    message = (
+        "The scene changed after its English H3 prompt was created. "
+        "Generate the prompt again.")
+    manager, state, submitted_ids, merged = fake_manager(
+        submit_failures=[message])
 
     manager.start(state["id"])
     wait_for(lambda: state["automation"]["status"] == "completed")
