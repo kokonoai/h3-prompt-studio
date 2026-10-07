@@ -1658,6 +1658,21 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     setOutputs(result.outputs);setSelectedQualityRunIds([]);autoMergeAttempt.current="";
     setNotice(t("已在后台重新质检选中的 "+count+" 个版本；不会修改提示词或重做视频，结果会自动刷新。","Re-reviewing "+count+" selected takes in the background. Prompts and videos are unchanged; results refresh automatically.","選択した "+count+" 件をバックグラウンドで再検査します。プロンプトや映像は変更せず、結果は自動更新されます。","已在背景重新質檢選中的 "+count+" 個版本；不會修改提示詞或重做影片，結果會自動重新整理。"));
   });
+  const openQualityAttention=()=>{
+    const runIds=qualityOverrideTargets.map(item=>item.run_id);
+    if(!runIds.length)return;
+    setSelectedQualityRunIds(runIds);
+    setProductionPage("output");
+    setNotice(t(
+      "已定位并选中全部 "+runIds.length+" 个待处理质检版本。请先查看视频与证据，再选择批量重新质检或批量判定合格。",
+      "Located and selected all "+runIds.length+" QC takes needing a decision. Review the videos and evidence, then re-review or accept the selection in a batch.",
+      "判断待ちの品質検査テイク "+runIds.length+" 件をすべて選択しました。映像と証拠を確認し、一括再検査または一括承認を選んでください。",
+      "已定位並選中全部 "+runIds.length+" 個待處理質檢版本。請先查看影片與證據，再選擇批量重新質檢或批量判定合格。",
+    ));
+    window.requestAnimationFrame(()=>window.requestAnimationFrame(()=>{
+      document.querySelector<HTMLElement>(".production-quality-batch")?.scrollIntoView({behavior:"smooth",block:"center"});
+    }));
+  };
   const approveQualityRepair=async(row:ProductionOutputRow,take:ProductionVideoJob)=>run(t("批准修复并重做","Approve repair and rerender","修正と再生成を承認","批准修復並重做"),async()=>{
     if(!production)return;
     if(!window.confirm(t("将把质检要求加入本段提示词，并在后台生成一个新版本。失败版本会保留但不会采用。继续吗？","Add the review repair requirements to this clip and render a new take in the background? The rejected take is kept but not adopted.","品質検査の修正条件をこのクリップに追加し、バックグラウンドで新しいテイクを生成します。不合格テイクは保持されますが採用されません。続けますか？","會把質檢要求加入本段提示詞，並在背景生成新版本。失敗版本會保留但不採用。繼續嗎？")))return;
@@ -2221,7 +2236,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       </div>
       <footer><span>{t("每 5 秒自动更新；刷新或切换页面不会中断任务。","Updates every 5 seconds; refreshing or changing pages does not stop the job.","5秒ごとに更新します。更新やページ移動で処理は停止しません。","每 5 秒自動更新；重新整理或切換頁面不會中斷任務。")}</span><code>{automation.stage_detail||automation.stage}</code></footer>
     </section>}
-    {automation?.status==="needs_attention"&&<div className="production-alert error"><strong>{t("后台任务需要处理：","Background production needs attention: ","バックグラウンドタスクを確認してください：","背景任務需要處理：")}</strong>{automationAttentionText}</div>}
+    {automation?.status==="needs_attention"&&<div className="production-alert error production-attention-alert"><span><strong>{t("后台任务需要处理：","Background production needs attention: ","バックグラウンドタスクを確認してください：","背景任務需要處理：")}</strong>{automationAttentionText}</span>{!!qualityOverrideTargets.length&&<button type="button" onClick={openQualityAttention}><Check size={16}/>{t("查看并全选待处理 "+qualityOverrideTargets.length,"Review & select all "+qualityOverrideTargets.length,"確認して全選択 "+qualityOverrideTargets.length,"查看並全選待處理 "+qualityOverrideTargets.length)}</button>}</div>}
 
     {productionPage==="projects"&&<section className="production-projects card">
       <div className="section-title production-projects-title"><div><span className="eyebrow">EPISODES · CLIPS</span><h2><FolderOpen size={21}/>{t("剧集 / 片段管理","Episodes & clips","エピソード／クリップ管理","劇集／片段管理")}</h2><p>{t("这里管理每集拆分出的制作片段；整部剧的分集编排与最终合片请到“剧本管理”。普通单镜头工程仍在“镜头工作室 → 已保存项目”。","Manage production parts split from episodes here. Use Script management for the whole story and final assembly. Single-scene projects remain in Scene Studio → Saved projects.","各話から分けた制作パートを管理します。全編の話数構成と結合は「脚本管理」で行います。単一シーンはシーンスタジオの保存済みプロジェクトにあります。","這裡管理每集拆分出的製作片段；整部劇的分集編排與最終合片請到「劇本管理」。普通單鏡頭工程仍在「鏡頭工作室 → 已儲存專案」。")}</p></div><button className="primary" onClick={startNewProduction}><Plus size={18}/>{t("新建剧集 / 片段","New episode / clip part","エピソード／クリップを作成","新建劇集／片段")}</button></div>
