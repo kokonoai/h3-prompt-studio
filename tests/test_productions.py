@@ -81,6 +81,64 @@ def _card(name, asset_ids=(), **extra):
             "asset_ids": list(asset_ids), "locked": True, **extra}
 
 
+def test_new_production_starts_with_an_empty_independent_card_library(tmp_path):
+    manager, source, projects, _assets, _store_asset = _rig(tmp_path)
+    source_subject_id = _id()
+    source["subjects"] = [{
+        "id": source_subject_id,
+        "name": "Source-only hero",
+        "description": "This identity belongs only to the linked H3 project.",
+        "asset_ids": [],
+    }]
+    projects[source["id"]] = copy.deepcopy(source)
+
+    production = manager.create({"source_project": source, "brief": ""})
+
+    assert production["source_project_id"] == source["id"]
+    assert production["cards"] == {kind: [] for kind in CARD_KINDS}
+    assert production["overview_asset_ids"] == {
+        "characters": None, "props": None, "environments": None, "wardrobe": None,
+    }
+    assert production["auto_quality_review"] is False
+    assert projects[source["id"]]["subjects"][0]["name"] == "Source-only hero"
+
+
+def test_legacy_auto_quality_setting_migrates_to_unified_manual_review(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": ""})
+    production["auto_merge"] = False
+    production["auto_quality_review"] = True
+    production["automation"].update(merge=False, review=True)
+
+    saved = manager.save(production)
+
+    assert saved["auto_merge"] is True
+    assert saved["auto_quality_review"] is False
+    assert saved["automation"]["merge"] is True
+    assert saved["automation"]["review"] is False
+
+
+def test_automation_clip_isolation_rows_persist_across_reload(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "One clip."})
+    segment_id = _id()
+
+    manager.update_automation(production["id"], {
+        "blocked_segments": [{
+            "segment_id": segment_id, "index": 3, "title": "Ambiguous call",
+            "stage": "prompts", "reason": "Dialogue belongs to two setups.",
+            "blocked_at": 12.5,
+        }]
+    })
+    reloaded = manager.get(production["id"])
+
+    assert reloaded["automation"]["blocked_segments"] == [{
+        "segment_id": segment_id, "index": 3, "title": "Ambiguous call",
+        "stage": "prompts", "reason": "Dialogue belongs to two setups.",
+        "blocked_at": 12.5,
+    }]
+
+
 def _planned_clip(title, characters, timeline, transition="hard_cut"):
     return {
         "title": title,
@@ -1654,6 +1712,37 @@ def test_revised_prompt_releases_old_manually_selected_take(tmp_path):
     assert updated["segments"][0]["video_prompt"] == "current prompt"
 
 
+def test_prompt_quality_failure_is_persisted_without_replacing_prompt_or_take(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "One short scene."})
+    production = manager.apply_plan(production["id"], [{
+        "title": "Beat", "story": "A waits.", "setting": "room", "action": "A waits.",
+        "ending": "A looks up.", "duration": 5, "duration_reason": "one beat",
+        "image_prompt": "A waiting", "dialogue": [], "card_selection": {},
+    }], "local_ai")
+    segment = production["segments"][0]
+    segment["video_prompt"] = "existing safe prompt"
+    segment["selected_video_run_id"] = _id()
+    production = manager.save(production)
+    selected = production["segments"][0]["selected_video_run_id"]
+
+    updated = manager.set_segment_prompt_quality(production["id"], segment["id"], {
+        "status": "failed", "attempts": 2,
+        "issues": [{
+            "severity": "error", "code": "internal_cut", "message": "Contains a cut.",
+            "repair_instruction": "Use one continuous setup.", "repairable": True,
+        }],
+        "repairs": ["First repair did not remove the cut."],
+        "prompt_sha256": "a" * 64, "checked_at": 1.25,
+    })
+    result = updated["segments"][0]
+
+    assert result["prompt_quality"]["status"] == "failed"
+    assert result["prompt_quality"]["attempts"] == 2
+    assert result["video_prompt"] == "existing safe prompt"
+    assert result["selected_video_run_id"] == selected
+
+
 def test_post_render_repair_requires_explicit_calls_and_stops_after_three(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "title": "Quality review"})
@@ -2861,7 +2950,10 @@ def test_shot_preflight_unifies_dialogue_camera_and_internal_cut_failures(tmp_pa
     issues = shot_preflight_for_segment(production, segment)
     codes = {row["code"] for row in issues}
     assert {"multiple_internal_cuts", "impossible_camera_change", "dialogue_overflow"} <= codes
-    assert any(row["code"] == "dense_action" and row["severity"] == "warning" for row in issues)
+    dense = next(row for row in issues if row["code"] == "dense_action")
+    assert dense["severity"] == "warning"
+    assert dense["suggested_split_count"] >= 2
+    assert "Recommended split" in dense["suggestion"]
 
 
 def test_shot_preflight_blocks_a_match_cut_hidden_inside_a_sentence():
@@ -2899,6 +2991,58 @@ def test_shot_preflight_does_not_count_one_repeated_match_cut_as_three_edits():
     assert any(row["code"] == "internal_editorial_cut" and row["severity"] == "error"
                for row in issues)
     assert not any(row["code"] == "multiple_internal_cuts" for row in issues)
+
+
+def test_materialise_auto_splits_one_explicit_silent_match_cut_and_keeps_coverage(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source,
+        "brief": "A paper card rests on Koko's desk.\n\nIts photographed copy fills Besi's laptop.",
+        "language": "en",
+    })
+    timeline = {"visible_start": [], "visible_end": [], "enters": [], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    clip = _planned_clip("The Connection", [], timeline, "hard_cut")
+    clip.update({
+        "story": ("A visual match cut connects the handwritten card. First, the physical card "
+                  "on Koko's desk, then the digital version on Besi's laptop."),
+        "setting": "Two separate rooms.",
+        "action": ("The image moves through a visual match cut from the paper card on Koko's desk "
+                   "to its photographed copy on Besi's laptop."),
+        "ending": "The laptop image holds.",
+        "duration": 5,
+        "continuity_state": _continuity_state("paper card", "laptop image", [], mmh3=False),
+        "shot_contract": _shot_contract("hard_cut", "close_up"),
+    })
+    production = manager.apply_plan(production["id"], [clip], "fallback")
+    original_id = production["segments"][0]["id"]
+    assert any(row["code"] == "internal_editorial_cut"
+               for row in production["segments"][0]["preflight_issues"])
+
+    materialised = manager.materialise(production["id"], original_id)
+    repaired = materialised["production"]
+
+    assert len(repaired["segments"]) == 2
+    assert repaired["automation"]["total"] == 2
+    assert repaired["segments"][0]["id"] == original_id
+    assert repaired["segments"][1]["transition_mode"] == "matched_cut"
+    assert repaired["segments"][0]["duration"] == 4
+    assert repaired["segments"][1]["duration"] == 4
+    assert repaired["coverage_report"]["status"] == "ok"
+    assert all(not [row for row in segment["preflight_issues"]
+                    if row["severity"] == "error"]
+               for segment in repaired["segments"])
+    assert all("match cut" not in segment["action"].casefold()
+               for segment in repaired["segments"])
+    manifest = production_source_manifest(repaired)
+    expected_paragraphs = [row["id"] for chunk in manifest["chunks"]
+                           for row in chunk["paragraphs"]]
+    expected_events = [row["id"] for chunk in manifest["chunks"]
+                       for row in chunk["events"]]
+    assert [ident for segment in repaired["segments"]
+            for ident in segment["source_refs"]["paragraph_ids"]] == expected_paragraphs
+    assert [ident for segment in repaired["segments"]
+            for ident in segment["source_refs"]["event_ids"]] == expected_events
 
 
 def test_shot_preflight_allows_one_plain_cut_to_be_restaged_continuously():

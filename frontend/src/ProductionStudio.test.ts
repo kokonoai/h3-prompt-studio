@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -28,6 +28,14 @@ describe("production text exports",()=>{
 });
 
 describe("episode batch production",()=>{
+  it("localises durable automation details at render time",()=>{
+    expect(productionAutomationDetailText("Building prompt for clip 26","prompts","zh-CN")).toBe("正在生成第 26 段提示词");
+    expect(productionAutomationDetailText("Generating video","videos","ja")).toBe("ComfyUIで映像を生成中");
+    expect(productionAutomationDetailText("Assembling initial cut","merge","zh-TW")).toBe("正在自動合併初版成片");
+    expect(productionAutomationDetailText(undefined,"videos","en")).toBe("Rendering video");
+    expect(productionAutomationDetailText("A future backend status","videos","zh-CN")).toBe("正在生成视频");
+  });
+
   it("keeps timed-out work attached to durable server progress",()=>{
     expect(timeoutRecoveryKind({busy:true},null)).toBe("ai");
     expect(timeoutRecoveryKind({busy:false},{automation:{status:"running"},active_jobs:0} as any)).toBe("automation");
@@ -50,6 +58,21 @@ describe("episode batch production",()=>{
     ]};
     expect(qualityAcceptanceTargets(outputs)).toEqual([
       {segment_id:"clip-1",run_id:"run-1",index:1,title:"Rejected"},
+    ]);
+  });
+
+  it("offers unreviewed and rejected takes for manual batch QC",()=>{
+    const legacy:any={id:"run-1",status:"succeeded",video_url:"/1.mp4",quality_review:{status:"legacy",accepted:true}};
+    const rejected:any={id:"run-2",status:"succeeded",video_url:"/2.mp4",quality_review:{status:"failed",accepted:false}};
+    const passed:any={id:"run-3",status:"succeeded",video_url:"/3.mp4",quality_review:{status:"passed",accepted:true}};
+    const outputs:any={segments:[
+      {segment_id:"clip-1",index:1,title:"Unreviewed",selected:legacy,candidates:[legacy]},
+      {segment_id:"clip-2",index:2,title:"Rejected",selected:null,candidates:[rejected]},
+      {segment_id:"clip-3",index:3,title:"Passed",selected:passed,candidates:[passed]},
+    ]};
+    expect(qualityReviewTargets(outputs)).toEqual([
+      {segment_id:"clip-1",run_id:"run-1",index:1,title:"Unreviewed"},
+      {segment_id:"clip-2",run_id:"run-2",index:2,title:"Rejected"},
     ]);
   });
 
@@ -90,8 +113,8 @@ describe("episode batch production",()=>{
   it("explains durable progress without confusing adopted clips with the current review",()=>{
     const automation:any={status:"running",stage:"quality",current_index:0,completed:1,total:30,merge:true};
     const segments:any[]=[
-      {status:"ready",video_prompt:"prompt one",stale_reasons:[]},
-      {status:"ready",video_prompt:"prompt two",stale_reasons:[]},
+      {status:"ready",video_prompt:"prompt one",stale_reasons:[],prompt_quality:{status:"passed"}},
+      {status:"ready",video_prompt:"prompt two",stale_reasons:[],prompt_quality:{status:"passed"}},
     ];
     const outputs:any={segment_count:30,ready_count:1,segments:[
       {index:1,candidates:[{status:"succeeded",video_url:"/one",quality_review:{status:"passed",accepted:true}}]},
@@ -99,6 +122,48 @@ describe("episode batch production",()=>{
     ]};
     expect(productionAutomationSnapshot(automation,segments,outputs)).toMatchObject({
       stage:"quality",currentIndex:2,total:30,promptReady:2,rendered:2,accepted:1,pendingReview:1,rejected:0,
+    });
+  });
+
+  it("does not count an old or rejected prompt as pre-render ready",()=>{
+    const automation:any={status:"running",stage:"prompts",current_index:1,completed:0,total:3,merge:false};
+    const segments:any[]=[
+      {status:"ready",video_prompt:"reviewed",stale_reasons:[],prompt_quality:{status:"passed"}},
+      {status:"ready",video_prompt:"legacy",stale_reasons:[]},
+      {status:"ready",video_prompt:"rejected",stale_reasons:[],prompt_quality:{status:"failed"}},
+    ];
+    expect(productionAutomationSnapshot(automation,segments,{segment_count:3,ready_count:0,segments:[]} as any)?.promptReady).toBe(1);
+  });
+
+  it("counts an adopted current take as proof that its prompt stage completed",()=>{
+    const automation:any={status:"running",stage:"prompts",current_index:12,completed:11,total:27,merge:true};
+    const segments:any[]=[
+      {id:"clip-1",status:"ready",video_prompt:"legacy prompt",stale_reasons:[],prompt_updated_at:100},
+      {id:"clip-2",status:"ready",video_prompt:"",stale_reasons:[]},
+    ];
+    const outputs:any={segment_count:27,ready_count:1,segments:[
+      {segment_id:"clip-1",selected:{id:"run-1",created_at:101},candidates:[{status:"succeeded",video_url:"/one"}]},
+    ]};
+
+    const snapshot=productionAutomationSnapshot(automation,segments,outputs);
+
+    expect(snapshot?.promptReady).toBe(1);
+    expect(snapshot?.percent).toBeGreaterThan(3);
+  });
+
+  it("keeps manual post-render QC outside the active generation percentage",()=>{
+    const automation:any={status:"running",stage:"videos",current_index:2,completed:0,total:2,merge:false,review:false};
+    const segments:any[]=[
+      {id:"clip-1",status:"ready",video_prompt:"one",stale_reasons:[],prompt_quality:{status:"passed"}},
+      {id:"clip-2",status:"ready",video_prompt:"two",stale_reasons:[],prompt_quality:{status:"passed"}},
+    ];
+    const outputs:any={segment_count:2,ready_count:0,manual_quality_pending_count:1,segments:[
+      {segment_id:"clip-1",candidates:[{status:"succeeded",video_url:"/one",quality_review:{status:"unreviewed",accepted:true}}]},
+      {segment_id:"clip-2",candidates:[]},
+    ]};
+
+    expect(productionAutomationSnapshot(automation,segments,outputs)).toMatchObject({
+      promptReady:2,rendered:1,manualPending:1,reviewEnabled:false,percent:75,
     });
   });
 });

@@ -143,6 +143,11 @@ def test_quality_context_separates_remote_panels_from_physical_cast(server):
         'cast_timeline': {'visible_start': ['Koko', 'Besi'], 'visible_end': ['Koko', 'Besi'],
                           'enters': [], 'exits': [], 'offscreen': [], 'mentioned_only': []},
         'continuity_state': {},
+        'preflight_issues': [{
+            'severity': 'warning', 'code': 'dense_cast',
+            'message': 'Review identity stability carefully.',
+            'suggestion': 'Prefer two simpler setups.',
+        }],
     }
 
     context = module._quality_visual_context(production, segment, [])
@@ -153,6 +158,10 @@ def test_quality_context_separates_remote_panels_from_physical_cast(server):
     assert context['must_not_be_physical'] == ['Koko', 'Besi']
     assert 'REMOTE-CALL PANEL GEOMETRY LOCK' in context['device_geometry_contract']
     assert [row['name'] for row in context['characters']] == ['Koko', 'Besi']
+    assert context['complexity_review_focus'] == [{
+        'code': 'dense_cast', 'message': 'Review identity stability carefully.',
+        'suggestion': 'Prefer two simpler setups.',
+    }]
 
 
 def test_quality_boundary_cast_repairs_entrance_conflicts_and_closeup_crops(server):
@@ -428,6 +437,37 @@ def test_rejected_take_becomes_adoptable_only_after_human_override(server, monke
     assert overridden['segments'][0]['selected']['id'] == run_id
 
 
+def test_initial_film_signature_stays_visible_while_manual_qc_is_running(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(4))
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Initial cut',
+            'project_id': project_id, 'status': 'ready',
+        }],
+    }
+    take = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+            'status': 'succeeded', 'video_url': '/initial.mp4', 'created_at': 300.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, '_production_quality_descriptor', lambda *_args: {
+        'status': 'reviewing', 'required': True, 'accepted': True,
+        'summary': 'Manual QC in progress.', 'issues': [],
+    })
+
+    overview = module.production_outputs(production_id, [take])
+
+    assert overview['all_ready']
+    assert not overview['quality_ready']
+    assert overview['quality_pending_count'] == 1
+    assert overview['signature']
+
+
 def test_batch_quality_acceptance_validates_then_releases_once(server, monkeypatch):
     module, client, _fake = server
     production_id = str(uuid.uuid4())
@@ -505,7 +545,36 @@ def test_batch_quality_acceptance_validates_then_releases_once(server, monkeypat
     assert all(review[3]['issues'][0]['code'] == 'duplicate_character' for review in saved_reviews)
     assert len(saved_productions) == 1
     assert len(automation_starts) == 1
+    assert automation_starts[0][1]['merge'] is True
+    assert automation_starts[0][1]['review'] is False
     assert automation_starts[0][1]['requested_by'] == 'human_quality_override_batch'
+
+
+def test_episode_automation_ignores_legacy_review_and_no_merge_switches(server, monkeypatch):
+    module, client, _fake = server
+    production_id = str(uuid.uuid4())
+    starts = []
+
+    class Productions:
+        def get(self, ident):
+            assert ident == production_id
+            return {'id': ident, 'segments': []}
+
+    class Automation:
+        def start(self, ident, **options):
+            starts.append((ident, options))
+            return {'status': 'running', 'merge': options['merge'], 'review': options['review']}
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, 'production_automation_manager', lambda: Automation())
+    monkeypatch.setattr(module, 'production_outputs', lambda ident: {'production_id': ident})
+
+    response = client.post(
+        f'/api/productions/{production_id}/automation/start', headers=auth(module),
+        json={'merge': False, 'review': True})
+
+    assert response.status_code == 200
+    assert starts == [(production_id, {'merge': True, 'review': False})]
 
 
 def test_concat_applies_one_final_loudness_master(server, monkeypatch, tmp_path):
@@ -570,6 +639,11 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     monkeypatch.setattr(module, 'production_outputs', lambda _ident: {'segments': [{'segment_id': previous_id, 'selected': source}]})
     monkeypatch.setattr(module, 'video_manager', lambda: Videos())
     monkeypatch.setattr(compiler, 'compile_project', lambda _project: {'valid': True, 'issues': [], 'prompt': 'test prompt'})
+    from backend import prompt_quality
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt', lambda *_args, **_kwargs: {
+        'status': 'passed', 'attempts': 0, 'issues': [], 'repairs': [],
+        'prompt_sha256': '', 'checked_at': 0,
+    })
     module.production_segment_video(production['id'], current_id, {'new_seed': False, 'request_id': str(uuid.uuid4())})
     render, parent = submitted[-1]
     assert parent == source['id']
@@ -593,6 +667,215 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     module.production_segment_video(production['id'], current_id, {'new_seed': False})
     render, parent = submitted[-1]
     assert parent is None and 'continuation_source' not in render
+
+
+def test_production_prompt_repairs_pre_render_quality_before_saving(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+    segment = {
+        'id': segment_id, 'index': 1, 'duration': 10, 'status': 'ready',
+        'prompt_direction': '',
+    }
+    production = {
+        'id': production_id, 'language': 'en', 'prompt_version': 'continuity_director',
+        'automation': {}, 'segments': [segment],
+    }
+    project = new_project()
+    prompts, saved = [], []
+
+    class Manager:
+        def list(self):
+            return []
+
+        def assert_active(self, _ident):
+            return copy.deepcopy(production)
+
+        def materialise(self, _ident, _segment_id):
+            return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
+
+        def set_segment_prompt(self, *args):
+            saved.append(args)
+            return copy.deepcopy(production)
+
+    class Planner:
+        def propose_plan(self, _model, _project, instructions, _persona):
+            prompts.append(instructions)
+            return {}
+
+    failed = {
+        'status': 'failed', 'attempts': 0,
+        'issues': [{
+            'severity': 'error', 'code': 'internal_cut',
+            'message': 'The generated prompt contains one internal cut.',
+            'repair_instruction': 'Replace the cut with one continuous camera move.',
+            'repairable': True,
+        }],
+        'repairs': [], 'prompt_sha256': '', 'checked_at': 0,
+    }
+    passed = {
+        'status': 'passed', 'attempts': 0, 'issues': [], 'repairs': [],
+        'prompt_sha256': '', 'checked_at': 0,
+    }
+    reviews = iter((failed, passed))
+    from backend import prompt_quality
+    monkeypatch.setattr(module, 'production_manager', lambda: Manager())
+    monkeypatch.setattr(module, 'client', lambda: Planner())
+    monkeypatch.setattr(module.RESOURCES, 'run_ai', lambda model, operation: operation(model))
+    monkeypatch.setitem(module.SETTINGS, 'ai_memory_mode', 'staged')
+    monkeypatch.setattr(module, 'save_project', lambda candidate: None)
+    monkeypatch.setattr(module, 'merge_plan', lambda baseline, _proposal: copy.deepcopy(baseline))
+    monkeypatch.setattr(module, '_production_prompt_instructions', lambda *_args: 'Build one continuous shot.')
+    monkeypatch.setattr(module, '_localise_candidate_for_h3', lambda _lm, _model, candidate: (
+        candidate, {'valid': True, 'issues': [], 'prompt': 'quality checked prompt'}))
+    monkeypatch.setattr(prompt_quality, 'review_generated_plan', lambda *_args: copy.deepcopy(next(reviews)))
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt', lambda *_args, **kwargs: {
+        **copy.deepcopy(passed), 'attempts': kwargs.get('attempts', 0),
+    })
+
+    result = module.production_segment_prompt(
+        production_id, segment_id, {'use_ai': True, '_automation': True})
+
+    assert len(prompts) == 2
+    assert 'PRE-RENDER PROMPT QUALITY REPAIR' in prompts[1]
+    assert 'Replace the cut with one continuous camera move.' in prompts[1]
+    assert result['prompt_quality']['status'] == 'passed'
+    assert result['prompt_quality']['attempts'] == 1
+    assert result['prompt_quality']['repairs'] == [
+        'The generated prompt contains one internal cut.']
+    assert saved[-1][-1] == result['prompt_quality']
+
+
+def test_production_prompt_repairs_duplicate_speech_without_another_llm_call(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+    segment = {'id': segment_id, 'index': 13, 'duration': 5, 'status': 'ready',
+               'prompt_direction': ''}
+    production = {'id': production_id, 'language': 'en',
+                  'prompt_version': 'continuity_director', 'automation': {},
+                  'segments': [segment]}
+    project = new_project()
+    prompts, saved = [], []
+
+    class Manager:
+        def list(self):
+            return []
+        def assert_active(self, _ident):
+            return copy.deepcopy(production)
+        def materialise(self, _ident, _segment_id):
+            return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
+        def set_segment_prompt(self, *args):
+            saved.append(args)
+            return copy.deepcopy(production)
+
+    class Planner:
+        def propose_plan(self, _model, _project, instructions, _persona):
+            prompts.append(instructions)
+            return {}
+
+    failed = {'status': 'failed', 'attempts': 0, 'issues': [{
+        'severity': 'error', 'code': 'unstructured_speech_event',
+        'message': 'Non-dialogue direction repeats a phone line.',
+        'repair_instruction': 'Bind it to structured dialogue.', 'repairable': True,
+    }], 'repairs': [], 'prompt_sha256': '', 'checked_at': 0}
+    passed = {'status': 'passed', 'attempts': 0,
+              'issues': [{'severity': 'warning', 'code': 'dense_generated_action',
+                          'message': 'Action dense.', 'repair_instruction': 'Review.',
+                          'repairable': True}],
+              'repairs': [], 'prompt_sha256': '', 'checked_at': 0}
+    reviews = iter((copy.deepcopy(failed), copy.deepcopy(passed)))
+    from backend import prompt_quality
+    monkeypatch.setattr(module, 'production_manager', lambda: Manager())
+    monkeypatch.setattr(module, 'client', lambda: Planner())
+    monkeypatch.setattr(module.RESOURCES, 'run_ai', lambda model, operation: operation(model))
+    monkeypatch.setitem(module.SETTINGS, 'ai_memory_mode', 'staged')
+    monkeypatch.setattr(module, 'save_project', lambda candidate: None)
+    monkeypatch.setattr(module, 'merge_plan', lambda baseline, _proposal: copy.deepcopy(baseline))
+    monkeypatch.setattr(module, '_production_prompt_instructions', lambda *_args: 'Build one shot.')
+    monkeypatch.setattr(module, '_localise_candidate_for_h3', lambda _lm, _model, candidate: (
+        candidate, {'valid': True, 'issues': [], 'prompt': 'quality checked prompt'}))
+    monkeypatch.setattr(prompt_quality, 'review_generated_plan',
+                        lambda *_args: copy.deepcopy(next(reviews)))
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt', lambda *_args, **kwargs: {
+        'status': 'passed', 'attempts': kwargs.get('attempts', 0), 'issues': [],
+        'repairs': [], 'prompt_sha256': '', 'checked_at': 0,
+    })
+
+    result = module.production_segment_prompt(
+        production_id, segment_id, {'use_ai': True, '_automation': True})
+
+    assert len(prompts) == 1
+    assert result['prompt_quality']['status'] == 'passed'
+    assert result['prompt_quality']['attempts'] == 1
+    assert saved[-1][-1] == result['prompt_quality']
+
+
+def test_production_prompt_falls_back_to_locked_scene_after_two_bad_repairs(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+    segment = {'id': segment_id, 'index': 1, 'duration': 10, 'status': 'ready',
+               'prompt_direction': ''}
+    production = {'id': production_id, 'language': 'en',
+                  'prompt_version': 'continuity_director', 'automation': {},
+                  'segments': [segment]}
+    project = new_project()
+    project['duration'] = 10
+    project['shots'][0]['duration'] = 10
+    prompts, saved = [], []
+
+    class Manager:
+        def list(self):
+            return []
+        def assert_active(self, _ident):
+            return copy.deepcopy(production)
+        def materialise(self, _ident, _segment_id):
+            return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
+        def set_segment_prompt(self, *args):
+            saved.append(args)
+            return copy.deepcopy(production)
+
+    class Planner:
+        def propose_plan(self, _model, _project, instructions, _persona):
+            prompts.append(instructions)
+            return {}
+
+    failed = {
+        'status': 'failed', 'attempts': 0,
+        'issues': [{'severity': 'error', 'code': 'multiple_camera_views',
+                    'message': 'The generated prompt names two camera views.',
+                    'repair_instruction': 'Use one camera setup.', 'repairable': True}],
+        'repairs': [], 'prompt_sha256': '', 'checked_at': 0,
+    }
+    passed = {'status': 'passed', 'attempts': 0,
+              'issues': [{'severity': 'warning', 'code': 'dense_generated_action',
+                          'message': 'The base scene is action dense.',
+                          'repair_instruction': 'Review the result.', 'repairable': True}],
+              'repairs': [], 'prompt_sha256': '', 'checked_at': 0}
+    reviews = iter((copy.deepcopy(failed), copy.deepcopy(failed), copy.deepcopy(failed),
+                    copy.deepcopy(passed)))
+    from backend import prompt_quality
+    monkeypatch.setattr(module, 'production_manager', lambda: Manager())
+    monkeypatch.setattr(module, 'client', lambda: Planner())
+    monkeypatch.setattr(module.RESOURCES, 'run_ai', lambda model, operation: operation(model))
+    monkeypatch.setitem(module.SETTINGS, 'ai_memory_mode', 'staged')
+    monkeypatch.setattr(module, 'save_project', lambda candidate: None)
+    monkeypatch.setattr(module, 'merge_plan', lambda baseline, _proposal: copy.deepcopy(baseline))
+    monkeypatch.setattr(module, '_production_prompt_instructions', lambda *_args: 'Build one shot.')
+    monkeypatch.setattr(module, '_localise_candidate_for_h3', lambda _lm, _model, candidate: (
+        candidate, {'valid': True, 'issues': [], 'prompt': 'quality checked prompt'}))
+    monkeypatch.setattr(prompt_quality, 'review_generated_plan',
+                        lambda *_args: copy.deepcopy(next(reviews)))
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt', lambda *_args, **kwargs: {
+        'status': 'passed', 'attempts': kwargs.get('attempts', 0), 'issues': [],
+        'repairs': [], 'prompt_sha256': '', 'checked_at': 0,
+    })
+
+    result = module.production_segment_prompt(
+        production_id, segment_id, {'use_ai': True, '_automation': True})
+
+    assert len(prompts) == 3
+    assert result['prompt_quality']['status'] == 'passed'
+    assert result['prompt_quality']['attempts'] == 2
+    assert saved[-1][-1] == result['prompt_quality']
 
 
 def test_upscale_handoff_uses_resolved_scene_and_requires_session(server, monkeypatch, tmp_path):

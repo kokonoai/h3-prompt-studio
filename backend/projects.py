@@ -365,7 +365,11 @@ def merge_plan(project, proposal):
     for field in ('soundscape', 'music'):
         if isinstance(proposal.get(field), str):
             result[field] = proposal[field][:8000]
-    if isinstance(proposal.get('style'), dict):
+    # A directed production clip already carries the production's locked
+    # visual bible.  Local planning may improve staging, but must never switch
+    # genre, lighting or palette.  Undirected Studio planning can still
+    # propose style changes as before.
+    if not preserve_structure and isinstance(proposal.get('style'), dict):
         for key in result['style']:
             if isinstance(proposal['style'].get(key), str):
                 result['style'][key] = proposal['style'][key][:3000]

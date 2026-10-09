@@ -31,8 +31,15 @@ _PROTECTED = re.compile(
     r"(?:subject_definitions:|summary:|retention_analysis:|detailed_description:|"
     r"integrated_multimodal_description:|asset_roles:|visual_style_and_continuity:|"
     r"dialogue_and_audio:|stability_constraints:|overall_soundscape:|non_diegetic_music:|"
+    r"production_render_override:|"
     r"<Picture\s+\d+>|<Video\s+\d+>|<Audio\s+\d+>|<Subject\s+\d+>|"
     r"\[Shot\s+\d+\]|\[Beat\s+\d+\]|@[A-Za-z][A-Za-z0-9-]*)"
+)
+_FINAL_AUDIO_SUFFIX = re.compile(
+    r"FINAL AUDIO OVERRIDE — HIGHEST PRIORITY:[\s\S]*\Z"
+)
+_LOCKED_LITERAL = re.compile(
+    r"production_render_override:|FINAL AUDIO OVERRIDE — HIGHEST PRIORITY:"
 )
 _CJK_DIRECTIONS = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
 _KANJI = re.compile(r"[\u3400-\u9fff]")
@@ -224,7 +231,16 @@ def localise_h3_prompt(client, model: str, prompt: str, target_language: str, *,
             "target_language": target_language,
             "prompt": prompt,
         }
-    masked, verbatim = _mask_verbatim(prompt, verbatim_blocks)
+    # Compiler-owned safety syntax is not an authoring surface.  A mixed-language
+    # production continuity block may legitimately require translation, but the
+    # final audio boundary is already concise English and must survive byte for
+    # byte.  Protect it automatically so a small local model cannot compress it
+    # away while translating an earlier CJK source-coverage paragraph.
+    protected_verbatim = list(verbatim_blocks)
+    final_audio = _FINAL_AUDIO_SUFFIX.search(prompt)
+    if final_audio and final_audio.group(0) not in protected_verbatim:
+        protected_verbatim.append(final_audio.group(0))
+    masked, verbatim = _mask_verbatim(prompt, protected_verbatim)
     masked, dialogue = _mask_dialogue(masked)
     masked, protected = _mask_protected(masked)
     template, direction_segments = _direction_template(masked)
@@ -254,7 +270,10 @@ def localise_h3_prompt(client, model: str, prompt: str, target_language: str, *,
         raise ValueError("The language pass returned incomplete or duplicate directing segments.")
     directions_by_index = {item["index"]: item["text"] for item in direction_segments}
     for item in translated_directions:
-        directions_by_index[untranslated_indexes[item["index"]]] = item["text"].strip()
+        translated_text = item["text"].strip()
+        if _LOCKED_LITERAL.search(translated_text):
+            raise ValueError("The language pass inserted compiler-owned H3 safety syntax into directing text.")
+        directions_by_index[untranslated_indexes[item["index"]]] = translated_text
     for index in untranslated_indexes:
         text = directions_by_index[index]
         if not text or _RESERVED_PLACEHOLDER.search(text) or _DIALOGUE.search(text):
@@ -283,7 +302,8 @@ def localise_h3_prompt(client, model: str, prompt: str, target_language: str, *,
             raise ValueError("The language correction returned incomplete or duplicate directing segments.")
         for item in correction:
             text = item["text"].strip()
-            if not text or _RESERVED_PLACEHOLDER.search(text) or _DIALOGUE.search(text):
+            if (not text or _RESERVED_PLACEHOLDER.search(text) or _DIALOGUE.search(text)
+                    or _LOCKED_LITERAL.search(text)):
                 raise ValueError("The language correction returned invalid directing text.")
             directions_by_index[failed_indexes[item["index"]]] = text
     english = _SEGMENT_PLACEHOLDER.sub(lambda match: directions_by_index[int(match.group(1))], template)

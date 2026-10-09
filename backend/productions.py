@@ -2975,17 +2975,58 @@ def normalise_automation(value):
     """Validate the durable episode-run cursor without trusting browser state."""
     if not isinstance(value, dict):
         value = {}
+    legacy_merge = value.get("merge", True)
+    legacy_review = value.get("review", False)
+    if type(legacy_merge) is not bool:
+        raise ValueError("Automation merge must be true or false.")
+    if type(legacy_review) is not bool:
+        raise ValueError("Automation post-render review must be true or false.")
     status = _text(value.get("status"), "automation status", 32, "idle") or "idle"
     stage = _text(value.get("stage"), "automation stage", 32, "idle") or "idle"
     if status not in AUTOMATION_STATUSES:
         status = "idle"
     if stage not in AUTOMATION_STAGES:
         stage = "idle"
+    blocked_segments = []
+    for row in value.get("blocked_segments", []) if isinstance(value.get("blocked_segments"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        segment_id = row.get("segment_id") or ""
+        try:
+            safe_id(segment_id)
+        except (TypeError, ValueError):
+            continue
+        blocked_stage = _text(row.get("stage"), "blocked automation stage", 32, "prompts") or "prompts"
+        if blocked_stage not in ("prompts", "videos"):
+            blocked_stage = "prompts"
+        index = row.get("index", 0)
+        if type(index) is not int or index < 0 or index > MAX_SEGMENTS:
+            index = 0
+        blocked_at = row.get("blocked_at")
+        if blocked_at is not None and (type(blocked_at) not in (int, float) or
+                                       not math.isfinite(blocked_at) or blocked_at < 0):
+            blocked_at = None
+        blocked_segments.append({
+            "segment_id": segment_id,
+            "index": index,
+            "title": _text(row.get("title"), "blocked clip title", 120),
+            "stage": blocked_stage,
+            "reason": _text(row.get("reason"), "blocked clip reason", 1600),
+            "blocked_at": round(float(blocked_at), 3) if blocked_at is not None else None,
+        })
+    # One durable row per clip. Preserve the most recent row when a defensive
+    # retry reports the same clip twice.
+    blocked_segments = list({row["segment_id"]: row for row in blocked_segments}.values())[:MAX_SEGMENTS]
     result = {
         "status": status,
         "stage": stage,
         "stage_detail": _text(value.get("stage_detail"), "automation detail", 300),
-        "merge": value.get("merge", True),
+        # The durable episode worker always assembles an initial cut and never
+        # starts post-render visual QC by itself.  Keep both fields in saved
+        # data for backward compatibility while migrating older active runs to
+        # the same prompt-check -> render -> initial-cut workflow.
+        "merge": True,
+        "review": False,
         "requested_by": _text(value.get("requested_by"), "automation requester", 32, "user") or "user",
         "current_segment_id": value.get("current_segment_id") or None,
         "current_index": value.get("current_index", 0),
@@ -2995,12 +3036,11 @@ def normalise_automation(value):
         "run_id": value.get("run_id") or None,
         "request_id": value.get("request_id") or None,
         "last_error": _text(value.get("last_error"), "automation error", 2000),
+        "blocked_segments": blocked_segments,
         "started_at": value.get("started_at"),
         "updated_at": value.get("updated_at"),
         "finished_at": value.get("finished_at"),
     }
-    if type(result["merge"]) is not bool:
-        raise ValueError("Automation merge must be true or false.")
     for key in ("current_index", "completed", "total", "attempt"):
         if type(result[key]) is not int or result[key] < 0 or result[key] > 10000:
             raise ValueError(f"Automation {key} must be a non-negative integer.")
@@ -3013,6 +3053,44 @@ def normalise_automation(value):
             raise ValueError(f"Automation {key} must be a non-negative timestamp.")
         result[key] = round(float(raw), 3) if raw is not None else None
     return result
+
+
+def normalise_prompt_quality(value):
+    """Keep one bounded, auditable pre-render prompt review on the clip."""
+    if not isinstance(value, dict):
+        return {"status": "unreviewed", "attempts": 0, "issues": [], "repairs": [],
+                "prompt_sha256": "", "checked_at": None}
+    status = value.get("status") if value.get("status") in ("unreviewed", "passed", "failed") else "unreviewed"
+    attempts = value.get("attempts", 0)
+    if type(attempts) is not int or not 0 <= attempts <= 2:
+        attempts = 0
+    issues = []
+    for row in value.get("issues", []) if isinstance(value.get("issues"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        severity = row.get("severity") if row.get("severity") in ("error", "warning") else "error"
+        issues.append({
+            "severity": severity,
+            "code": _text(row.get("code"), "prompt quality issue code", 80, "prompt_quality") or "prompt_quality",
+            "message": _text(row.get("message"), "prompt quality issue", 600),
+            "repair_instruction": _text(row.get("repair_instruction"), "prompt repair instruction", 600),
+            "repairable": bool(row.get("repairable", False)),
+        })
+    repairs = value.get("repairs", []) if isinstance(value.get("repairs"), list) else []
+    prompt_hash = _text(value.get("prompt_sha256"), "prompt quality hash", 64)
+    if prompt_hash and not re.fullmatch(r"[a-f0-9]{64}", prompt_hash):
+        prompt_hash = ""
+    checked_at = value.get("checked_at")
+    if checked_at is not None and (type(checked_at) not in (int, float) or
+                                   not math.isfinite(checked_at) or checked_at < 0):
+        checked_at = None
+    return {
+        "status": status, "attempts": attempts, "issues": issues[:16],
+        "repairs": [_text(item, "prompt repair history", 600) for item in repairs[:16]
+                    if isinstance(item, str) and item.strip()],
+        "prompt_sha256": prompt_hash,
+        "checked_at": round(float(checked_at), 3) if checked_at is not None else None,
+    }
 
 
 def normalise_segment(value, index, previous=None):
@@ -3080,6 +3158,8 @@ def normalise_segment(value, index, previous=None):
                                      "video prompt source", 30),
         "prompt_seconds": _seconds(value.get("prompt_seconds", prior.get("prompt_seconds"))),
         "prompt_updated_at": value.get("prompt_updated_at", prior.get("prompt_updated_at")),
+        "prompt_quality": normalise_prompt_quality(
+            value.get("prompt_quality", prior.get("prompt_quality"))),
         "prepare_seconds": _seconds(value.get("prepare_seconds", prior.get("prepare_seconds"))),
         "workflow_profile_id": _text(value.get("workflow_profile_id", prior.get("workflow_profile_id")),
                                      "video workflow profile", 40, "builtin") or "builtin",
@@ -3168,8 +3248,13 @@ def normalise_segment(value, index, previous=None):
     return result
 
 
-def _contract_issue(severity, code, message):
-    return {"severity": severity, "code": code, "message": str(message)[:600]}
+def _contract_issue(severity, code, message, **details):
+    result = {"severity": severity, "code": code, "message": str(message)[:600]}
+    if details.get("suggestion"):
+        result["suggestion"] = str(details["suggestion"])[:600]
+    if type(details.get("suggested_split_count")) is int:
+        result["suggested_split_count"] = max(2, min(8, details["suggested_split_count"]))
+    return result
 
 
 def _flatten_manifest(manifest, kind):
@@ -3562,6 +3647,78 @@ def _hard_editorial_cut_count(text):
         text, re.IGNORECASE | re.MULTILINE))
 
 
+def _clean_editorial_split_side(value):
+    """Return one standalone side of a deterministic two-setup split."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ,;:-")
+    if not text:
+        return ""
+    if text[-1] not in ".!?。！？":
+        text += "."
+    return text
+
+
+def _split_editorial_text(value):
+    """Split explicit two-sided match/scene-change prose without an LLM.
+
+    This intentionally handles only authored forms whose two sides are
+    explicit in the text.  Ambiguous cuts remain blocking rather than losing
+    story information.  The returned strings never retain the editorial cue,
+    because each result is itself one uninterrupted H3 render.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text or not _hard_editorial_cut_count(text):
+        return None
+
+    # Story summaries commonly state the visual rhyme first, followed by a
+    # concrete "First ..., then ..." description. Prefer those concrete sides
+    # over the meta sentence that names the match cut.
+    match = re.search(
+        r"\bfirst\s*[,：:]\s*(?P<left>.+?)(?:,\s*|\s+)then\s+(?P<right>.+)$",
+        text, re.IGNORECASE)
+    if not match:
+        match = re.search(
+            r"(?:首先|先)\s*(?P<left>.+?)(?:然后|然後|随后|隨後|再)\s*(?P<right>.+)$",
+            text)
+    if match:
+        left = _clean_editorial_split_side(match.group("left"))
+        right = _clean_editorial_split_side(match.group("right"))
+        if left and right and not _hard_editorial_cut_count(left + "\n" + right):
+            return left, right
+
+    # "match-cuts from X to Y" and equivalent forms expose both setups
+    # directly. A leading camera/meta phrase is deliberately discarded.
+    match = re.search(
+        r"(?:through\s+(?:a\s+)?(?:visual\s+)?match\s+cut\s+|"
+        r"(?:match[- ]cuts?|smash\s+cuts?|jump\s+cuts?|hard\s+cuts?)\s+)"
+        r"from\s+(?P<left>.+?)\s+to\s+(?P<right>.+)$",
+        text, re.IGNORECASE)
+    if match:
+        left = _clean_editorial_split_side(match.group("left"))
+        right = _clean_editorial_split_side(match.group("right"))
+        if left and right and not _hard_editorial_cut_count(left + "\n" + right):
+            return left, right
+
+    # The most frequent action form is a complete first sentence followed by
+    # "It match-cuts to ...". Keep the completed first setup and only remove
+    # the boundary words from the second.
+    match = re.search(
+        r"(?P<left>.+?)(?:\s+(?:it|the\s+(?:image|shot|scene))\s+)?"
+        r"(?:match[- ]cuts?|smash\s+cuts?|jump\s+cuts?|hard\s+cuts?|transitions?)\s+to\s+"
+        r"(?P<right>.+)$",
+        text, re.IGNORECASE)
+    if not match:
+        match = re.search(
+            r"(?P<left>.+?)(?:匹配剪辑|匹配剪輯|镜头切换|鏡頭切換|場面転換|マッチカット)"
+            r"(?:到|至|为|為|成)?\s*(?P<right>.+)$",
+            text)
+    if match:
+        left = _clean_editorial_split_side(match.group("left"))
+        right = _clean_editorial_split_side(match.group("right"))
+        if left and right and not _hard_editorial_cut_count(left + "\n" + right):
+            return left, right
+    return None
+
+
 def _camera_view_count(text):
     patterns = (
         r"\b(?:extreme\s+wide|wide\s+shot|full\s+shot|medium\s+shot|medium\s+close|"
@@ -3588,8 +3745,8 @@ def shot_preflight_for_segment(production, segment):
     """Return one compact, actionable pre-prompt quality report.
 
     Semantic facts come from the authored contracts; cheap text checks only
-    flag render complexity. Warnings remain advisory. Errors are reserved for
-    contradictions that cannot be rendered without changing the screenplay.
+    flag render complexity. Dense action/cast stays advisory so an episode can
+    continue, while errors remain hard contradictions.
     """
     issues = []
     text = _preflight_text(segment)
@@ -3610,10 +3767,15 @@ def shot_preflight_for_segment(production, segment):
     action_beats = _action_beat_count("\n".join(
         str(segment.get(key) or "") for key in ("action", "ending")))
 
-    if action_beats > max(4, math.ceil(duration / 2)):
+    action_capacity = max(4, math.ceil(duration / 2))
+    if action_beats > action_capacity:
+        split_count = max(2, math.ceil(action_beats / action_capacity))
         issues.append(_contract_issue(
             "warning", "dense_action",
-            f"Clip {segment.get('index')} packs about {action_beats} action beats into {duration}s; simplify or split it."))
+            f"Clip {segment.get('index')} packs about {action_beats} action beats into {duration}s; generation may continue, but review this take carefully.",
+            suggestion=(f"Recommended split: {split_count} consecutive clips, preserving source order and dialogue; "
+                        "place dependent actions in sequence and overlap only compatible reactions."),
+            suggested_split_count=split_count))
     if cut_count > 1:
         issues.append(_contract_issue(
             "error", "multiple_internal_cuts",
@@ -3679,9 +3841,13 @@ def shot_preflight_for_segment(production, segment):
             "error", "cast_capacity",
             f"Clip {segment.get('index')} asks for {visible_count} physical characters, beyond the nine-reference H3 budget."))
     elif visible_count > 4:
+        split_count = max(2, math.ceil(visible_count / 4))
         issues.append(_contract_issue(
             "warning", "dense_cast",
-            f"Clip {segment.get('index')} has {visible_count} visible characters; prefer an overview reference and restrained staging."))
+            f"Clip {segment.get('index')} has {visible_count} physical characters; generation may continue, but review identity stability carefully.",
+            suggestion=(f"Recommended split: {split_count} filmable setups with no more than four physical characters per render; "
+                        "use a brief master shot only when the full group must be established."),
+            suggested_split_count=split_count))
 
     # Coverage and adjacent-state failures belong to the same user-facing
     # preflight instead of surfacing later as unrelated generation errors.
@@ -3805,15 +3971,23 @@ class ProductionManager:
         for voice in result["cards"]["voices"]:
             voice["language"] = result["language"]
         result["overview_asset_ids"] = normalise_overview_assets(result.get("overview_asset_ids"))
-        result["auto_merge"] = result.get("auto_merge", True)
-        if type(result["auto_merge"]) is not bool:
+        legacy_auto_merge = result.get("auto_merge", True)
+        if type(legacy_auto_merge) is not bool:
             raise ValueError("Automatic film assembly must be true or false.")
+        # Initial assembly is now part of the production contract rather than
+        # a per-project option.  This also upgrades projects that previously
+        # disabled it, so a closed browser cannot leave a finished episode
+        # without its first cut.
+        result["auto_merge"] = True
         result["auto_continue_previous"] = result.get("auto_continue_previous", False)
         if type(result["auto_continue_previous"]) is not bool:
             raise ValueError("Automatic continuation from the preceding clip must be true or false.")
-        result["auto_quality_review"] = result.get("auto_quality_review", True)
-        if type(result["auto_quality_review"]) is not bool:
+        legacy_auto_quality_review = result.get("auto_quality_review", False)
+        if type(legacy_auto_quality_review) is not bool:
             raise ValueError("Automatic post-render quality review must be true or false.")
+        # Retain the field for backward-compatible files/API clients, but old
+        # projects that enabled it migrate to the unified manual-QC workflow.
+        result["auto_quality_review"] = False
         result["auto_keyframes_enabled"] = result.get("auto_keyframes_enabled", False)
         if type(result["auto_keyframes_enabled"]) is not bool:
             raise ValueError("Automatic supplemental keyframes must be true or false.")
@@ -4012,11 +4186,17 @@ class ProductionManager:
             "card_collection_id": None,
             "card_collection_name": _text(body.get("card_collection_name"), "card collection name", 120, source["title"] + " cast") or "Main cast",
             "source_project_id": source["id"], "source_mode": source["mode"], "created_at": now, "updated_at": now,
-            "cards": cards_from_project(source),
+            # A production is an independent episode/part.  The source H3
+            # project supplies render settings and remains linked for output,
+            # but its subjects and reference assets must not silently become
+            # this production's reusable card library.  Users can explicitly
+            # load a shared collection or create cards after the blank
+            # production exists.
+            "cards": empty_card_library(),
             "overview_asset_ids": empty_overview_assets(),
             "auto_merge": True,
             "auto_continue_previous": False,
-            "auto_quality_review": True,
+            "auto_quality_review": False,
             "auto_keyframes_enabled": False,
             "auto_keyframe_model": "z_image_turbo_bf16.safetensors",
             "video_aspect_ratio": body.get("video_aspect_ratio", source.get("aspect_ratio", "16:9")),
@@ -4780,7 +4960,14 @@ class ProductionManager:
         segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
         if not segment:
             raise ValueError("Production clip not found.")
-        self._repair_recoverable_preflight(production, segment)
+        if self._repair_recoverable_preflight(production, segment):
+            # Persist structural repairs before local-AI prompt generation. A
+            # subsequent model or ComfyUI failure must not make the same clip
+            # split itself again when the durable worker resumes.
+            production = self.save(production)
+            segment = next((s for s in production["segments"] if s["id"] == segment_id), None)
+            if not segment:
+                raise ValueError("Production clip changed while repairing its shot plan.")
         self.assert_storyboard_contract_current(production, segment)
         if segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION:
             raise ValueError(
@@ -5137,6 +5324,7 @@ class ProductionManager:
         segment["video_prompt_source"] = ""
         segment["prompt_seconds"] = None
         segment["prompt_updated_at"] = None
+        segment["prompt_quality"] = normalise_prompt_quality(None)
         segment["project_id"], segment["status"] = base["id"], "ready"
         segment["source_hash"], segment["context_hash"] = segment_hash(segment), production_context_hash(production)
         segment["reference_strategy_version"] = REFERENCE_STRATEGY_VERSION
@@ -5810,7 +5998,8 @@ class ProductionManager:
             self.save_project(project)
         return self.save(production)
 
-    def set_segment_prompt(self, ident, segment_id, prompt, source, seconds, project_id=None):
+    def set_segment_prompt(self, ident, segment_id, prompt, source, seconds, project_id=None,
+                           prompt_quality=None):
         production = self.get(ident)
         segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
         if not segment:
@@ -5819,6 +6008,7 @@ class ProductionManager:
         segment["video_prompt_source"] = source if source in ("local_ai", "compiled") else "compiled"
         segment["prompt_seconds"] = _seconds(seconds)
         segment["prompt_updated_at"] = time.time()
+        segment["prompt_quality"] = normalise_prompt_quality(prompt_quality)
         # A prompt revision changes the render contract. Keep every old take
         # in history, but release a manual pin so an earlier video cannot be
         # silently assembled as though it matched the new prompt.
@@ -5837,6 +6027,15 @@ class ProductionManager:
             segment["source_hash"] = segment_hash(segment)
             segment["context_hash"] = production_context_hash(production)
             segment["stale_reasons"] = []
+        return self.save(production)
+
+    def set_segment_prompt_quality(self, ident, segment_id, prompt_quality):
+        """Persist a failed or successful text-only gate without adopting a prompt."""
+        production = self.get(ident)
+        segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
+        if not segment:
+            raise ValueError("Production clip not found.")
+        segment["prompt_quality"] = normalise_prompt_quality(prompt_quality)
         return self.save(production)
 
     def set_video_run(self, ident, segment_id, run_id):
@@ -5873,6 +6072,7 @@ class ProductionManager:
         segment["quality_repair_count"] = count + 1
         segment["video_prompt"] = ""
         segment["video_prompt_source"] = ""
+        segment["prompt_quality"] = normalise_prompt_quality(None)
         segment["selected_video_run_id"] = None
         segment["status"] = "stale"
         segment["stale_reasons"] = ["视频成片质检发现明确问题，需要按质检要求重建本段"]
@@ -5946,17 +6146,23 @@ class ProductionManager:
         return True
 
     def _repair_recoverable_preflight(self, production, segment):
-        """Downgrade an unsafe adjacent continuation to a normal hard cut.
+        """Apply deterministic story-safe repairs before prompt generation.
 
-        Cast, dialogue, source coverage and shot content are deliberately left
-        untouched.  Only the editorial boundary and MMH3 continuation switch
-        are changed.  All other preflight errors remain blocking after the
-        audit is rebuilt, so this cannot conceal missing dialogue, internal
-        cuts or an overloaded/unfilmable shot.
+        Unsafe adjacent continuation is downgraded to a normal hard cut. One
+        explicit two-setup editorial transition may also be split when it has
+        no dialogue and its source contract can be partitioned without loss.
+        Ambiguous cuts and dialogue-bearing cuts remain blocking rather than
+        guessing who speaks in which newly created clip.
         """
         errors = [row for row in segment.get("preflight_issues", [])
                   if row.get("severity") == "error"]
         codes = {str(row.get("code") or "") for row in errors}
+
+        if ("internal_editorial_cut" in codes and
+                self._split_internal_editorial_segment(production, segment)):
+            audit_storyboard_contract(production, backfill_legacy=True)
+            return True
+
         repaired_codes = sorted(codes & AUTO_HARD_CUT_CONTINUITY_CODES)
         changed = False
 
@@ -5984,6 +6190,253 @@ class ProductionManager:
             # harmless cut change does not mark every later adopted take stale.
             audit_storyboard_contract(production, backfill_legacy=True)
         return changed
+
+    def _split_internal_editorial_segment(self, production, segment):
+        """Turn one explicit, silent two-setup clip into adjacent render clips.
+
+        The operation is intentionally conservative: it requires two explicit
+        action sides plus enough ordered paragraph/event ownership to give
+        both new clips a valid source contract. The original clip ID stays on
+        the first side so an in-flight automation cursor remains valid. Any
+        old render remains in project history, while neither changed side is
+        allowed to reuse it as the current take.
+        """
+        segments = production.get("segments", [])
+        try:
+            position = next(index for index, row in enumerate(segments)
+                            if row.get("id") == segment.get("id"))
+        except StopIteration:
+            return False
+        if len(segments) >= MAX_SEGMENTS or segment.get("dialogue"):
+            return False
+
+        refs = segment.get("source_refs", {})
+        paragraphs = list(refs.get("paragraph_ids", []))
+        dialogue_ids = list(refs.get("dialogue_ids", []))
+        event_ids = list(refs.get("event_ids", []))
+        # Source dialogue may not be silently separated from its locked line,
+        # even when an older clip lost the corresponding visible dialogue row.
+        if dialogue_ids or len(paragraphs) < 2 or len(event_ids) < 2:
+            return False
+
+        action_parts = _split_editorial_text(segment.get("action"))
+        if not action_parts:
+            return False
+        story_parts = _split_editorial_text(segment.get("story")) or action_parts
+        setting_parts = _split_editorial_text(segment.get("setting")) or action_parts
+        ending_parts = _split_editorial_text(segment.get("ending"))
+        if any(_hard_editorial_cut_count(value) for value in
+               (*action_parts, *story_parts, *setting_parts)):
+            return False
+
+        def partition(values):
+            pivot = max(1, min(len(values) - 1, math.ceil(len(values) / 2)))
+            return list(values[:pivot]), list(values[pivot:])
+
+        paragraph_parts = partition(paragraphs)
+        event_parts = partition(event_ids)
+        if not all(paragraph_parts) or not all(event_parts):
+            return False
+
+        original = copy.deepcopy(segment)
+
+        def reset_generated(row, *, ident):
+            row["id"] = ident
+            row["image_prompt"] = ""
+            row["prompt_direction"] = ""
+            row["quality_repair_direction"] = ""
+            row["quality_repair_count"] = 0
+            row["video_prompt"] = ""
+            row["video_prompt_source"] = ""
+            row["prompt_seconds"] = 0
+            row["prompt_updated_at"] = None
+            row["prompt_quality"] = normalise_prompt_quality(None)
+            row["prepare_seconds"] = 0
+            row["project_id"] = None
+            row["status"] = "unprepared"
+            row["source_hash"] = ""
+            row["context_hash"] = ""
+            row["reference_strategy_version"] = 0
+            row["image_run_id"] = None
+            row["image_run_ids"] = []
+            row["image_asset_id"] = None
+            row["keyframe_asset_ids"] = []
+            row["ending_continuity_asset_id"] = None
+            row["selected_video_run_id"] = None
+            row["last_video_run_id"] = None
+            row["stale_reasons"] = []
+            row["coverage_issues"] = []
+            row["continuity_issues"] = []
+            row["preflight_issues"] = []
+            row["mmh3_allowed"] = False
+            return row
+
+        first = reset_generated(copy.deepcopy(original), ident=original["id"])
+        second = reset_generated(copy.deepcopy(original), ident=str(uuid.uuid4()))
+        original_duration = int(original.get("duration") or PLANNED_MIN_SECONDS)
+        if original_duration >= MIN_SECONDS * 2:
+            first_duration = max(MIN_SECONDS, original_duration // 2)
+            second_duration = max(MIN_SECONDS, original_duration - first_duration)
+        else:
+            first_duration = second_duration = MIN_SECONDS
+
+        first.update({
+            "title": f"{original.get('title') or 'Clip'} · A",
+            "story": story_parts[0], "setting": setting_parts[0],
+            "action": action_parts[0],
+            "ending": (ending_parts[0] if ending_parts else
+                       "Hold on this setup before the matched edit."),
+            "duration": first_duration,
+            "duration_reason": "Automatically separated the first side of an explicit two-setup editorial transition.",
+            "source_refs": {"scene_ids": list(refs.get("scene_ids", [])),
+                            "paragraph_ids": paragraph_parts[0], "dialogue_ids": [],
+                            "event_ids": event_parts[0]},
+        })
+        second.update({
+            "title": f"{original.get('title') or 'Clip'} · B",
+            "story": story_parts[1], "setting": setting_parts[1],
+            "action": action_parts[1],
+            "ending": (ending_parts[1] if ending_parts else original.get("ending", "")),
+            "duration": second_duration,
+            "duration_reason": "Automatically separated the second side of an explicit two-setup editorial transition.",
+            "transition_mode": "matched_cut", "continue_previous": False,
+            "source_refs": {"scene_ids": list(refs.get("scene_ids", [])),
+                            "paragraph_ids": paragraph_parts[1], "dialogue_ids": [],
+                            "event_ids": event_parts[1]},
+        })
+
+        old_state = original.get("continuity_state", {})
+        start_positions = copy.deepcopy(old_state.get("positions_start", []))
+        end_positions = copy.deepcopy(old_state.get("positions_end", []))
+        start_props = copy.deepcopy(old_state.get("prop_holders_start", []))
+        end_props = copy.deepcopy(old_state.get("prop_holders_end", []))
+        first["continuity_state"] = {
+            "opening_state": old_state.get("opening_state") or setting_parts[0],
+            "ending_state": story_parts[0],
+            "positions_start": start_positions, "positions_end": copy.deepcopy(start_positions),
+            "prop_holders_start": start_props, "prop_holders_end": copy.deepcopy(start_props),
+            "mmh3_eligible": False,
+        }
+        second["continuity_state"] = {
+            "opening_state": story_parts[1],
+            "ending_state": old_state.get("ending_state") or second["ending"],
+            "positions_start": end_positions, "positions_end": copy.deepcopy(end_positions),
+            "prop_holders_start": end_props, "prop_holders_end": copy.deepcopy(end_props),
+            "mmh3_eligible": False,
+        }
+
+        old_timeline = original.get("cast_timeline", {})
+        known_names = list(dict.fromkeys(
+            list(old_timeline.get("visible_start", [])) +
+            list(old_timeline.get("visible_end", [])) +
+            list(old_timeline.get("offscreen", []))))
+
+        def visible_names(rows, fallback, text):
+            values = [row.get("character") for row in rows if row.get("character")]
+            if not values:
+                values = [name for name in fallback if _name_occurs(name, text)]
+            return list(dict.fromkeys(values))
+
+        first_visible = visible_names(
+            start_positions, old_timeline.get("visible_start", []), action_parts[0])
+        second_visible = visible_names(
+            end_positions, old_timeline.get("visible_end", []), action_parts[1])
+
+        def split_timeline(visible):
+            folded = {str(name).strip().casefold() for name in visible}
+            return {
+                "visible_start": list(visible), "visible_end": list(visible),
+                "enters": [], "exits": [],
+                "offscreen": [name for name in known_names
+                              if str(name).strip().casefold() not in folded],
+                "mentioned_only": list(old_timeline.get("mentioned_only", [])),
+            }
+
+        first["cast_timeline"] = split_timeline(first_visible)
+        second["cast_timeline"] = split_timeline(second_visible)
+
+        old_shot = original.get("shot_contract", {})
+        first["shot_contract"] = {
+            **copy.deepcopy(old_shot),
+            "ending_composition": old_shot.get("opening_composition") or story_parts[0],
+            "must_change": "",
+        }
+        second["shot_contract"] = {
+            **copy.deepcopy(old_shot),
+            "opening_composition": old_shot.get("ending_composition") or story_parts[1],
+            "edit_reason": "action_match", "relation_previous": "matched_cut",
+        }
+
+        card_name_by_id = {}
+        for kind in SELECTABLE_CARD_KINDS:
+            for card in production.get("cards", {}).get(kind, []):
+                card_name_by_id[str(card.get("id"))] = str(card.get("name") or "")
+
+        def relevance(value, text):
+            haystack = re.sub(r"[_\-]+", " ", str(text or "")).casefold()
+            candidates = [str(value), card_name_by_id.get(str(value), "")]
+            scores = []
+            for raw in dict.fromkeys(candidate for candidate in candidates if candidate):
+                phrase = re.sub(r"[_\-]+", " ", raw).strip().casefold()
+                if not phrase:
+                    continue
+                score = 4 if phrase in haystack else 0
+                tokens = [token for token in re.findall(r"[a-z0-9]+|[\u3400-\u9fff]+", phrase)
+                          if len(token) >= 3]
+                scores.append(score + sum(1 for token in tokens if token in haystack))
+            return max(scores, default=0)
+
+        first_state_text = " ".join(
+            f"{row.get('prop', '')} {row.get('holder', '')} {row.get('state', '')}"
+            for row in start_props)
+        second_state_text = " ".join(
+            f"{row.get('prop', '')} {row.get('holder', '')} {row.get('state', '')}"
+            for row in end_props)
+        combined_first = "\n".join(
+            (story_parts[0], setting_parts[0], action_parts[0], first_state_text))
+        combined_second = "\n".join(
+            (story_parts[1], setting_parts[1], action_parts[1], second_state_text))
+        first_selection, second_selection = {}, {}
+        for kind in SELECTABLE_CARD_KINDS:
+            values = list(original.get("card_selection", {}).get(kind, []))
+            left_values, right_values = [], []
+            if kind == "voices":
+                # A silent split must not retain voice references that could
+                # tempt the renderer to invent speech or device audio.
+                first_selection[kind], second_selection[kind] = [], []
+                continue
+            for value in values:
+                left_score = relevance(value, combined_first)
+                right_score = relevance(value, combined_second)
+                if left_score > right_score:
+                    left_values.append(value)
+                elif right_score > left_score:
+                    right_values.append(value)
+                else:
+                    # Shared/ambiguous props and environments are safer on
+                    # both sides than silently losing a locked reference.
+                    left_values.append(value)
+                    right_values.append(value)
+            first_selection[kind], second_selection[kind] = left_values, right_values
+        first["card_selection"] = first_selection
+        second["card_selection"] = second_selection
+
+        warning = (
+            "Automatically split one explicit two-setup editorial transition into adjacent "
+            "render clips; source order and all authored events were preserved.")
+        first["continuity_warnings"] = list(dict.fromkeys(
+            [*first.get("continuity_warnings", []), warning]))[:16]
+        second["continuity_warnings"] = list(dict.fromkeys(
+            [*second.get("continuity_warnings", []), warning]))[:16]
+
+        segments[position:position + 1] = [first, second]
+        for index, row in enumerate(segments):
+            row["index"] = index + 1
+        if isinstance(production.get("automation"), dict):
+            # Keep the visible denominator truthful during the potentially
+            # long local-model call that immediately follows this split.
+            production["automation"]["total"] = len(segments)
+        return True
 
     def assert_video_project_current(self, production, project):
         """Reject stale or visually ungrounded production snapshots.

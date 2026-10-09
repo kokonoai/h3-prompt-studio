@@ -24,6 +24,10 @@ PROMPT_REPAIR_MARKERS = (
     "scene changed after its english h3 prompt was created",
     "saved h3 language pass is invalid",
     "project dialogue language changed",
+    # Old or manually edited prompts are checked again at the final submission
+    # boundary.  A failed text-only gate is safe to repair by rebuilding only
+    # the prompt; no video has been submitted yet.
+    "failed pre-render prompt quality",
     "shot_contract.relation_previous disagrees with transition_mode",
     # Adjacent-state failures can be repaired without changing story/cast: the
     # materialiser converts the unsafe continuation to a hard cut, rebuilds the
@@ -42,11 +46,48 @@ PROMPT_REPAIR_MARKERS = (
 )
 TRANSIENT_MARKERS = (
     "timeout", "timed out", "readtimeout", "connecttimeout", "connection",
+    "did not respond in time",
     "not reachable", "temporarily unavailable", "winerror 10054",
     "winerror 5", "permissionerror", "ai is still working",
     "a video request is already active",
     "running or queued work", "already generating another video",
     "has not released gpu memory", "model has not released",
+)
+GLOBAL_FAILURE_MARKERS = (
+    # Local services, shared workflow dependencies and filesystem failures
+    # affect every remaining clip; skipping individual clips would only waste
+    # time and repeat the same failure across the episode.
+    "studio is shutting down",
+    "comfyui is not reachable", "comfyui is not running",
+    "confirm h3 studio and comfyui", "check that comfyui",
+    "does not have the required lora", "required lora_name",
+    "select the h3 desktop installation", "workflow model is missing",
+    "connection refused", "connecttimeout", "readtimeout", "timed out",
+    "winerror 10054", "a video request is already active",
+    "submission is uncertain", "running or queued work",
+    "already generating another video", "has not released gpu memory",
+    "model has not released", "permissionerror", "winerror 5",
+    "no space left", "disk full", "read-only file system",
+    "cuda out of memory", "out of memory", "safetensors",
+    "lmstudioerror: lm studio returned http 500",
+    "ollama returned http 500", "ollama is not reachable",
+    "cannot reach ollama", "cannot reach lm studio",
+    "selected ollama model is not installed",
+    "selected model is not loaded",
+    "assistant load could not be confirmed",
+    "comfyui queue state could not be verified",
+    "comfyui's queue status could not be verified",
+    "comfyui’s queue status could not be verified",
+    "original comfyui connection is unknown",
+    "comfyui transfer did not finish",
+    "check the comfyui and lm studio connections",
+    # These are compiler-owned invariants, not scene-authoring defects. If one
+    # is absent after compilation, every following clip would fail for the same
+    # shared language/template bug; do not spend an episode isolating them one
+    # by one.
+    "failed final h3 prompt quality: the final h3 prompt must contain exactly one final audio override",
+    "failed final h3 prompt quality: the final audio override does not match the locked dialogue count",
+    "failed final h3 prompt quality: the final h3 prompt lost or duplicated its production continuity override",
 )
 
 
@@ -58,6 +99,19 @@ def is_prompt_repairable(message: str) -> bool:
 def is_transient_failure(message: str) -> bool:
     value = str(message).casefold()
     return any(marker in value for marker in TRANSIENT_MARKERS)
+
+
+def is_global_failure(message: str) -> bool:
+    """Return whether continuing other clips would repeat a shared failure.
+
+    This function is called only after the prompt/render helper has exhausted
+    its own bounded retry policy.  A still-transient transport or lock failure
+    at that boundary is therefore shared infrastructure trouble, not evidence
+    that one storyboard clip is defective.
+    """
+    value = str(message).casefold()
+    return (any(marker in value for marker in GLOBAL_FAILURE_MARKERS)
+            or is_transient_failure(value))
 
 
 class ProductionAutomationManager:
@@ -91,7 +145,7 @@ class ProductionAutomationManager:
         worker = self.workers.get(production_id)
         return bool(worker and worker.is_alive())
 
-    def start(self, production_id, *, merge=True, requested_by="user"):
+    def start(self, production_id, *, merge=True, review=False, requested_by="user"):
         production = self.get_production(production_id)
         if production.get("task_state") == "paused":
             raise ValueError("This production is paused. Resume it before starting the background run.")
@@ -104,8 +158,9 @@ class ProductionAutomationManager:
             started_at = current.get("started_at") or time.time()
             self._update(
                 production_id, status="running", stage="scan",
-                merge=bool(merge), requested_by=requested_by, started_at=started_at,
-                finished_at=None, last_error="", stage_detail="Checking missing work",
+                merge=bool(merge), review=bool(review), requested_by=requested_by, started_at=started_at,
+                finished_at=None, last_error="", blocked_segments=[],
+                stage_detail="Checking missing work",
             )
             worker = threading.Thread(
                 target=self._run, args=(production_id,), daemon=True,
@@ -189,6 +244,47 @@ class ProductionAutomationManager:
             "accept it or approve its suggested repair" + suffix)
 
     @staticmethod
+    def _blocked_attention_message(rows):
+        labels = []
+        for row in rows[:8]:
+            index = row.get("index")
+            title = str(row.get("title") or "").strip()
+            reason = str(row.get("reason") or "").strip()
+            label = (f"{index} {title}" if index else
+                     str(row.get("segment_id") or "")[:8]).strip()
+            labels.append(f"{label}: {reason}" if reason else label)
+        suffix = " | ".join(labels)
+        if len(rows) > len(labels):
+            suffix += f" | +{len(rows) - len(labels)} more"
+        return (
+            f"Finished every independent clip that could continue. {len(rows)} clip(s) were "
+            "isolated instead of stopping the episode. Review or edit those storyboard clips, "
+            "then resume to retry only the unresolved work: " + suffix)
+
+    def _block_segment(self, production_id, segment, stage, message):
+        """Persist one clip-local failure and let the same episode continue."""
+        production = self.get_production(production_id)
+        automation = production.get("automation", {})
+        rows = [row for row in automation.get("blocked_segments", [])
+                if row.get("segment_id") != segment.get("id")]
+        rows.append({
+            "segment_id": segment.get("id"),
+            "index": int(segment.get("index") or 0),
+            "title": str(segment.get("title") or "")[:120],
+            "stage": stage if stage in ("prompts", "videos") else "prompts",
+            "reason": str(message)[:1600],
+            "blocked_at": time.time(),
+        })
+        self._update(
+            production_id, status="running", stage="scan",
+            current_segment_id=None, current_index=0, run_id=None,
+            request_id=None, attempt=0, last_error="",
+            blocked_segments=rows,
+            stage_detail=f"Isolated clip {segment.get('index')}; continuing remaining clips",
+        )
+        return rows
+
+    @staticmethod
     def _active_run_for_segment(overview, segment_id):
         row = next((item for item in overview.get("segments", [])
                     if item.get("segment_id") == segment_id), None)
@@ -228,6 +324,66 @@ class ProductionAutomationManager:
                 continue
             return job
         raise RuntimeError("Studio is shutting down; the persisted production task will resume next time.")
+
+    @staticmethod
+    def _prompt_needs_build(segment):
+        quality = segment.get("prompt_quality") or {}
+        return (
+            segment.get("status") != "ready"
+            or not str(segment.get("video_prompt") or "").strip()
+            or bool(segment.get("stale_reasons"))
+            or quality.get("status") == "failed"
+        )
+
+    def _prepare_prompt(self, production_id, segment):
+        """Build one prompt during the prompt-only pass before video rendering.
+
+        Keeping prompt preparation separate from rendering avoids repeatedly
+        switching the local LLM and ComfyUI workload for every clip.  It also
+        makes the progress UI truthful: every missing prompt is checked before
+        the continuous render pass starts.
+        """
+        segment_id, index = segment["id"], segment["index"]
+        repaired = False
+        max_attempts = len(self.retry_delays) + 1
+        for attempt in range(max_attempts):
+            if self._pause_if_requested(production_id):
+                return
+            self._update(
+                production_id, status="running", stage="prompts",
+                current_segment_id=segment_id, current_index=index,
+                run_id=None, request_id=None, attempt=attempt,
+                stage_detail=f"Building prompt for clip {index}",
+            )
+            try:
+                self.generate_prompt(production_id, segment_id)
+                current = next((item for item in self.get_production(production_id).get("segments", [])
+                                if item.get("id") == segment_id), None)
+                if current is None:
+                    raise RuntimeError("The queued production clip no longer exists.")
+                if self._prompt_needs_build(current):
+                    raise RuntimeError(
+                        f"Clip {index} prompt generation finished without a usable reviewed prompt.")
+                self._update(production_id, attempt=0, last_error="",
+                             stage_detail=f"Prompt ready for clip {index}")
+                return
+            except Exception as exc:
+                message = str(exc)
+                if is_prompt_repairable(message) and not repaired:
+                    repaired = True
+                    self._update(production_id, last_error=message[:2000],
+                                 stage_detail=f"Repairing prompt for clip {index}")
+                    continue
+                if attempt + 1 < max_attempts and is_transient_failure(message):
+                    delay = self.retry_delays[attempt]
+                    self._update(production_id, status="retrying", stage="prompts",
+                                 attempt=attempt + 1, last_error=message[:2000],
+                                 stage_detail=f"Retrying prompt {index} in {int(delay)}s")
+                    if self._wait(delay):
+                        raise RuntimeError("Studio is shutting down; the task will resume next time.")
+                    continue
+                raise
+        raise RuntimeError(f"Clip {index} prompt exceeded its safe retry limit.")
 
     def _process_segment(self, production_id, segment, overview):
         segment_id, index = segment["id"], segment["index"]
@@ -311,24 +467,77 @@ class ProductionAutomationManager:
                 segments = sorted(production.get("segments", []), key=lambda item: item["index"])
                 overview = self.outputs(production_id)
                 completed_ids = self._selected_segment_ids(overview)
+                automation = production.get("automation", {})
+                review_after_render = bool(automation.get("review", False))
+                blocked_rows = list(automation.get("blocked_segments", []))
+                blocked_ids = {row.get("segment_id") for row in blocked_rows}
                 self._update(production_id, status="running", total=len(segments),
                              completed=len(completed_ids), last_error="")
+                # If Studio restarted while a video request was active, finish
+                # resolving that durable request before touching the LLM.
+                if automation.get("run_id") or automation.get("request_id"):
+                    active_segment = next((segment for segment in segments
+                                           if segment.get("id") == automation.get("current_segment_id")), None)
+                    if active_segment is not None:
+                        try:
+                            self._process_segment(production_id, active_segment, overview)
+                        except Exception as exc:
+                            if is_global_failure(str(exc)):
+                                raise
+                            self._block_segment(
+                                production_id, active_segment, "videos", str(exc))
+                        continue
+
+                quality_blocked = self._quality_blocked_rows(overview, segments)
+                quality_blocked_ids = {row.get("segment_id") for row in quality_blocked}
+
+                # Phase 1: prepare and preflight every missing prompt.  No new
+                # video is submitted until this pass is complete.
+                prompt_candidates = [
+                    segment for segment in segments
+                    if segment.get("id") not in quality_blocked_ids
+                    and segment.get("id") not in blocked_ids
+                    and (segment.get("id") not in completed_ids
+                         or segment.get("status") != "ready"
+                         or bool(segment.get("stale_reasons")))
+                    and self._prompt_needs_build(segment)
+                ]
+                prompt_target = next((segment for segment in prompt_candidates
+                                      if segment.get("quality_repair_direction")), None)
+                if prompt_target is None and prompt_candidates:
+                    prompt_target = prompt_candidates[0]
+                if prompt_target is not None:
+                    try:
+                        self._prepare_prompt(production_id, prompt_target)
+                    except Exception as exc:
+                        if is_global_failure(str(exc)):
+                            raise
+                        self._block_segment(
+                            production_id, prompt_target, "prompts", str(exc))
+                    continue
+
                 # An explicitly approved quality repair is the only rejected
                 # clip the queue may regenerate.  Prioritise it so an earlier
                 # unapproved rejection cannot hijack the resumed worker.
                 target = next((segment for segment in segments
                                if segment.get("quality_repair_direction") and
+                               segment.get("id") not in blocked_ids and
                                (segment["id"] not in completed_ids
                                 or segment.get("status") != "ready"
                                 or not segment.get("video_prompt", "").strip()
                                 or bool(segment.get("stale_reasons")))), None)
                 if target is not None:
-                    self._process_segment(production_id, target, overview)
+                    try:
+                        self._process_segment(production_id, target, overview)
+                    except Exception as exc:
+                        if is_global_failure(str(exc)):
+                            raise
+                        self._block_segment(production_id, target, "videos", str(exc))
                     continue
 
                 # Newly rendered takes must receive their review before older
                 # rejected clips pause the queue again.
-                if (self.review_quality is not None and
+                if (review_after_render and self.review_quality is not None and
                         int(overview.get("quality_pending_count") or 0) > 0):
                     self._update(production_id, status="running", stage="quality",
                                  current_segment_id=None, current_index=0,
@@ -344,20 +553,34 @@ class ProductionAutomationManager:
                     self.review_quality(production_id)
                     continue
 
-                quality_blocked = self._quality_blocked_rows(overview, segments)
-                quality_blocked_ids = {row.get("segment_id") for row in quality_blocked}
                 target = next((segment for segment in segments
                                if (segment["id"] not in completed_ids
                                     or segment.get("status") != "ready"
                                     or not segment.get("video_prompt", "").strip()
                                     or bool(segment.get("stale_reasons")))
-                               and segment["id"] not in quality_blocked_ids), None)
+                               and segment["id"] not in quality_blocked_ids
+                               and segment["id"] not in blocked_ids), None)
                 if target is not None:
-                    self._process_segment(production_id, target, overview)
+                    try:
+                        self._process_segment(production_id, target, overview)
+                    except Exception as exc:
+                        if is_global_failure(str(exc)):
+                            raise
+                        self._block_segment(production_id, target, "videos", str(exc))
                     continue
+                # Clip-local structural/prompt/render failures are collected
+                # only after all independent work has finished. They do not
+                # permit a partial final assembly, but they also never stop an
+                # unrelated clip from reaching a usable take.
+                if blocked_rows:
+                    raise RuntimeError(self._blocked_attention_message(blocked_rows))
+                # A take rejected by an explicitly requested QC pass always
+                # needs a human decision.  Resuming the ordinary generation
+                # queue must neither rerender it nor attempt to assemble a cut
+                # with a missing adopted take.
                 if quality_blocked:
                     raise RuntimeError(self._quality_attention_message(quality_blocked))
-                if self.review_quality is not None:
+                if review_after_render and self.review_quality is not None:
                     self._update(production_id, status="running", stage="quality",
                                  current_segment_id=None, current_index=0,
                                  run_id=None, request_id=None,
@@ -366,17 +589,25 @@ class ProductionAutomationManager:
                     failed = reviewed.get("failed", []) if isinstance(reviewed, dict) else []
                     if failed:
                         raise RuntimeError(self._quality_attention_message(failed))
-                if production.get("automation", {}).get("merge", True):
+                # Assembly belongs to the normal generation path, not to
+                # optional post-render QC.  This keeps the durable worker able
+                # to create the initial cut even when the browser is closed.
+                # When a user-approved repair replaces a take, the same path
+                # assembles the updated cut from the new signature.
+                if automation.get("merge", True):
                     self._update(production_id, status="running", stage="merge",
                                  current_segment_id=None, current_index=0,
                                  run_id=None, request_id=None,
-                                 stage_detail="Assembling final film")
+                                 stage_detail=("Assembling reviewed film" if review_after_render else
+                                               "Assembling initial cut"))
                     self.build_film(production_id)
+                detail = ("Reviewed film complete" if review_after_render else
+                          "Initial cut ready; optional quality review is available")
                 self._update(production_id, status="completed", stage="completed",
                              completed=len(segments), total=len(segments),
                              current_segment_id=None, current_index=0,
                              run_id=None, request_id=None, attempt=0,
-                             stage_detail="Episode complete", last_error="",
+                              stage_detail=detail, last_error="",
                              finished_at=time.time())
                 return
         except Exception as exc:

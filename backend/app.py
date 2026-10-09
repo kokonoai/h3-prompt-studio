@@ -1220,6 +1220,7 @@ def production_materialize(production_id: str, segment_id: str):
     result['compiled'] = compile_project(result['project'])
     return result
 
+
 @app.post('/api/productions/{production_id}/materialize')
 def production_materialize_all(production_id: str, body: dict):
     only_missing = body.get('only_missing', True)
@@ -1416,6 +1417,15 @@ def _require_production_quality(production_id, segment_id, run_id):
     })
 
 
+def _defer_production_quality(production_id, segment_id, run_id):
+    """Mark a new take for an explicit later human-triggered review."""
+    return _save_production_quality(production_id, segment_id, run_id, {
+        'status': 'unreviewed', 'required': False, 'accepted': True,
+        'summary': 'Video ready. Start quality review after watching this take.',
+        'issues': [], 'repair_direction': '', 'reviewed_at': None,
+    })
+
+
 def _quality_reference_rows(production, segment):
     selected = {str(value).strip().casefold() for value in
                 segment.get('card_selection', {}).get('characters', []) if str(value).strip()}
@@ -1535,6 +1545,11 @@ def _quality_visual_context(production, segment, references):
         segment, timeline, character_names, 'last')
     prop_contract = _quality_prop_contract(segment)
     device_contract = device_screen_geometry_lock(segment, display_names)
+    complexity_focus = [
+        {'code': row.get('code'), 'message': row.get('message'),
+         'suggestion': row.get('suggestion')}
+        for row in segment.get('preflight_issues', [])
+        if isinstance(row, dict) and row.get('code') in ('dense_cast', 'dense_action')]
     return {
         'clip': {'index': segment.get('index'), 'title': segment.get('title'),
                  'action': segment.get('action'), 'ending': segment.get('ending'),
@@ -1561,6 +1576,7 @@ def _quality_visual_context(production, segment, references):
         'continuity_only_prop_names': prop_contract['continuity_names'],
         'visual_style': production.get('style_bible') or production.get('visual_style_custom') or
                         production.get('visual_style_preset'),
+        'complexity_review_focus': complexity_focus,
         'sampling_limit': ('Only first/middle/last frames are supplied. Do not infer dialogue, sound, '
                            'continuous motion, or off-screen events.'),
     }
@@ -1847,6 +1863,9 @@ def production_outputs(production_id, runs=None):
     pending_quality = [row for row in segments if row.get('selected') and
                        row['selected'].get('quality_review', {}).get('required') and
                        row['selected'].get('quality_review', {}).get('status') in ('pending', 'reviewing')]
+    manual_quality_pending = [row for row in segments if row.get('selected') and
+                              row['selected'].get('quality_review', {}).get('status') in
+                              ('legacy', 'unreviewed', 'pending', 'reviewing')]
     quality_ready = all_ready and not pending_quality
     legacy_upgrade_count = sum(bool(row.get('legacy_upgrade')) for row in segments)
     blocking_stale_count = sum(
@@ -1855,13 +1874,22 @@ def production_outputs(production_id, runs=None):
         bool(row.get('selected') and
              row['selected'].get('quality_review', {}).get('status') == 'legacy')
         for row in segments)
+    # The first assembled cut is useful before manual QC.  Keep its identity
+    # stable while a review is running; quality_ready still prevents a new
+    # assembly from racing an active review, but it no longer hides an already
+    # completed initial cut.
     signature = hashlib.sha256(json.dumps(
         {'assembly_version': FILM_ASSEMBLY_VERSION, 'run_ids': selected_ids},
-        separators=(',', ':')).encode()).hexdigest()[:20] if quality_ready else None
+        separators=(',', ':')).encode()).hexdigest()[:20] if all_ready else None
     output = DATA / 'production_films' / production['id'] / (signature + '.mp4') if signature else None
     final_ready = bool(output and output.is_file() and output.stat().st_size)
-    adopted_video_seconds = round(sum(float((row['selected'] or {}).get('elapsed_seconds') or 0)
-                                      for row in segments), 3)
+    adopted_video_seconds = round(sum(float(
+        (row['selected'] or {}).get('server_execution_seconds') or
+        (row['selected'] or {}).get('elapsed_seconds') or 0)
+        for row in segments), 3)
+    adopted_video_wall_seconds = round(sum(float(
+        (row['selected'] or {}).get('elapsed_seconds') or 0)
+        for row in segments), 3)
     job_counts = _production_video_job_counts(segments)
     return {
         'production_id': production['id'], 'auto_merge': production.get('auto_merge', True),
@@ -1869,6 +1897,7 @@ def production_outputs(production_id, runs=None):
         'quality_batch': _production_quality_batch_state(production['id']),
         'segments': segments, 'selected_run_ids': selected_ids, 'all_ready': all_ready,
         'quality_ready': quality_ready, 'quality_pending_count': len(pending_quality),
+        'manual_quality_pending_count': len(manual_quality_pending),
         'legacy_upgrade_count': legacy_upgrade_count,
         'legacy_unreviewed_count': legacy_unreviewed_count,
         'blocking_stale_count': blocking_stale_count,
@@ -1883,6 +1912,7 @@ def production_outputs(production_id, runs=None):
             'prompt_generation_seconds': round(sum(float(row.get('prompt_seconds') or 0)
                                                     for row in production['segments']), 3),
             'video_generation_seconds': adopted_video_seconds,
+            'video_wall_seconds': adopted_video_wall_seconds,
             'merge_seconds': production.get('timings', {}).get('merge_seconds'),
         },
         'final_ready': final_ready,
@@ -1913,12 +1943,18 @@ def production_automation_get(production_id: str):
 @app.post('/api/productions/{production_id}/automation/start')
 def production_automation_start(production_id: str, body: dict):
     production_id = safe_id(production_id)
-    if not isinstance(body, dict) or set(body) - {'merge'}:
-        raise ValueError('Automation start accepts only the merge option.')
+    if not isinstance(body, dict) or set(body) - {'merge', 'review'}:
+        raise ValueError('Automation start accepts only merge and review options.')
     merge = body.get('merge', True)
-    if type(merge) is not bool:
-        raise ValueError('Automation merge must be true or false.')
-    automation = production_automation_manager().start(production_id, merge=merge)
+    review = body.get('review', False)
+    if type(merge) is not bool or type(review) is not bool:
+        raise ValueError('Automation merge and review options must be true or false.')
+    # Legacy clients may still send the old switches.  Full-episode automation
+    # now has one invariant path: prompt preflight, continuous rendering and a
+    # durable initial assembly.  Video QC is started only through its explicit
+    # single/batch endpoints after the user watches that cut.
+    automation = production_automation_manager().start(
+        production_id, merge=True, review=False)
     return {'automation': automation, 'production': production_manager().get(production_id),
             'outputs': production_outputs(production_id)}
 
@@ -2006,7 +2042,7 @@ def production_quality_approve_repair(production_id: str, segment_id: str, run_i
     updated = production_manager().apply_quality_repair(
         production['id'], segment['id'], review['repair_direction'])
     automation = production_automation_manager().start(
-        production['id'], merge=updated.get('auto_merge', True), requested_by='approved_quality_repair')
+        production['id'], merge=True, review=False, requested_by='approved_quality_repair')
     return {'production': production_manager().get(production['id']), 'automation': automation,
             'outputs': production_outputs(production['id'])}
 
@@ -2033,7 +2069,7 @@ def production_quality_accept_override(production_id: str, segment_id: str, run_
     segment['selected_video_run_id'] = run['id']
     production_manager().save(production)
     automation = production_automation_manager().start(
-        production['id'], merge=production.get('auto_merge', True),
+        production['id'], merge=True, review=False,
         requested_by='human_quality_override')
     return {'review': review, 'automation': automation,
             'outputs': production_outputs(production['id'])}
@@ -2094,7 +2130,7 @@ def production_quality_accept_override_batch(production_id: str, body: dict):
 
     production_manager().save(production)
     automation = production_automation_manager().start(
-        production['id'], merge=production.get('auto_merge', True),
+        production['id'], merge=True, review=False,
         requested_by='human_quality_override_batch')
     return {
         'accepted_count': len(accepted), 'accepted': accepted,
@@ -2274,7 +2310,8 @@ def video_library_overview():
             if selected:
                 job = {key: selected.get(key) for key in (
                     'id', 'status', 'seed', 'duration', 'new_seconds', 'created_at',
-                    'elapsed_seconds', 'width', 'height', 'video_url', 'scene_video_url',
+                    'elapsed_seconds', 'server_execution_seconds', 'width', 'height',
+                    'video_url', 'scene_video_url',
                     'download_url', 'output_folder')}
             videos.append({
                 'production_id': production['id'], 'production_title': production['title'],
@@ -2334,13 +2371,22 @@ def series_outputs(series_id):
         legacy = folder / f"episode-{episode['index']:02d}.mp4" if folder else None
         if path and (not path.is_file() or not path.stat().st_size) and legacy and legacy.is_file() and legacy.stat().st_size:
             path = legacy
-        episode['film_ready'] = bool(path and path.is_file() and path.stat().st_size)
-        episode['film_url'] = (f"/api/series/{series['id']}/film/episode/{episode['index']}?signature={signature}"
-                               if episode['film_ready'] and path == legacy else
-                               f"/api/series/{series['id']}/film/episode/{episode['index']}?signature={episode['signature']}"
-                               if episode['film_ready'] else None)
-        episode['file_path'] = str(path.resolve()) if episode['film_ready'] else None
-        episode['folder_path'] = str(path.parent.resolve()) if episode['film_ready'] else None
+        current_ready = bool(path and path.is_file() and path.stat().st_size)
+        film_signature = (signature if current_ready and path == legacy else
+                          episode['signature'] if current_ready else None)
+        if not current_ready:
+            historical = _latest_series_episode_film(series['id'], episode['index'])
+            if historical:
+                path, film_signature = historical
+        film_ready = bool(path and path.is_file() and path.stat().st_size)
+        episode['film_ready'] = film_ready
+        episode['film_current'] = current_ready
+        episode['film_signature'] = film_signature if film_ready else None
+        episode['film_url'] = (f"/api/series/{series['id']}/film/episode/{episode['index']}?signature={film_signature}"
+                               if film_ready else None)
+        episode['file_path'] = str(path.resolve()) if film_ready else None
+        episode['folder_path'] = str(path.parent.resolve()) if film_ready else None
+        episode['assembled_at'] = path.stat().st_mtime if film_ready else None
     final = folder / 'complete.mp4' if folder else None
     final_ready = bool(final and final.is_file() and final.stat().st_size)
     return {'series_id': series['id'], 'title': series['title'], 'episodes': episodes,
@@ -2353,6 +2399,33 @@ def series_outputs(series_id):
 
 def _series_episode_folder(series_id, index, signature):
     return DATA / 'series_films' / safe_id(series_id) / 'episodes' / f'episode-{index:02d}-{signature}'
+
+
+def _latest_series_episode_film(series_id, index):
+    """Return the newest retained episode film, even when its sources changed.
+
+    Episode signatures intentionally change when an adopted take or project order
+    changes.  Older results remain useful review/export artifacts and must not
+    disappear from Script management merely because they are no longer current.
+    """
+    root = DATA / 'series_films' / safe_id(series_id) / 'episodes'
+    if not root.is_dir():
+        return None
+    prefix = f'episode-{index:02d}-'
+    candidates = []
+    for folder in root.iterdir():
+        if not folder.is_dir() or not folder.name.startswith(prefix):
+            continue
+        signature = folder.name[len(prefix):]
+        if not re.fullmatch(r'[0-9a-f]{20}', signature):
+            continue
+        path = folder / f'episode-{index:02d}.mp4'
+        if path.is_file() and path.stat().st_size:
+            candidates.append((path.stat().st_mtime, path, signature))
+    if not candidates:
+        return None
+    _modified, path, signature = max(candidates, key=lambda row: row[0])
+    return path, signature
 
 
 def series_selection_outputs(series_id, indices):
@@ -2654,8 +2727,8 @@ def series_episode_film_open(series_id: str, index: int):
 def series_episode_film_get(series_id: str, index: int, signature: str, download: bool = False):
     overview = series_outputs(series_id)
     episode = next((item for item in overview['episodes'] if item['index'] == index), None)
-    if not episode or not episode['film_ready'] or signature not in (episode['signature'], overview['signature']):
-        raise HTTPException(409, 'This episode film is not assembled for the current project order.')
+    if not episode or not episode['film_ready'] or signature != episode.get('film_signature'):
+        raise HTTPException(409, 'This retained episode film is unavailable. Refresh Script management and try again.')
     path = Path(episode['file_path'])
     return FileResponse(path, media_type='video/mp4', filename=f'H3-Series-Episode-{index:02d}.mp4' if download else None)
 
@@ -2901,40 +2974,160 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     project = materialised['project']
     started = time.monotonic()
     if use_ai:
-        planning_project = copy.deepcopy(project)
+        from .dialogue_audio import (normalise_structured_dialogue_directions,
+                                     silence_unstructured_speech_directions)
+        # Build the locked planning baseline from the source project after a
+        # deterministic audio-safety pass.  This handles authored phrases such
+        # as "both share a soft laugh" in final_state/soundscape without
+        # altering structured dialogue or the production storyboard.  The AI
+        # and its fallback are now checked against the same safe baseline, so
+        # a repairable vocal wording cannot exhaust two retries and stop the
+        # complete-episode queue.
+        planning_project = normalise_structured_dialogue_directions(
+            copy.deepcopy(project))
+        planning_project = silence_unstructured_speech_directions(
+            planning_project, project)
+        last_prompt_quality = None
 
         def generate(model):
+            nonlocal last_prompt_quality
+            from .prompt_quality import (MAX_AUTOMATIC_REPAIRS, repair_request,
+                                         review_compiled_prompt, review_generated_plan,
+                                         with_repair_history)
             lm = client()
-            RESOURCES.stage = f"Building video prompt for clip {segment['index']}"
-            instructions = _production_prompt_instructions(production, segment)
-            if SETTINGS.get('ai_memory_mode') == 'resident_small':
-                from .continuation_suggestions import compact_plan
-                planning_project.setdefault('simple', {})['directed'] = True
-                proposal = compact_plan(lm, model, planning_project, instructions, SETTINGS['persona'])
-            else:
-                proposal = lm.propose_plan(model, planning_project, instructions, SETTINGS['persona'])
-            candidate = merge_plan(planning_project, proposal)
-            candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
-            return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled}
+            base_instructions = _production_prompt_instructions(production, segment)
+            failures, repair = [], ''
+            for quality_attempt in range(MAX_AUTOMATIC_REPAIRS + 1):
+                RESOURCES.stage = (f"Building video prompt for clip {segment['index']}" if not quality_attempt else
+                                   f"Repairing prompt quality {quality_attempt}/{MAX_AUTOMATIC_REPAIRS} for clip {segment['index']}")
+                instructions = '\n\n'.join(value for value in (base_instructions, repair) if value)
+                if SETTINGS.get('ai_memory_mode') == 'resident_small':
+                    from .continuation_suggestions import compact_plan
+                    planning_project.setdefault('simple', {})['directed'] = True
+                    proposal = compact_plan(lm, model, planning_project, instructions, SETTINGS['persona'])
+                else:
+                    proposal = lm.propose_plan(model, planning_project, instructions, SETTINGS['persona'])
+                candidate = merge_plan(planning_project, proposal)
+                candidate = normalise_structured_dialogue_directions(candidate)
+                plan_quality = review_generated_plan(
+                    production, segment, planning_project, candidate)
+                last_prompt_quality = plan_quality
+                if plan_quality['status'] == 'failed':
+                    blocking_codes = {
+                        row.get('code') for row in plan_quality['issues']
+                        if row.get('severity') == 'error'
+                    }
+                    # These phrases duplicate or invent vocal direction
+                    # outside the already locked dialogue objects. They can be
+                    # removed deterministically without asking the LLM again
+                    # and without changing any spoken words or speaker IDs.
+                    if blocking_codes and blocking_codes <= {
+                            'unstructured_speech_event', 'unanchored_nonverbal_vocal',
+                            'invented_nonverbal_vocal'}:
+                        original_quality = plan_quality
+                        repaired_candidate = silence_unstructured_speech_directions(
+                            candidate, planning_project)
+                        repaired_quality = review_generated_plan(
+                            production, segment, planning_project, repaired_candidate)
+                        if repaired_quality['status'] == 'passed':
+                            failures.append(original_quality)
+                            candidate = repaired_candidate
+                            plan_quality = with_repair_history(repaired_quality, failures)
+                            last_prompt_quality = plan_quality
+                if plan_quality['status'] == 'failed':
+                    failures.append(plan_quality)
+                    last_prompt_quality = with_repair_history(
+                        plan_quality, failures[:-1])
+                    if any(not row.get('repairable') for row in plan_quality['issues']
+                           if row.get('severity') == 'error'):
+                        messages = ' '.join(
+                            row['message'] for row in plan_quality['issues']
+                            if row.get('severity') == 'error')
+                        raise ValueError(
+                            f"Clip {segment['index']} failed pre-render prompt quality after "
+                            f"{quality_attempt} automatic repair(s): {messages}")
+                    if quality_attempt >= MAX_AUTOMATIC_REPAIRS:
+                        # The materialised project is the locked, already
+                        # preflighted scene contract.  If the local model keeps
+                        # inventing a second camera or changing staging after
+                        # two repairs, use that safe base plan rather than
+                        # pausing an otherwise runnable episode.  Advisory
+                        # warnings (for example dense action) remain visible.
+                        fallback = normalise_structured_dialogue_directions(
+                            copy.deepcopy(planning_project))
+                        fallback = silence_unstructured_speech_directions(
+                            fallback, planning_project)
+                        fallback_quality = review_generated_plan(
+                            production, segment, planning_project, fallback)
+                        if fallback_quality['status'] == 'failed':
+                            messages = ' '.join(
+                                row['message'] for row in plan_quality['issues']
+                                if row.get('severity') == 'error')
+                            raise ValueError(
+                                f"Clip {segment['index']} failed pre-render prompt quality after "
+                                f"{quality_attempt} automatic repair(s): {messages}")
+                        candidate = fallback
+                        plan_quality = with_repair_history(fallback_quality, failures)
+                        last_prompt_quality = plan_quality
+                    else:
+                        repair = repair_request(plan_quality)
+                        continue
+                candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
+                prompt_quality = review_compiled_prompt(
+                    production, segment, candidate, compiled['prompt'],
+                    attempts=len(failures), repairs=[])
+                prompt_quality = with_repair_history(prompt_quality, failures)
+                last_prompt_quality = prompt_quality
+                if prompt_quality['status'] == 'failed':
+                    messages = ' '.join(
+                        row['message'] for row in prompt_quality['issues']
+                        if row.get('severity') == 'error')
+                    raise ValueError(
+                        f"Clip {segment['index']} failed final H3 prompt quality: {messages}")
+                return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled,
+                        'prompt_quality': prompt_quality}
+            raise ValueError(f"Clip {segment['index']} exceeded its prompt quality repair limit.")
 
-        generated = RESOURCES.run_ai(SETTINGS['model'], generate)
+        try:
+            generated = RESOURCES.run_ai(SETTINGS['model'], generate)
+        except Exception:
+            if last_prompt_quality:
+                production_manager().set_segment_prompt_quality(
+                    production_id, segment_id, last_prompt_quality)
+            raise
         proposal, candidate, compiled = generated['proposal'], generated['candidate'], generated['compiled']
+        prompt_quality = generated['prompt_quality']
         source = 'local_ai'
     else:
-        candidate, proposal, source = project, None, 'compiled'
+        from .dialogue_audio import normalise_structured_dialogue_directions
+        from .prompt_quality import review_compiled_prompt
+        candidate = normalise_structured_dialogue_directions(project)
+        proposal, source = None, 'compiled'
         compiled = compile_project(candidate)
+        prompt_quality = review_compiled_prompt(
+            production, segment, candidate, compiled.get('prompt', '')) if compiled.get('valid') else None
     if not compiled['valid']:
         errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
         raise ValueError('\n'.join(errors) or 'This clip could not produce a valid H3 prompt.')
+    if not prompt_quality or prompt_quality['status'] != 'passed':
+        if prompt_quality:
+            production_manager().set_segment_prompt_quality(
+                production_id, segment_id, prompt_quality)
+        messages = ' '.join(
+            row.get('message', '') for row in (prompt_quality or {}).get('issues', [])
+            if row.get('severity') == 'error')
+        raise ValueError(
+            f"Clip {segment['index']} failed pre-render prompt quality. " +
+            (messages or 'Rebuild this clip prompt before generating video.'))
     seconds = time.monotonic() - started
     candidate['simple_generation'] = {
         'seconds': round(seconds, 3), 'generated_at': datetime.now(timezone.utc).isoformat(),
         'method': 'ai' if use_ai else 'manual'}
     save_project(candidate)
     production = production_manager().set_segment_prompt(
-        production_id, segment_id, compiled['prompt'], source, seconds, candidate['id'])
+        production_id, segment_id, compiled['prompt'], source, seconds, candidate['id'], prompt_quality)
     return {'production': production, 'project': candidate, 'compiled': compiled,
-            'proposal': proposal, 'seconds': round(seconds, 3)}
+            'proposal': proposal, 'prompt_quality': prompt_quality, 'seconds': round(seconds, 3)}
 
 
 @app.post('/api/productions/{production_id}/segments/{segment_id}/video')
@@ -2995,13 +3188,27 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
     if not compiled['valid']:
         errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
         raise ValueError('\n'.join(errors) or 'This clip needs a valid video prompt before generation.')
+    from .prompt_quality import review_compiled_prompt
+    prompt_quality = review_compiled_prompt(production, segment, project, compiled['prompt'])
+    if prompt_quality['status'] != 'passed':
+        production_manager().set_segment_prompt_quality(
+            production_id, segment_id, prompt_quality)
+        messages = ' '.join(
+            row.get('message', '') for row in prompt_quality['issues']
+            if row.get('severity') == 'error')
+        raise ValueError(
+            f"Clip {segment['index']} failed pre-render prompt quality. "
+            f"Regenerate this clip prompt before video: {messages}")
     production = production_manager().set_segment_prompt(
         production_id, segment_id, compiled['prompt'], segment.get('video_prompt_source') or 'compiled',
-        segment.get('prompt_seconds') or 0, project['id'])
+        segment.get('prompt_seconds') or 0, project['id'], prompt_quality)
     run = video_manager().submit(body.get('request_id'), project, compiled['prompt'], parent_run_id=parent_run_id)
     production = production_manager().set_video_run(production_id, segment_id, run['id'])
-    if production.get('auto_quality_review', True):
-        run['quality_review'] = _require_production_quality(production_id, segment_id, run['id'])
+    # All production renders now enter the same explicit manual-QC queue.
+    # Automatic per-take review made single-clip rerenders behave differently
+    # from the full-episode pipeline and could delay the initial assembly.
+    run['quality_review'] = _defer_production_quality(
+        production_id, segment_id, run['id'])
     return {'run': run, 'production': production}
 
 @app.get('/api/stories')

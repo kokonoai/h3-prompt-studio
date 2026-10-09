@@ -24,8 +24,12 @@
 .series-select-episode{display:inline-flex;align-items:center;gap:8px;color:#c1d9cb;font-size:13px;cursor:pointer}
 .series-select-episode input{width:17px;height:17px;accent-color:#b9f1d3}
 .series-episode-film{grid-template-columns:minmax(0,380px) minmax(0,1fr);align-items:stretch;padding:16px;border:1px solid #416e51;border-radius:14px;background:#0d1d14}
+.series-episode-film.is-history{border-color:#8b6a34;background:linear-gradient(145deg,#211b10,#101912)}
 .series-film-location{display:flex;flex-direction:column;justify-content:center;gap:12px;min-width:0}
 .series-film-location strong{font-size:15px;color:#d3f8e2}
+.series-episode-film.is-history .series-film-location strong{color:#ffe0a1}
+.series-film-location small{color:#86a594;font-size:12px}
+.series-film-stale{margin:0;padding:10px 12px;border:1px solid #6d542b;border-radius:9px;background:#302613;color:#eacb8e;font-size:12px;line-height:1.55}
 .series-film-location code{display:block;max-width:100%;padding:11px 12px;border:1px solid #345841;border-radius:9px;background:#0a1710;color:#afcabb;font-size:12px;overflow-wrap:anywhere;user-select:all}
 .series-film-links{display:flex;flex-wrap:wrap;align-items:center;gap:13px}
 .series-film-links a{display:inline-flex;align-items:center;gap:6px;color:#b2e9ca;text-decoration:none;font-weight:700}

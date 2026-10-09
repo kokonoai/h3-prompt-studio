@@ -151,7 +151,7 @@ def _object_notes(shot, names):
     return ' '.join(text)
 
 
-def _voice_and_dialogue(project, shots, names, speaker_ids):
+def _voice_and_dialogue(project, shots, names, speaker_ids, soundscape=""):
     voice = project.get('narrative_voice')
     if not isinstance(voice, dict):
         voice = {}
@@ -206,7 +206,7 @@ def _voice_and_dialogue(project, shots, names, speaker_ids):
                 lines.append(names[sid] + "'s visible lips remain closed during the voiceover.")
     if not audible:
         lines.append('No scripted speech is assigned to this clip.')
-    lines.append(audible_speech_lock(shots, names))
+    lines.append(audible_speech_lock(shots, names, soundscape))
     return '\n\n'.join(lines)
 
 
@@ -281,7 +281,8 @@ def render_narrative_prompt(*, project, references, active, bound,
     return '\n\n'.join((
         'asset_roles:\n' + _asset_roles(references, active, bound, project),
         'visual_style_and_continuity:\n' + '\n\n'.join(part for part in visual if part),
-        'dialogue_and_audio:\n' + _voice_and_dialogue(project, shots, subject_names, speaker_ids),
+        'dialogue_and_audio:\n' + _voice_and_dialogue(
+            project, shots, subject_names, speaker_ids, soundscape),
         'overall_soundscape:\n' + sound,
         'non_diegetic_music:\n' + (_text(music) or 'N/A'),
         'stability_constraints:\n' + stability,

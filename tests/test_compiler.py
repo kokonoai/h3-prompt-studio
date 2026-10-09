@@ -226,8 +226,9 @@ def test_all_prompt_versions_lock_short_dialogue_and_unused_time(prompt_version)
     assert "Do not fill unused clip duration with new voices" in text
     assert "After the final scripted line, only the explicitly requested non-speech ambience is audible" in text
     assert text.rstrip().endswith(
-        "all mouths remain closed and only the requested non-vocal ambience or effects continue."
+        "only the requested ambience or effects continue."
     )
+    assert "AUTHORIZED NONVERBAL VOCAL EVENTS: none" in text
     assert "Spoken-utterance count is exactly 1 utterance total (cue 1=Visitor)" in text
     assert "Perform each existing tagged dialogue cue exactly once" in text
     assert "sound-effect labels are silent metadata" in text
@@ -244,6 +245,19 @@ def test_prompt_versions_lock_silent_clips(prompt_version):
     assert result["valid"], result["issues"]
     assert "No audible dialogue, narration, singing" in result["prompt"]
     assert "Spoken-utterance count is exactly zero" in result["prompt"]
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_prompt_versions_allow_only_named_authored_wordless_reaction(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    p["shots"][0]["action"] = "Visitor releases one brief sigh and lowers the note."
+
+    text = compile_project(p)["prompt"]
+
+    assert "Visitor=one brief wordless sigh" in text
+    assert "contains no words or lyrics" in text
+    assert "Spoken-utterance count is exactly zero" in text
 
 
 def test_final_audio_override_preserves_two_cues_once_and_orders_speakers():

@@ -2,7 +2,9 @@ import pytest
 import importlib
 import shutil
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend.series import SeriesManager
@@ -91,6 +93,51 @@ def test_one_ready_episode_can_be_assembled_before_the_whole_script(tmp_path, mo
     assert first.is_file() and first.read_bytes() == b"joined-episode"
     with pytest.raises(ValueError, match="Every episode"):
         module.build_series_film(series["id"])
+
+
+def test_series_keeps_latest_episode_film_visible_after_sources_change(tmp_path, monkeypatch):
+    module = importlib.import_module("backend.app")
+    production_id = "22222222-2222-4222-8222-222222222222"
+    manager = SeriesManager(tmp_path, lambda ident: {"id": ident, "title": "Part"})
+    series = manager.create({"title": "Retained results", "episode_count": 1})
+    episodes = series["episodes"]
+    episodes[0]["production_ids"] = [production_id]
+    manager.update(series["id"], {"episodes": episodes})
+    monkeypatch.setattr(module, "DATA", tmp_path)
+    monkeypatch.setattr(module, "series_manager", lambda: manager)
+    monkeypatch.setattr(module, "production_manager", lambda: SimpleNamespace(
+        get=lambda ident: {"id": ident, "title": "Part"}))
+    monkeypatch.setattr(module, "production_outputs", lambda _ident: {
+        "ready_count": 1, "segment_count": 1, "all_ready": True,
+        "final_ready": True, "signature": "current-part-signature",
+        "final_url": "/part.mp4", "active_jobs": 0, "uncertain_jobs": 0})
+
+    retained_signature = "a" * 20
+    retained = (tmp_path / "series_films" / series["id"] / "episodes" /
+                f"episode-01-{retained_signature}" / "episode-01.mp4")
+    retained.parent.mkdir(parents=True)
+    retained.write_bytes(b"retained-episode")
+
+    overview = module.series_outputs(series["id"])
+    episode = overview["episodes"][0]
+    assert episode["film_ready"] and not episode["film_current"]
+    assert episode["film_signature"] == retained_signature
+    assert episode["file_path"] == str(retained.resolve())
+    assert f"signature={retained_signature}" in episode["film_url"]
+    response = module.series_episode_film_get(series["id"], 1, retained_signature)
+    assert Path(response.path).resolve() == retained.resolve()
+    with pytest.raises(HTTPException) as exc:
+        module.series_episode_film_get(series["id"], 1, "b" * 20)
+    assert "Refresh Script management" in exc.value.detail
+
+    current = (module._series_episode_folder(series["id"], 1, episode["signature"]) /
+               "episode-01.mp4")
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"current-episode")
+    refreshed = module.series_outputs(series["id"])["episodes"][0]
+    assert refreshed["film_current"]
+    assert refreshed["film_signature"] == refreshed["signature"]
+    assert refreshed["file_path"] == str(current.resolve())
 
 
 def test_episode_folder_opens_only_the_server_derived_result(tmp_path, monkeypatch):

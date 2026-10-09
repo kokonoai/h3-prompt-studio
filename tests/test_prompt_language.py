@@ -69,6 +69,32 @@ def test_localisation_separates_english_direction_from_target_dialogue():
     assert "N/A" not in client.request["content"]
 
 
+def test_mixed_language_continuity_cannot_drop_compiler_owned_safety_tail():
+    final_audio = (
+        "FINAL AUDIO OVERRIDE — HIGHEST PRIORITY: Spoken-utterance count is exactly zero. "
+        "No character may produce words or speech-like vocal sounds."
+    )
+    raw = (
+        "A safe establishing view with source note 场景。\n\n"
+        "production_render_override:\n保持原文事件顺序。\n\n" + final_audio
+    )
+    client = FakeClient({
+        "direction_segments": [
+            {"index": 0, "text": "A safe establishing view with a scene source note."},
+            {"index": 1, "text": "Preserve the original event order."},
+        ],
+        "dialogue": [],
+    })
+
+    record = localise_h3_prompt(client, "local-model", raw, "en")
+
+    assert record["prompt"].count("production_render_override:") == 1
+    assert record["prompt"].count("FINAL AUDIO OVERRIDE") == 1
+    assert record["prompt"].endswith(final_audio)
+    assert "保持原文事件顺序" not in record["prompt"]
+    assert "FINAL AUDIO OVERRIDE" not in client.request["content"]
+
+
 def test_compliant_english_delivery_uses_validated_zero_inference_fast_path():
     raw = (
         "integrated_multimodal_description: [Shot 1] A quiet room. "

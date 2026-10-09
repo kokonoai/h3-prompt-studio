@@ -823,7 +823,8 @@ def compile_project(project: dict) -> dict:
                 body = "the camera cuts to the following composition. " + body
             rendered_shots.append(f"[Shot {len(rendered_shots) + 1}] At {timestamp}, " + body)
     body = "\n".join(rendered_shots)
-    body += "\n" + audible_speech_lock(shots, {sid: name(sid) for sid in subject_map})
+    body += "\n" + audible_speech_lock(
+        shots, {sid: name(sid) for sid in subject_map}, soundscape)
     body += ("\nContinuity safeguards: no duplicate instance of a named subject, face swap, merged cast, "
              "costume or prop exchange, style change, unexplained teleportation, reversed screen direction, "
              "extra limbs, random background people, subtitles, logos or watermarks. Keep voice identity "
@@ -877,7 +878,7 @@ def compile_project(project: dict) -> dict:
         shots, {
             sid: (_text(subject_map[sid].get("name")) or name(sid))
             for sid in subject_map
-        }
+        }, soundscape
     )
     # AI planning data remains editable in the project's language.  A saved,
     # source-bound delivery prompt may replace this complete raw multilingual
