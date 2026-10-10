@@ -634,6 +634,45 @@ def timed_group_story(group):
             f"{str(group['text']).strip()}")
 
 
+def storyboard_timed_batches(groups, *, max_groups=3, max_chars=4200,
+                             max_possible_clips=6):
+    """Pack adjacent authored timing groups into bounded local-LLM calls.
+
+    Planning one ten-second block per request is very safe but makes a
+    25-30-shot screenplay spend ten minutes in serialized model calls.  Small
+    adjacent batches retain immutable per-group source IDs and can therefore
+    be validated just as strictly.  A caller may split a failed batch and
+    retry only that batch.
+    """
+    rows = list(groups or [])
+    batches, current = [], []
+    current_chars = current_capacity = 0
+    for offset, group in enumerate(rows):
+        text = timed_group_story(group)
+        capacity = max(1, int(group.get("duration") or 0) // PLANNED_MIN_SECONDS)
+        exceeds = bool(current) and (
+            len(current) >= max(1, int(max_groups))
+            or current_chars + len(text) > max(400, int(max_chars))
+            or current_capacity + capacity > max(1, int(max_possible_clips))
+        )
+        if exceeds:
+            batches.append({"start_index": offset - len(current) + 1,
+                            "groups": current})
+            current, current_chars, current_capacity = [], 0, 0
+        current.append(copy.deepcopy(group))
+        current_chars += len(text)
+        current_capacity += capacity
+    if current:
+        batches.append({"start_index": len(rows) - len(current) + 1,
+                        "groups": current})
+    return batches
+
+
+def timed_batch_story(groups):
+    """Join a bounded timing batch without dropping any authored boundary."""
+    return "\n\n".join(timed_group_story(group) for group in groups)
+
+
 def _authored_action_cue(text, character_names):
     """Remove quoted speech while retaining authored physical action."""
     names = {name.strip().casefold() for name in character_names if name.strip()}
@@ -934,6 +973,24 @@ def production_source_manifest(production, story=None):
               if timed else storyboard_planning_chunks(story))
     chunks = [source_manifest_for_text(piece, index + 1) for index, piece in enumerate(pieces)]
     return {"version": STORY_CONTRACT_VERSION, "story_hash": _hash(story), "chunks": chunks}
+
+
+def timed_batch_source_manifest(groups, start_index):
+    """Return one flattened prompt manifest with globally stable chunk IDs."""
+    start = max(1, int(start_index))
+    chunks = [
+        source_manifest_for_text(timed_group_story(group), start + offset)
+        for offset, group in enumerate(groups)
+    ]
+    return {
+        "version": STORY_CONTRACT_VERSION,
+        "source_hash": _hash(timed_batch_story(groups)),
+        "chunks": chunks,
+        "scenes": [row for chunk in chunks for row in chunk["scenes"]],
+        "paragraphs": [row for chunk in chunks for row in chunk["paragraphs"]],
+        "dialogue": [row for chunk in chunks for row in chunk["dialogue"]],
+        "events": [row for chunk in chunks for row in chunk["events"]],
+    }
 
 
 SOURCE_REF_KEYS = ("scene_ids", "paragraph_ids", "dialogue_ids", "event_ids")
@@ -3391,6 +3448,104 @@ def validate_planned_chunk_source_contract(story, chunk_index, planned):
         raise ValueError(f"Storyboard part {chunk_index} did not preserve source coverage: " +
                          "; ".join(dict.fromkeys(issues)))
     return planned
+
+
+def validate_planned_timed_batch_source_contract(groups, start_index, planned,
+                                                   language="en"):
+    """Validate and fit a multi-timecode response without weakening locks.
+
+    Each returned clip must belong to exactly one authored timing group.  The
+    global Cxx source prefixes make that ownership deterministic, so batching
+    reduces model calls without allowing the model to merge or reorder source
+    blocks.
+    """
+    groups = list(groups or [])
+    if not groups:
+        raise ValueError("Storyboard timed batch contains no source groups.")
+    start = max(1, int(start_index))
+    end = start + len(groups) - 1
+    if not isinstance(planned, list) or not planned:
+        raise ValueError(f"Storyboard timed batch {start}-{end} returned no clips.")
+    manifest = timed_batch_source_manifest(groups, start)
+    cleaned = []
+    for index, segment in enumerate(planned):
+        if not isinstance(segment, dict):
+            raise ValueError(f"Storyboard timed batch {start}-{end} contains an invalid clip.")
+        try:
+            cleaned.append(normalise_segment(segment, index))
+        except ValueError as exc:
+            raise ValueError(
+                f"Storyboard timed batch {start}-{end} has an invalid clip: {exc}") from exc
+
+    issues = []
+    expected = {
+        key: [row["id"] for chunk in manifest["chunks"]
+              for row in chunk[kind]]
+        for key, kind in (("scene_ids", "scenes"),
+                          ("paragraph_ids", "paragraphs"),
+                          ("dialogue_ids", "dialogue"),
+                          ("event_ids", "events"))
+    }
+    for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
+        actual = [ident for segment in cleaned for ident in segment["source_refs"][key]]
+        missing = [ident for ident in expected[key] if ident not in actual]
+        duplicates = list(dict.fromkeys(ident for ident in actual if actual.count(ident) > 1))
+        unknown = [ident for ident in actual if ident not in expected[key]]
+        if missing:
+            issues.append(f"missing {key}: {', '.join(missing[:20])}")
+        if duplicates:
+            issues.append(f"duplicated {key}: {', '.join(duplicates[:20])}")
+        if unknown:
+            issues.append(f"unknown {key}: {', '.join(unknown[:20])}")
+        if not missing and not duplicates and not unknown and actual != expected[key]:
+            issues.append(f"reordered {key}")
+
+    known_scenes = set(expected["scene_ids"])
+    for segment in cleaned:
+        refs = segment["source_refs"]
+        unknown_scenes = [ident for ident in refs["scene_ids"] if ident not in known_scenes]
+        if unknown_scenes:
+            issues.append("unknown scene_ids: " + ", ".join(unknown_scenes[:20]))
+        if not refs["scene_ids"] or not refs["paragraph_ids"]:
+            issues.append("a clip is not bound to an original scene and paragraph")
+        if not refs["dialogue_ids"] and not refs["event_ids"]:
+            issues.append("a clip owns neither authored dialogue nor a plot event")
+
+    owner_sets = []
+    chunk_ids = []
+    for chunk in manifest["chunks"]:
+        chunk_ids.append({row["id"] for kind in ("scenes", "paragraphs", "dialogue", "events")
+                          for row in chunk[kind]})
+    for segment in cleaned:
+        refs = segment["source_refs"]
+        all_refs = {ident for key in SOURCE_REF_KEYS for ident in refs[key]}
+        owners = {offset for offset, known in enumerate(chunk_ids) if all_refs & known}
+        if len(owners) != 1:
+            issues.append("a clip merged or lost authored timing-group bindings")
+            owner_sets.append(None)
+        else:
+            owner_sets.append(next(iter(owners)))
+    concrete = [owner for owner in owner_sets if owner is not None]
+    if concrete != sorted(concrete):
+        issues.append("reordered authored timing groups")
+    for offset in range(len(groups)):
+        if offset not in concrete:
+            issues.append(f"missing authored timing group {start + offset}")
+    if issues:
+        raise ValueError(
+            f"Storyboard timed batch {start}-{end} did not preserve source coverage: " +
+            "; ".join(dict.fromkeys(issues)))
+
+    result = []
+    for offset, group in enumerate(groups):
+        children = [segment for segment, owner in zip(cleaned, owner_sets) if owner == offset]
+        fitted = fit_planned_durations(
+            children, group["duration"], language, timed_group_story(group))
+        for child in fitted:
+            child["_source_chunk"] = start + offset
+            child["_source_timed_group"] = start + offset
+        result.extend(fitted)
+    return result
 
 
 def audit_storyboard_contract(production, *, backfill_legacy=True):
@@ -6597,11 +6752,13 @@ def planning_card_catalog(production):
 
 
 def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previous_ending="",
-                     previous_contract=None):
+                     previous_contract=None, source_manifest_override=None):
     source_story = story or production["brief"]
     timing = episode_timing_targets(production, chunk_index, chunk_total, source_story)
     locked_dialogue = locked_timed_dialogue(production, source_story)
-    source_manifest = source_manifest_for_text(source_story, chunk_index)
+    source_manifest = (copy.deepcopy(source_manifest_override)
+                       if isinstance(source_manifest_override, dict)
+                       else source_manifest_for_text(source_story, chunk_index))
     return json.dumps({
         "title": production["title"], "story_or_script": source_story,
         "project_output_language": PRODUCTION_LANGUAGES[production["language"]],

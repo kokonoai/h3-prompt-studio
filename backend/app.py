@@ -1054,9 +1054,12 @@ def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
+                              storyboard_timed_batches, timed_batch_source_manifest,
+                              timed_batch_story,
                               storyboard_output_token_budget,
                               timed_clip_groups, timed_group_story,
-                              validate_planned_chunk_source_contract)
+                              validate_planned_chunk_source_contract,
+                              validate_planned_timed_batch_source_contract)
     started = time.monotonic()
     production = production_manager().assert_active(production_id)
     story = current_episode_story(production)
@@ -1070,26 +1073,122 @@ def production_plan(production_id: str, body: dict):
     if use_ai:
         try:
             def generate(model):
-                # Explicit source timecodes are clip-boundary authority. Plan
-                # each merged 5-15 second group independently so a local model
-                # cannot pull dialogue or action across an authored boundary.
                 source_groups = timed_clip_groups(story)
-                pieces = ([timed_group_story(group) for group in source_groups]
-                          if source_groups else storyboard_planning_chunks(story))
                 segments, previous_ending, previous_contract = [], '', {}
+
+                def remember_handoff(new_segments):
+                    nonlocal previous_ending, previous_contract
+                    if not new_segments:
+                        return
+                    last = new_segments[-1]
+                    previous_ending = last['ending']
+                    previous_contract = {
+                        'ending_state': last.get('continuity_state', {}).get('ending_state', last.get('ending', '')),
+                        'cast_timeline': last.get('cast_timeline', {}),
+                        'positions_end': last.get('continuity_state', {}).get('positions_end', []),
+                        'prop_holders_end': last.get('continuity_state', {}).get('prop_holders_end', []),
+                        'ending_composition': last.get('shot_contract', {}).get('ending_composition', ''),
+                        'shot_size': last.get('shot_contract', {}).get('shot_size', ''),
+                        'camera_axis': last.get('shot_contract', {}).get('camera_axis', ''),
+                    }
+
+                if source_groups:
+                    # Adjacent explicit timecode blocks share one bounded LLM
+                    # request. Their source IDs remain globally distinct, so
+                    # the validator can prove that no story/dialogue moved
+                    # across a boundary. A batch which overflows or keeps
+                    # violating coverage is split in half automatically.
+                    batches = storyboard_timed_batches(source_groups)
+                    batch_index = 0
+                    while batch_index < len(batches):
+                        batch = batches[batch_index]
+                        batch_groups = batch['groups']
+                        start_group = batch['start_index']
+                        end_group = start_group + len(batch_groups) - 1
+                        piece = timed_batch_story(batch_groups)
+                        RESOURCES.stage = (
+                            f'Planning story groups {start_group}-{end_group} '
+                            f'({batch_index + 1} of {len(batches)} batches)')
+                        manifest = timed_batch_source_manifest(batch_groups, start_group)
+                        payload = planning_payload(
+                            production, piece, batch_index + 1, len(batches),
+                            previous_ending, previous_contract,
+                            source_manifest_override=manifest)
+                        timing = episode_timing_targets(
+                            production, batch_index + 1, len(batches), piece)
+                        feasible = timing.get('feasible_clip_count') or {}
+                        clip_count = max(
+                            1, int(timing.get('recommended_clip_count') or 1),
+                            int(feasible.get('maximum') or 1))
+                        output_budget = storyboard_output_token_budget(clip_count)
+                        coverage_error = None
+                        try:
+                            attempt_limit = 1 if len(batch_groups) > 1 else 2
+                            for attempt in range(attempt_limit):
+                                request = payload
+                                if attempt:
+                                    retry = json.loads(payload)
+                                    retry['validation_retry'] = (
+                                        'The previous response violated the storyboard schema or source-coverage contract. '
+                                        'Return a fresh complete plan. Keep every source_manifest chunk separate and in order. '
+                                        'Assign every paragraph, dialogue and event ID exactly once. Never merge two authored '
+                                        'timecode groups into one clip. Keep story to at most two concise sentences, setting '
+                                        'to one sentence, action to at most three sentences and ending to one sentence. '
+                                        'Exact authored dialogue stays only in the structured dialogue list. Diagnostic: ' +
+                                        str(coverage_error)[:1200])
+                                    request = json.dumps(retry, ensure_ascii=False, indent=2)
+                                    RESOURCES.stage = (
+                                        f'Retrying source coverage for story groups '
+                                        f'{start_group}-{end_group}')
+                                answer = client().complete_json(
+                                    model, PLANNER_SYSTEM, request,
+                                    production_schema_for_story(piece),
+                                    max_tokens=output_budget,
+                                    temperature=0.12 if attempt else 0.25)
+                                try:
+                                    new_segments = validate_planned_timed_batch_source_contract(
+                                        batch_groups, start_group, answer['segments'],
+                                        production['language'])
+                                    break
+                                except ValueError as exc:
+                                    coverage_error = exc
+                                    if attempt + 1 >= attempt_limit:
+                                        raise
+                        except Exception as exc:
+                            split_worthy = (
+                                isinstance(exc, ValueError)
+                                or (isinstance(exc, LMStudioError) and exc.code in {
+                                    'response_truncated', 'response_incomplete',
+                                    'invalid_model_output', 'invalid_response'}))
+                            if len(batch_groups) <= 1 or not split_worthy:
+                                raise
+                            midpoint = len(batch_groups) // 2
+                            left = batch_groups[:midpoint]
+                            right = batch_groups[midpoint:]
+                            batches[batch_index:batch_index + 1] = [
+                                {'start_index': start_group, 'groups': left},
+                                {'start_index': start_group + len(left), 'groups': right},
+                            ]
+                            RESOURCES.stage = (
+                                f'Story groups {start_group}-{end_group} were too dense; '
+                                'retrying as smaller verified batches')
+                            continue
+                        segments.extend(new_segments)
+                        if len(segments) > 64:
+                            raise ValueError(
+                                'This story needs more than 64 H3 clips. Split it into episodes before planning.')
+                        remember_handoff(new_segments)
+                        batch_index += 1
+                    return segments
+
+                pieces = storyboard_planning_chunks(story)
                 for index, piece in enumerate(pieces):
                     RESOURCES.stage = f'Planning story part {index + 1} of {len(pieces)}'
-                    payload = planning_payload(production, piece, index + 1, len(pieces), previous_ending,
-                                               previous_contract)
+                    payload = planning_payload(
+                        production, piece, index + 1, len(pieces),
+                        previous_ending, previous_contract)
                     timing = episode_timing_targets(production, index + 1, len(pieces), piece)
-                    # Each segment carries source, cast, continuity and edit
-                    # contracts. Scale within the local client's real 4,096
-                    # output-token ceiling, then verify and retry this source
-                    # part before moving on to the next one.
                     feasible = timing.get('feasible_clip_count') or {}
-                    # Reserve for the largest valid split of this source part,
-                    # not only the nominal ten-second recommendation. Dense
-                    # story text may legitimately need the second clip.
                     clip_count = max(
                         1, int(timing.get('recommended_clip_count') or 1),
                         int(feasible.get('maximum') or 1))
@@ -1113,46 +1212,21 @@ def production_plan(production_id: str, body: dict):
                             model, PLANNER_SYSTEM, request,
                             production_schema_for_story(piece), max_tokens=output_budget,
                             temperature=0.12 if attempt else 0.25)
-                        new_segments = answer['segments']
                         try:
                             new_segments = validate_planned_chunk_source_contract(
-                                piece, index + 1, new_segments)
+                                piece, index + 1, answer['segments'])
                             break
                         except ValueError as exc:
                             coverage_error = exc
                             if attempt:
                                 raise
-                    # Keep an immutable source-part binding outside model prose.
-                    # apply_plan uses it to prove paragraph/dialogue/event
-                    # coverage and to reject cross-part reordering.
                     for segment in new_segments:
                         segment['_source_chunk'] = index + 1
-                    if source_groups:
-                        # Fit and tag each authored block before joining the
-                        # whole episode.  The tag is internal and is discarded
-                        # by normalise_segment after dialogue restoration.
-                        new_segments = fit_planned_durations(
-                            new_segments, source_groups[index]['duration'],
-                            production['language'], piece)
-                        for segment in new_segments:
-                            segment['_source_timed_group'] = index + 1
                     segments.extend(new_segments)
                     if len(segments) > 64:
-                        raise ValueError('This story needs more than 64 H3 clips. Split it into episodes before planning.')
-                    previous_ending = segments[-1]['ending'] if segments else previous_ending
-                    if segments:
-                        last = segments[-1]
-                        previous_contract = {
-                            'ending_state': last.get('continuity_state', {}).get('ending_state', last.get('ending', '')),
-                            'cast_timeline': last.get('cast_timeline', {}),
-                            'positions_end': last.get('continuity_state', {}).get('positions_end', []),
-                            'prop_holders_end': last.get('continuity_state', {}).get('prop_holders_end', []),
-                            'ending_composition': last.get('shot_contract', {}).get('ending_composition', ''),
-                            'shot_size': last.get('shot_contract', {}).get('shot_size', ''),
-                            'camera_axis': last.get('shot_contract', {}).get('camera_axis', ''),
-                        }
-                if source_groups:
-                    return segments
+                        raise ValueError(
+                            'This story needs more than 64 H3 clips. Split it into episodes before planning.')
+                    remember_handoff(new_segments)
                 target = episode_timing_targets(production, story=story)['episode_target_seconds']
                 return fit_planned_durations(segments, target, production['language'], story)
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)

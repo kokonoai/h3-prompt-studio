@@ -23,9 +23,12 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
                                  split_truncated_card_chunk,
+                                 storyboard_timed_batches, timed_batch_source_manifest,
+                                 timed_batch_story,
                                  storyboard_output_token_budget,
                                  timed_clip_groups, timed_group_story, timed_story_beats,
-                                 validate_planned_chunk_source_contract)
+                                 validate_planned_chunk_source_contract,
+                                 validate_planned_timed_batch_source_contract)
 from backend.projects import merge_plan, new_project, shot
 from backend.video_workflows import VideoWorkflowManager
 
@@ -847,6 +850,71 @@ def test_storyboard_planning_chunks_keep_long_local_answers_bounded():
     assert len(pieces) >= 5
     assert max(map(len, pieces)) <= 2000
     assert "".join(pieces).replace("\n", "") == story.replace("\n", "")
+
+
+def test_timed_storyboard_batches_reduce_serial_calls_without_losing_order():
+    def stamp(seconds):
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    screenplay = "\n\n".join(
+        f"{stamp(index * 10)}-{stamp((index + 1) * 10)}\n"
+        f"Character completes beat {index + 1}."
+        for index in range(6)
+    )
+    groups = timed_clip_groups(screenplay)
+
+    batches = storyboard_timed_batches(groups)
+
+    assert len(groups) == 6
+    assert [row["start_index"] for row in batches] == [1, 4]
+    assert [len(row["groups"]) for row in batches] == [3, 3]
+    assert timed_batch_story(batches[0]["groups"]).count("-") == 3
+
+
+def test_timed_batch_contract_keeps_global_source_ids_and_group_durations():
+    screenplay = """0:00-0:10
+A opens the door.
+
+0:10-0:20
+B crosses the room.
+
+0:20-0:30
+C closes the window."""
+    groups = timed_clip_groups(screenplay)
+    manifest = timed_batch_source_manifest(groups, 5)
+    planned = []
+    for offset, chunk in enumerate(manifest["chunks"]):
+        clip = _planned_clip(f"Beat {offset + 1}", [], {
+            key: [] for key in
+            ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
+        })
+        clip["duration"] = 10
+        clip["source_refs"] = {
+            "scene_ids": [row["id"] for row in chunk["scenes"]],
+            "paragraph_ids": [row["id"] for row in chunk["paragraphs"]],
+            "dialogue_ids": [row["id"] for row in chunk["dialogue"]],
+            "event_ids": [row["id"] for row in chunk["events"]],
+        }
+        planned.append(clip)
+
+    checked = validate_planned_timed_batch_source_contract(groups, 5, planned, "en")
+
+    assert [row["_source_timed_group"] for row in checked] == [5, 6, 7]
+    assert [row["duration"] for row in checked] == [10, 10, 10]
+    assert checked[1]["source_refs"]["paragraph_ids"][0].startswith("C06-")
+
+    merged = copy.deepcopy(planned)
+    for key in ("scene_ids", "paragraph_ids", "dialogue_ids", "event_ids"):
+        merged[0]["source_refs"][key].extend(merged[1]["source_refs"][key])
+    merged.pop(1)
+    with pytest.raises(ValueError, match="merged or lost authored timing-group bindings"):
+        validate_planned_timed_batch_source_contract(groups, 5, merged, "en")
+
+    unbound = copy.deepcopy(planned)
+    unbound[0]["source_refs"]["paragraph_ids"] = []
+    unbound[0]["source_refs"]["event_ids"] = []
+    with pytest.raises(ValueError, match="not bound to an original scene and paragraph"):
+        validate_planned_timed_batch_source_contract(groups, 5, unbound, "en")
 
 
 def test_storyboard_output_budget_never_exceeds_local_client_limit():
