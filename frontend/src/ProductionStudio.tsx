@@ -212,6 +212,15 @@ export const timeoutRecoveryKind=(
   return "idle";
 };
 
+export type FullRunPreparationStep="cards"|"episodes"|"storyboard";
+export const fullRunPreparationComplete=(step:FullRunPreparationStep,value:Pick<Production,
+  "card_plan_source_hash"|"card_planner_warning"|"episodes"|"segments">|null|undefined)=>{
+  if(!value)return false;
+  if(step==="cards")return !!value.card_plan_source_hash||!!value.card_planner_warning;
+  if(step==="episodes")return value.episodes.length>0;
+  return value.segments.length>0;
+};
+
 const blank = (project:Project) => ({
   // A new episode/part is deliberately empty. The current Scene Studio
   // project is still the technical render source, but its creative content
@@ -1336,9 +1345,12 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     }catch{return null;}
   };
   const monitorTimedOutRequest=async(id=production?.id)=>{
-    if(!id)return {kind:"idle" as TimeoutRecoveryKind,snapshot:null,error:""};
+    if(!id)return {kind:"idle" as TimeoutRecoveryKind,snapshot:null,error:"",confirmed:false};
     let failedChecks=0;
-    for(let attempt=0;attempt<200;attempt++){
+    // Local planning can legitimately outlive the browser request by many
+    // minutes. Keep reconciling long enough for the largest observed local
+    // plans, while continuing to expose the server's live stage to the user.
+    for(let attempt=0;attempt<600;attempt++){
       const snapshot=await reconcileAfterTimeout(id);
       let connection:{busy?:boolean;stage?:string;error?:string|null}|null=null;
       try{
@@ -1346,11 +1358,11 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         failedChecks=0;
       }catch{failedChecks+=1;}
       const kind=timeoutRecoveryKind(connection,snapshot?.overview);
-      if(kind==="automation"||kind==="video"||kind==="quality")return {kind,snapshot,error:""};
+      if(kind==="automation"||kind==="video"||kind==="quality")return {kind,snapshot,error:"",confirmed:true};
       if(kind==="idle"){
         if(connection||failedChecks>=4){
           await refreshList().catch(()=>{});
-          return {kind,snapshot,error:connection?.stage==="needs attention"?connection.error||"":""};
+          return {kind,snapshot,error:connection?.stage==="needs attention"?connection.error||"":"",confirmed:!!connection};
         }
       }else{
         setBusy(t(
@@ -1362,7 +1374,48 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       }
       await sleep(3000);
     }
-    return {kind:"idle" as TimeoutRecoveryKind,snapshot:await reconcileAfterTimeout(id),error:""};
+    return {kind:"idle" as TimeoutRecoveryKind,snapshot:await reconcileAfterTimeout(id),error:"",confirmed:false};
+  };
+  const runFullPreparationStep=async(
+    step:FullRunPreparationStep,id:string,request:()=>Promise<Production>,
+  )=>{
+    try{return await request();}
+    catch(error){
+      if(!(error instanceof ApiTimeoutError))throw error;
+      setBusy(t(
+        "前端等待超时，服务器仍在处理；完成后将自动继续下一步…",
+        "The browser wait timed out; the server is still working and the next step will resume automatically…",
+        "画面の待機はタイムアウトしました。サーバー完了後に次の工程を自動再開します…",
+        "前端等待逾時，伺服器仍在處理；完成後將自動繼續下一步…"
+      ));
+      const recovered=await monitorTimedOutRequest(id);
+      if(recovered.error)throw new Error(recovered.error);
+      let settled=recovered.snapshot;
+      // The shared AI lock is released just before the endpoint performs its
+      // final atomic project save. If the idle check lands in that tiny gap,
+      // poll the saved project briefly instead of declaring the completed
+      // request missing or submitting it a second time.
+      if(recovered.confirmed&&recovered.kind==="idle"){
+        for(let attempt=0;attempt<20&&!fullRunPreparationComplete(step,settled?.production);attempt++){
+          await sleep(500);
+          settled=await reconcileAfterTimeout(id)||settled;
+        }
+      }
+      const refreshed=settled?.production;
+      if(recovered.confirmed&&recovered.kind==="idle"&&refreshed&&
+          fullRunPreparationComplete(step,refreshed)){
+        setProduction(refreshed);setDraft(refreshed);
+        if(settled?.overview)setOutputs(settled.overview);
+        setNotice(t(
+          "超时步骤已由服务器完成，一键流程正在自动继续。",
+          "The timed-out server step completed; the one-click run is continuing automatically.",
+          "タイムアウトした工程がサーバーで完了し、一括処理を自動継続しています。",
+          "逾時步驟已由伺服器完成，一鍵流程正在自動繼續。"
+        ));
+        return refreshed;
+      }
+      throw new Error(timeoutMessage());
+    }
   };
   const run=async(label:string,fn:()=>Promise<void>)=>{
     if(busyRef.current)return;busyRef.current=true;setBusy(label);setError("");setNotice("");
@@ -2113,19 +2166,22 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         if(current.task_state==="paused")throw new Error(t("当前任务已暂停，请先恢复后再运行全流程。","This task is paused. Resume it before starting the full run.","このタスクは一時停止中です。再開してから全工程を実行してください。","目前任務已暫停，請先恢復後再執行全流程。"));
 
         setBusy(t("全流程 · 第 2/6 步：补全文字卡","Full run · Step 2/6: complete text cards","全工程・ステップ2/6：文章カードを補完","全流程 · 第 2/6 步：補全文字卡"));
-        current=await api("/productions/"+current.id+"/cards/plan",{force:false},undefined,"POST",{timeoutMs:900000}) as Production;
+        current=await runFullPreparationStep("cards",current.id,()=>
+          api("/productions/"+current.id+"/cards/plan",{force:false},undefined,"POST",{timeoutMs:900000}) as Promise<Production>);
         setProduction(current);setDraft(current);
         stopIfPauseRequested();
 
         if(!current.episodes.length){
           setBusy(t("全流程 · 第 3/6 步：规划剧集","Full run · Step 3/6: plan episode","全工程・ステップ3/6：エピソード計画","全流程 · 第 3/6 步：規劃劇集"));
-          current=await api("/productions/"+current.id+"/episodes/plan",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as Production;
+          current=await runFullPreparationStep("episodes",current.id,()=>
+            api("/productions/"+current.id+"/episodes/plan",{use_ai:true},undefined,"POST",{timeoutMs:900000}) as Promise<Production>);
           setProduction(current);setDraft(current);setOpenEpisodeId(current.episodes[0]?.id||null);
           stopIfPauseRequested();
         }
         if(!current.segments.length){
           setBusy(t("全流程 · 第 3/6 步：拆分当前集分镜","Full run · Step 3/6: plan current episode clips","全工程・ステップ3/6：現在話をクリップ化","全流程 · 第 3/6 步：拆分目前集分鏡"));
-          current=await api("/productions/"+current.id+"/plan",{use_ai:true},undefined,"POST",{timeoutMs:480000}) as Production;
+          current=await runFullPreparationStep("storyboard",current.id,()=>
+            api("/productions/"+current.id+"/plan",{use_ai:true},undefined,"POST",{timeoutMs:480000}) as Promise<Production>);
           setProduction(current);setDraft(current);setKeyframeSuggestions([]);
           stopIfPauseRequested();
         }

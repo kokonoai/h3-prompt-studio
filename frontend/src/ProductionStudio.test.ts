@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { fullRunPreparationComplete, productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -42,6 +42,18 @@ describe("episode batch production",()=>{
     expect(timeoutRecoveryKind({busy:false},{automation:{status:"idle"},active_jobs:1} as any)).toBe("video");
     expect(timeoutRecoveryKind({busy:false},{automation:{status:"idle"},active_jobs:0,quality_batch:{status:"running"}} as any)).toBe("quality");
     expect(timeoutRecoveryKind({busy:false},{automation:{status:"completed"},active_jobs:0} as any)).toBe("idle");
+  });
+
+  it("resumes a full run only after the timed-out preparation step was saved",()=>{
+    const empty:any={card_plan_source_hash:"",card_planner_warning:"",episodes:[],segments:[]};
+    expect(fullRunPreparationComplete("storyboard",null)).toBe(false);
+    expect(fullRunPreparationComplete("cards",empty)).toBe(false);
+    expect(fullRunPreparationComplete("cards",{...empty,card_plan_source_hash:"current-hash"})).toBe(true);
+    expect(fullRunPreparationComplete("cards",{...empty,card_planner_warning:"Cards preserved"})).toBe(true);
+    expect(fullRunPreparationComplete("episodes",empty)).toBe(false);
+    expect(fullRunPreparationComplete("episodes",{...empty,episodes:[{id:"episode-1"}]})).toBe(true);
+    expect(fullRunPreparationComplete("storyboard",empty)).toBe(false);
+    expect(fullRunPreparationComplete("storyboard",{...empty,segments:[{id:"clip-1"}]})).toBe(true);
   });
 
   it("targets only checked clips and keeps storyboard order",()=>{
