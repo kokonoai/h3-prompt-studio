@@ -19,7 +19,8 @@ def wait_for(predicate, timeout=2.0):
 
 
 def fake_manager(*, submit_failures=None, initial_status="idle", quality_result=None,
-                 rejected_take=False):
+                 rejected_take=False, prompt_failures=None,
+                 fallback_prompt=False):
     state = {
         "id": "production-1", "task_state": "active",
         "segments": [{"id": "segment-1", "index": 1,
@@ -35,6 +36,7 @@ def fake_manager(*, submit_failures=None, initial_status="idle", quality_result=
     submitted_ids = []
     merged = []
     failures = list(submit_failures or [])
+    planning_failures = list(prompt_failures or [])
 
     def get_production(_ident):
         return copy.deepcopy(state)
@@ -56,7 +58,14 @@ def fake_manager(*, submit_failures=None, initial_status="idle", quality_result=
                               "candidates": []}], "all_ready": bool(selected)}
 
     def generate_prompt(_production_id, _segment_id):
+        if planning_failures:
+            raise RuntimeError(planning_failures.pop(0))
         state["segments"][0].update(status="ready", stale_reasons=[], video_prompt="current")
+
+    def generate_fallback_prompt(_production_id, _segment_id):
+        state["segments"][0].update(
+            status="ready", stale_reasons=[], video_prompt="locked compiled fallback",
+            prompt_quality={"status": "passed"})
 
     def submit_video(_production_id, _segment_id, request_id):
         submitted_ids.append(request_id)
@@ -74,6 +83,7 @@ def fake_manager(*, submit_failures=None, initial_status="idle", quality_result=
         outputs=outputs, generate_prompt=generate_prompt, submit_video=submit_video,
         get_run=get_run, resolve_run=lambda _run_id: get_run(_run_id),
         build_film=lambda ident: merged.append(ident), poll_interval=0,
+        generate_fallback_prompt=(generate_fallback_prompt if fallback_prompt else None),
         review_quality=(lambda _ident: copy.deepcopy(quality_result))
         if quality_result is not None else None,
         retry_delays=(0, 0, 0),
@@ -157,6 +167,24 @@ def test_failure_classification_is_narrow_and_safe():
         "exactly one final audio override.")
     assert not is_global_failure("Clip 7 failed shot preflight: split this internal cut")
     assert not is_global_failure("The model response was truncated; shorten the request")
+
+
+def test_local_prompt_quality_failure_uses_locked_fallback_and_finishes():
+    manager, state, submitted_ids, merged = fake_manager(
+        prompt_failures=[
+            "Clip 1 failed pre-render prompt quality after 2 automatic repair(s): "
+            "The generated prompt names 2 distinct camera views in one render."
+        ] * 2,
+        fallback_prompt=True,
+    )
+
+    manager.start(state["id"])
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    assert state["segments"][0]["video_prompt"] == "locked compiled fallback"
+    assert state["automation"].get("blocked_segments", []) == []
+    assert len(submitted_ids) == 1
+    assert merged == [state["id"]]
 
 
 def test_explicit_resume_retries_previous_isolated_clip():
@@ -394,7 +422,7 @@ def test_clip_local_prompt_failure_is_isolated_while_other_clips_finish():
     assert rendered == {"segment-2"}
     assert merged == []
     assert [row["segment_id"] for row in state["automation"]["blocked_segments"]] == ["segment-1"]
-    assert "Finished every independent clip" in state["automation"]["last_error"]
+    assert "remain unfinished" in state["automation"]["last_error"]
 
 
 def test_global_dependency_failure_still_pauses_episode_immediately():

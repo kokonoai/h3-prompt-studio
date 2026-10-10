@@ -752,6 +752,8 @@ def production_automation_manager():
                 outputs=lambda ident: production_outputs(ident),
                 generate_prompt=lambda production_id, segment_id: production_segment_prompt(
                     production_id, segment_id, {'use_ai': True, '_automation': True}),
+                generate_fallback_prompt=lambda production_id, segment_id: production_segment_prompt(
+                    production_id, segment_id, {'use_ai': False, '_automation': True}),
                 submit_video=lambda production_id, segment_id, request_id: production_segment_video(
                     production_id, segment_id,
                     {'request_id': request_id, 'new_seed': True, '_automation': True}),
@@ -2970,7 +2972,10 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     segment = next((item for item in production['segments'] if item['id'] == safe_id(segment_id)), None)
     if not segment:
         raise ValueError('Production clip not found.')
-    materialised = production_manager().materialise(production_id, segment_id)
+    materialised = production_manager().materialise(
+        production_id, segment_id,
+        allow_render_advisories=not use_ai,
+    )
     project = materialised['project']
     started = time.monotonic()
     if use_ai:
@@ -3099,9 +3104,15 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
         prompt_quality = generated['prompt_quality']
         source = 'local_ai'
     else:
-        from .dialogue_audio import normalise_structured_dialogue_directions
+        from .dialogue_audio import (normalise_structured_dialogue_directions,
+                                     silence_unstructured_speech_directions)
         from .prompt_quality import review_compiled_prompt
         candidate = normalise_structured_dialogue_directions(project)
+        # The deterministic fallback is the final completion path when local
+        # AI cannot produce a prettier plan that passes advisory preflight.
+        # Keep every locked story/dialogue fact, but normalise unsafe prose so
+        # the compiled prompt remains submit-able without another model call.
+        candidate = silence_unstructured_speech_directions(candidate, project)
         proposal, source = None, 'compiled'
         compiled = compile_project(candidate)
         prompt_quality = review_compiled_prompt(

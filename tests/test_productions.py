@@ -2955,6 +2955,18 @@ def test_shot_preflight_unifies_dialogue_camera_and_internal_cut_failures(tmp_pa
     assert dense["suggested_split_count"] >= 2
     assert "Recommended split" in dense["suggestion"]
 
+    production["segments"] = [segment]
+    segment["preflight_issues"] = issues
+    with pytest.raises(ValueError, match="failed shot preflight"):
+        manager.assert_storyboard_contract_current(production, segment)
+    # The automation-only locked-script fallback may render visual-complexity
+    # defects for later human review, but it still must not bypass source
+    # coverage or dialogue-contract errors.
+    segment["preflight_issues"] = [
+        row for row in issues if row["code"] != "dialogue_overflow"]
+    assert manager.assert_storyboard_contract_current(
+        production, segment, allow_render_advisories=True)
+
 
 def test_shot_preflight_blocks_a_match_cut_hidden_inside_a_sentence():
     production = {"brief": "A remote exchange.",

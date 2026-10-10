@@ -76,7 +76,8 @@ def test_mixed_language_continuity_cannot_drop_compiler_owned_safety_tail():
     )
     raw = (
         "A safe establishing view with source note 场景。\n\n"
-        "production_render_override:\n保持原文事件顺序。\n\n" + final_audio
+        "production_render_override:\nDEVICE GEOMETRY CONTRACT V2\n"
+        "SCREEN-VIEW GEOMETRY LOCK\n保持原文事件顺序。\n\n" + final_audio
     )
     client = FakeClient({
         "direction_segments": [
@@ -89,6 +90,8 @@ def test_mixed_language_continuity_cannot_drop_compiler_owned_safety_tail():
     record = localise_h3_prompt(client, "local-model", raw, "en")
 
     assert record["prompt"].count("production_render_override:") == 1
+    assert record["prompt"].count("DEVICE GEOMETRY CONTRACT V2") == 1
+    assert record["prompt"].count("SCREEN-VIEW GEOMETRY LOCK") == 1
     assert record["prompt"].count("FINAL AUDIO OVERRIDE") == 1
     assert record["prompt"].endswith(final_audio)
     assert "保持原文事件顺序" not in record["prompt"]

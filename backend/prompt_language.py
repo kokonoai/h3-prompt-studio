@@ -31,7 +31,9 @@ _PROTECTED = re.compile(
     r"(?:subject_definitions:|summary:|retention_analysis:|detailed_description:|"
     r"integrated_multimodal_description:|asset_roles:|visual_style_and_continuity:|"
     r"dialogue_and_audio:|stability_constraints:|overall_soundscape:|non_diegetic_music:|"
-    r"production_render_override:|"
+    r"production_render_override:|DEVICE GEOMETRY CONTRACT V2|"
+    r"STATIC-DISPLAY GEOMETRY LOCK|REMOTE-CALL PANEL GEOMETRY LOCK|"
+    r"SCREEN-VIEW GEOMETRY LOCK|"
     r"<Picture\s+\d+>|<Video\s+\d+>|<Audio\s+\d+>|<Subject\s+\d+>|"
     r"\[Shot\s+\d+\]|\[Beat\s+\d+\]|@[A-Za-z][A-Za-z0-9-]*)"
 )

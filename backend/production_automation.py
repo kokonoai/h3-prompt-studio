@@ -119,13 +119,15 @@ class ProductionAutomationManager:
 
     def __init__(self, *, list_productions, get_production, update_automation,
                  outputs, generate_prompt, submit_video, get_run, resolve_run,
-                 build_film, review_quality=None, poll_interval=5.0,
+                 build_film, review_quality=None, generate_fallback_prompt=None,
+                 poll_interval=5.0,
                  retry_delays=(5.0, 15.0, 30.0)):
         self.list_productions = list_productions
         self.get_production = get_production
         self.update_automation = update_automation
         self.outputs = outputs
         self.generate_prompt = generate_prompt
+        self.generate_fallback_prompt = generate_fallback_prompt
         self.submit_video = submit_video
         self.get_run = get_run
         self.resolve_run = resolve_run
@@ -257,9 +259,9 @@ class ProductionAutomationManager:
         if len(rows) > len(labels):
             suffix += f" | +{len(rows) - len(labels)} more"
         return (
-            f"Finished every independent clip that could continue. {len(rows)} clip(s) were "
-            "isolated instead of stopping the episode. Review or edit those storyboard clips, "
-            "then resume to retry only the unresolved work: " + suffix)
+            f"Finished every clip that could be submitted. {len(rows)} clip(s) remain unfinished "
+            "because their video request could not be completed safely. Review the technical "
+            "reason, then resume to retry only the unfinished work: " + suffix)
 
     def _block_segment(self, production_id, segment, stage, message):
         """Persist one clip-local failure and let the same episode continue."""
@@ -280,7 +282,7 @@ class ProductionAutomationManager:
             current_segment_id=None, current_index=0, run_id=None,
             request_id=None, attempt=0, last_error="",
             blocked_segments=rows,
-            stage_detail=f"Isolated clip {segment.get('index')}; continuing remaining clips",
+            stage_detail=f"Clip {segment.get('index')} could not be submitted; continuing remaining clips",
         )
         return rows
 
@@ -335,6 +337,33 @@ class ProductionAutomationManager:
             or quality.get("status") == "failed"
         )
 
+    def _prepare_fallback_prompt(self, production_id, segment, reason):
+        """Compile the locked scene without AI when advisory planning fails.
+
+        The author explicitly reviews image quality after the initial cut. A
+        local model failing to simplify camera prose must therefore not stop
+        or quarantine the episode when the deterministic source contract can
+        still produce a valid H3 prompt.
+        """
+        if self.generate_fallback_prompt is None:
+            raise RuntimeError(reason)
+        segment_id, index = segment["id"], segment["index"]
+        self._update(
+            production_id, status="running", stage="prompts",
+            current_segment_id=segment_id, current_index=index,
+            run_id=None, request_id=None, attempt=0,
+            last_error=str(reason)[:2000],
+            stage_detail=f"Using locked-script fallback for clip {index}",
+        )
+        self.generate_fallback_prompt(production_id, segment_id)
+        current = next((item for item in self.get_production(production_id).get("segments", [])
+                        if item.get("id") == segment_id), None)
+        if current is None or self._prompt_needs_build(current):
+            raise RuntimeError(
+                f"Clip {index} deterministic prompt fallback did not produce a usable prompt.")
+        self._update(production_id, attempt=0, last_error="",
+                     stage_detail=f"Fallback prompt ready for clip {index}")
+
     def _prepare_prompt(self, production_id, segment):
         """Build one prompt during the prompt-only pass before video rendering.
 
@@ -382,6 +411,9 @@ class ProductionAutomationManager:
                     if self._wait(delay):
                         raise RuntimeError("Studio is shutting down; the task will resume next time.")
                     continue
+                if not is_global_failure(message) and self.generate_fallback_prompt is not None:
+                    self._prepare_fallback_prompt(production_id, segment, message)
+                    return
                 raise
         raise RuntimeError(f"Clip {index} prompt exceeded its safe retry limit.")
 
@@ -400,6 +432,7 @@ class ProductionAutomationManager:
                                f"Clip {index} video failed.")
 
         repaired = False
+        fallback_used = False
         request_id = automation.get("request_id") or str(uuid.uuid4())
         max_attempts = len(self.retry_delays) + 1
         for attempt in range(max_attempts):
@@ -446,6 +479,19 @@ class ProductionAutomationManager:
                                  stage_detail=f"Repairing prompt for clip {index}",
                                  last_error=message[:2000])
                     self.generate_prompt(production_id, segment_id)
+                    continue
+                prompt_boundary_failure = (
+                    is_prompt_repairable(message)
+                    or "failed shot preflight" in message.casefold()
+                    or "failed pre-render prompt quality" in message.casefold()
+                    or "without a usable reviewed prompt" in message.casefold()
+                )
+                if (prompt_boundary_failure and not fallback_used
+                        and not is_global_failure(message)
+                        and self.generate_fallback_prompt is not None):
+                    self._prepare_fallback_prompt(production_id, segment, message)
+                    fallback_used = True
+                    repaired = True
                     continue
                 if attempt + 1 < max_attempts and is_transient_failure(message):
                     delay = self.retry_delays[attempt]

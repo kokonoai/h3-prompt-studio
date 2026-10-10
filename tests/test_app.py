@@ -690,7 +690,7 @@ def test_production_prompt_repairs_pre_render_quality_before_saving(server, monk
         def assert_active(self, _ident):
             return copy.deepcopy(production)
 
-        def materialise(self, _ident, _segment_id):
+        def materialise(self, _ident, _segment_id, **_kwargs):
             return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
 
         def set_segment_prompt(self, *args):
@@ -761,7 +761,7 @@ def test_production_prompt_repairs_duplicate_speech_without_another_llm_call(ser
             return []
         def assert_active(self, _ident):
             return copy.deepcopy(production)
-        def materialise(self, _ident, _segment_id):
+        def materialise(self, _ident, _segment_id, **_kwargs):
             return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
         def set_segment_prompt(self, *args):
             saved.append(args)
@@ -827,7 +827,7 @@ def test_production_prompt_falls_back_to_locked_scene_after_two_bad_repairs(serv
             return []
         def assert_active(self, _ident):
             return copy.deepcopy(production)
-        def materialise(self, _ident, _segment_id):
+        def materialise(self, _ident, _segment_id, **_kwargs):
             return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
         def set_segment_prompt(self, *args):
             saved.append(args)

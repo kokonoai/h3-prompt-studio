@@ -1248,10 +1248,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     if(!automation)return "";
     if(automation.status==="retrying")return t("连接或任务暂时不可用，系统会在安全间隔后继续，不会重复提交同一个视频。","The connection or job is temporarily unavailable. Studio will resume after a safe delay without submitting the same video twice.","接続または処理が一時的に利用できません。安全な間隔の後、同じ映像を重複送信せず再開します。","連線或任務暫時不可用，系統會在安全間隔後繼續，不會重複提交同一個影片。");
     if(automationBlockedRows.length)return t(
-      "已有 "+automationBlockedRows.length+" 段无法安全自动处理，已暂时隔离；后台正在继续其余片段，结束后统一请你决定。",
-      automationBlockedRows.length+" clip(s) could not be repaired safely and were isolated; the remaining clips are continuing, with one decision list shown at the end.",
-      automationBlockedRows.length+" 件は安全に自動修正できないため隔離しました。残りは続行し、最後にまとめて確認できます。",
-      "已有 "+automationBlockedRows.length+" 段無法安全自動處理，已暫時隔離；背景正在繼續其餘片段，結束後統一請你決定。"
+      "已有 "+automationBlockedRows.length+" 段因技术原因暂未完成；后台仍在继续其余片段，结束后统一列出原因。",
+      automationBlockedRows.length+" clip(s) remain unfinished for technical reasons; the remaining clips are continuing and the reasons will be listed at the end.",
+      automationBlockedRows.length+" 件は技術的な理由で未完了です。残りは続行し、最後に理由をまとめて表示します。",
+      "已有 "+automationBlockedRows.length+" 段因技術原因暫未完成；背景仍在繼續其餘片段，結束後統一列出原因。"
     );
     if(automation.stage==="prompts")return t("正在完成镜头契约、角色空间、对白与声线检查，并生成视频提示词；通过生成前质检后才会提交 ComfyUI，可安全修复的问题最多自动处理两轮。","Checking the shot contract, cast planes, dialogue and voices while building the video prompt. Only prompts that pass pre-render QC are submitted to ComfyUI; safe defects may be repaired automatically up to twice.","ショット契約・人物空間・台詞・音声を確認しながら映像プロンプトを生成しています。生成前検査を通過したものだけをComfyUIへ送り、安全に直せる問題は最大2回自動修正します。","正在完成鏡頭契約、角色空間、對白與聲線檢查，並生成影片提示詞；通過生成前質檢後才會提交 ComfyUI，可安全修復的問題最多自動處理兩輪。");
     if(automation.stage==="videos")return t("ComfyUI 正在生成视频；可以切换页面或刷新，后台任务和已经完成的内容不会丢失。","ComfyUI is rendering. You may change pages or refresh; the durable job and completed work are preserved.","ComfyUIで生成中です。ページ移動や更新をしても、バックグラウンド処理と完成済み内容は保持されます。","ComfyUI 正在生成影片；可以切換頁面或重新整理，背景任務和已完成內容不會遺失。");
@@ -1260,10 +1260,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     return t("系统正在核对缺失的提示词和视频，然后从第一个未完成项继续；视频质检稍后由你手动启动。","Studio is locating missing prompts and videos, then resumes from the first unfinished item. Video QC is started manually afterward.","不足しているプロンプトと映像を確認し、最初の未完了項目から再開します。映像検査は完了後に手動で開始します。","系統正在核對缺失的提示詞和影片，然後從第一個未完成項繼續；影片質檢稍後由你手動啟動。");
   })();
   const automationAttentionText=automationBlockedRows.length?t(
-    "其余可独立处理的分镜已经继续完成；目前隔离了 "+automationBlockedRows.length+" 段，未进行不安全的猜测或重复提交。请查看这些分镜，修正后再次继续："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；"),
-    "Every independent clip continued. "+automationBlockedRows.length+" clip(s) were isolated instead of being guessed or resubmitted unsafely. Review them and resume after editing: "+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+": "+row.reason).join("; "),
-    "独立して処理できるクリップはすべて続行しました。安全でない推測や重複送信を避けるため "+automationBlockedRows.length+" 件を隔離しました。修正後に再開してください："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；"),
-    "其餘可獨立處理的分鏡已繼續完成；目前隔離了 "+automationBlockedRows.length+" 段，未進行不安全的猜測或重複提交。請查看這些分鏡，修正後再次繼續："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；")
+    "其余分镜已经继续完成；目前有 "+automationBlockedRows.length+" 段因技术原因未完成。请查看原因并再次继续："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；"),
+    "The remaining clips continued. "+automationBlockedRows.length+" clip(s) remain unfinished for technical reasons. Review the reason and resume: "+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+": "+row.reason).join("; "),
+    "残りのクリップは続行しました。技術的な理由で "+automationBlockedRows.length+" 件が未完了です。理由を確認して再開してください："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；"),
+    "其餘分鏡已繼續完成；目前有 "+automationBlockedRows.length+" 段因技術原因未完成。請查看原因並再次繼續："+automationBlockedRows.slice(0,6).map(row=>row.index+" "+row.title+"："+row.reason).join("；")
   ):automation?.stage==="quality"&&qualityOverrideTargets.length?t(
     "生成后质检有 "+qualityOverrideTargets.length+" 个不合格版本等待你决定。它们没有被采用，也不会自动重做。请到“视频一览与输出”逐项查看；可勾选后批量判定合格，或单独批准修复并重做。",
     qualityOverrideTargets.length+" rejected post-render takes need your decision. They were not adopted or rerendered. Review them in Project videos and output, then batch-accept selected takes or approve individual repairs.",
@@ -1784,10 +1784,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     setOpenSegmentId(segmentIds[0]||null);
     setProductionPage("storyboard");
     setNotice(t(
-      "已定位并选中全部 "+segmentIds.length+" 个隔离分镜。展开后可查看生成前检查结果和原始内容；修正完成后再次点击一键流程，只会重试未完成部分。",
-      "Located and selected all "+segmentIds.length+" isolated clips. Open them to inspect preflight findings and source content; after editing, run the pipeline again to retry only unfinished work.",
-      "隔離された "+segmentIds.length+" 件を選択しました。生成前検査と元内容を確認・修正後、全工程を再開すると未完了分だけ再試行します。",
-      "已定位並選中全部 "+segmentIds.length+" 個隔離分鏡。展開後可查看生成前檢查結果和原始內容；修正完成後再次點擊一鍵流程，只會重試未完成部分。"
+      "已定位并选中全部 "+segmentIds.length+" 个未完成分镜。展开后可查看技术原因和原始内容；处理完成后再次点击一键流程，只会重试未完成部分。",
+      "Located and selected all "+segmentIds.length+" unfinished clips. Open them to inspect the technical reason and source content; then run the pipeline again to retry only unfinished work.",
+      "未完了の "+segmentIds.length+" 件を選択しました。技術的な理由と元内容を確認後、全工程を再開すると未完了分だけ再試行します。",
+      "已定位並選中全部 "+segmentIds.length+" 個未完成分鏡。展開後可查看技術原因和原始內容；處理完成後再次點擊一鍵流程，只會重試未完成部分。"
     ));
     window.requestAnimationFrame(()=>window.requestAnimationFrame(()=>{
       document.querySelector<HTMLElement>(".segment-selection-toolbar")?.scrollIntoView({behavior:"smooth",block:"center"});
@@ -2338,7 +2338,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <div className="production-automation-counts">
         <span><b>{automationSnapshot.promptReady}/{automationSnapshot.total}</b>{t("提示词已准备"," prompts ready"," プロンプト準備済み","提示詞已準備")}</span>
         <span><b>{automationSnapshot.rendered}/{automationSnapshot.total}</b>{t("视频已生成"," videos rendered"," 映像生成済み","影片已生成")}</span>
-        {!!automationSnapshot.blocked&&<span className="attention"><b>{automationSnapshot.blocked}</b>{t(" 段已隔离 · 其余继续"," clips isolated · continuing others"," 件を隔離・残りは続行"," 段已隔離 · 其餘繼續")}</span>}
+        {!!automationSnapshot.blocked&&<span className="attention"><b>{automationSnapshot.blocked}</b>{t(" 段因技术原因未完成 · 其余继续"," clips unfinished · continuing others"," 件が技術的理由で未完了・残りは続行"," 段因技術原因未完成 · 其餘繼續")}</span>}
         {automationSnapshot.reviewEnabled?<><span><b>{automationSnapshot.accepted}/{automationSnapshot.total}</b>{t("版本已采用"," takes adopted"," テイク採用済み","版本已採用")}</span>{!!automationSnapshot.pendingReview&&<span className="review"><b>{automationSnapshot.pendingReview}</b>{t("正在质检"," in review"," 品質検査中","正在質檢")}</span>}{!!automationSnapshot.rejected&&<span className="attention"><b>{automationSnapshot.rejected}</b>{t("待人工决定"," need a decision"," 件が判断待ち","待人工決定")}</span>}</>:<span className="manual"><b>{automationSnapshot.manualPending}</b>{t("可按需 AI 质检 · 不阻塞生成合片"," optional AI QC · does not block rendering or assembly"," 必要時AI検査・生成と結合を妨げません","可按需 AI 質檢 · 不阻塞生成合片")}</span>}
       </div>
       <div className="production-automation-steps" aria-label={t("当前片段处理阶段","Current clip stage","現在クリップの工程","目前片段處理階段")}>
@@ -2348,7 +2348,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       </div>
       <footer><span>{t("每 5 秒自动更新；刷新或切换页面不会中断任务。","Updates every 5 seconds; refreshing or changing pages does not stop the job.","5秒ごとに更新します。更新やページ移動で処理は停止しません。","每 5 秒自動更新；重新整理或切換頁面不會中斷任務。")}</span><code title={automation.stage_detail||automation.stage}>{automationStageDetail}</code></footer>
     </section>}
-    {automation?.status==="needs_attention"&&<div className="production-alert error production-attention-alert"><span><strong>{t("后台任务需要处理：","Background production needs attention: ","バックグラウンドタスクを確認してください：","背景任務需要處理：")}</strong>{automationAttentionText}</span>{!!automationBlockedRows.length?<button type="button" onClick={openAutomationBlockers}><Check size={16}/>{t("查看并全选隔离分镜 "+automationBlockedRows.length,"Review isolated clips "+automationBlockedRows.length,"隔離クリップを確認 "+automationBlockedRows.length,"查看並全選隔離分鏡 "+automationBlockedRows.length)}</button>:!!qualityOverrideTargets.length&&<button type="button" onClick={openQualityAttention}><Check size={16}/>{t("查看并全选待处理 "+qualityOverrideTargets.length,"Review & select all "+qualityOverrideTargets.length,"確認して全選択 "+qualityOverrideTargets.length,"查看並全選待處理 "+qualityOverrideTargets.length)}</button>}</div>}
+    {automation?.status==="needs_attention"&&<div className="production-alert error production-attention-alert"><span><strong>{t("后台任务需要处理：","Background production needs attention: ","バックグラウンドタスクを確認してください：","背景任務需要處理：")}</strong>{automationAttentionText}</span>{!!automationBlockedRows.length?<button type="button" onClick={openAutomationBlockers}><Check size={16}/>{t("查看并全选未完成分镜 "+automationBlockedRows.length,"Review unfinished clips "+automationBlockedRows.length,"未完了クリップを確認 "+automationBlockedRows.length,"查看並全選未完成分鏡 "+automationBlockedRows.length)}</button>:!!qualityOverrideTargets.length&&<button type="button" onClick={openQualityAttention}><Check size={16}/>{t("查看并全选待处理 "+qualityOverrideTargets.length,"Review & select all "+qualityOverrideTargets.length,"確認して全選択 "+qualityOverrideTargets.length,"查看並全選待處理 "+qualityOverrideTargets.length)}</button>}</div>}
 
     {productionPage==="projects"&&<section className="production-projects card">
       <div className="section-title production-projects-title"><div><span className="eyebrow">{t("剧集 · 片段","EPISODES · CLIPS","エピソード・クリップ","劇集 · 片段")}</span><h2><FolderOpen size={21}/>{t("剧集 / 片段管理","Episodes & clips","エピソード／クリップ管理","劇集／片段管理")}</h2><p>{t("这里管理每集拆分出的制作片段；整部剧的分集编排与最终合片请到“剧本管理”。普通单镜头工程仍在“镜头工作室 → 已保存项目”。","Manage production parts split from episodes here. Use Script management for the whole story and final assembly. Single-scene projects remain in Scene Studio → Saved projects.","各話から分けた制作パートを管理します。全編の話数構成と結合は「脚本管理」で行います。単一シーンはシーンスタジオの保存済みプロジェクトにあります。","這裡管理每集拆分出的製作片段；整部劇的分集編排與最終合片請到「劇本管理」。普通單鏡頭工程仍在「鏡頭工作室 → 已儲存專案」。")}</p></div><button className="primary" onClick={startNewProduction}><Plus size={18}/>{t("新建剧集 / 片段","New episode / clip part","エピソード／クリップを作成","新建劇集／片段")}</button></div>

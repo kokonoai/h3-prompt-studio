@@ -303,6 +303,19 @@ def test_generated_plan_quality_rejects_internal_cut_and_locked_changes():
     assert "Replace the cut with a continuous pan" in request
 
 
+def test_angle_plus_framing_describes_one_camera_view():
+    production, segment, baseline = fixture()
+    baseline["shots"][0]["setting"] = (
+        "A low-angle close-up on the edge of the glass paperweight.")
+
+    report = review_generated_plan(
+        production, segment, baseline, copy.deepcopy(baseline))
+
+    assert report["status"] == "passed"
+    assert not any(row["code"] == "multiple_camera_views"
+                   for row in report["issues"])
+
+
 def test_generated_plan_keeps_dense_action_as_an_advisory_warning():
     production, segment, baseline = fixture()
     candidate = copy.deepcopy(baseline)

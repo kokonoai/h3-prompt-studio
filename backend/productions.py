@@ -39,6 +39,13 @@ AUTO_HARD_CUT_CONTINUITY_CODES = frozenset({
     "eyeline_conflict", "prop_changed_hands", "prop_state_jump",
     "wardrobe_jump", "axis_crossing", "invalid_mmh3_continuation",
 })
+# These affect likely visual quality, not source-story completeness.  The
+# ordinary AI path still tries to repair them; the automation-only locked-script
+# fallback may render them so the author can judge the initial cut afterwards.
+AUTOMATION_RENDER_ADVISORY_CODES = frozenset({
+    "multiple_internal_cuts", "internal_editorial_cut",
+    "impossible_camera_change", "face_screen_geometry",
+})
 SHOT_ROLES = ("master", "reaction", "close_up", "insert", "establishing", "over_shoulder", "cutaway")
 SHOT_SIZES = ("extreme_wide", "wide", "medium", "medium_close", "close_up", "extreme_close_up")
 EDIT_REASONS = ("dialogue_reaction", "action_match", "eyeline_match", "information_reveal",
@@ -3720,17 +3727,36 @@ def _split_editorial_text(value):
 
 
 def _camera_view_count(text):
-    patterns = (
-        r"\b(?:extreme\s+wide|wide\s+shot|full\s+shot|medium\s+shot|medium\s+close|"
-        r"close[- ]?up|extreme\s+close|over[- ]the[- ]shoulder|overhead|top[- ]down|"
-        r"low[- ]angle|high[- ]angle|pov|reverse\s+angle)\b",
-        r"(?:大全景|远景|遠景|全景|中景|近景|特写|特寫|大特写|大特寫|过肩|過肩|"
-        r"俯拍|仰拍|主观镜头|主觀鏡頭|クローズアップ|ロングショット|俯瞰|煽り)",
+    """Estimate distinct setups without counting angle + framing as two views.
+
+    A phrase such as ``low-angle close-up`` describes one camera, while
+    ``wide shot, then close-up`` asks for two framings.  The old flat token
+    count treated the former as two views and rejected otherwise filmable
+    clips after every repair attempt.
+    """
+    categories = (
+        # Framing / shot size.
+        (r"\b(?:extreme\s+wide|wide\s+shot|full\s+shot|medium\s+shot|"
+         r"medium\s+close|close[- ]?up|extreme\s+close)\b|"
+         r"(?:大全景|远景|遠景|全景|中景|近景|特写|特寫|大特写|大特寫|"
+         r"クローズアップ|ロングショット)"),
+        # Camera angle. One of these may be combined with one framing above.
+        (r"\b(?:overhead|top[- ]down|low[- ]angle|high[- ]angle)\b|"
+         r"(?:俯拍|仰拍|俯瞰|煽り)"),
+        # Viewpoint / placement.
+        (r"\b(?:over[- ]the[- ]shoulder|pov|reverse\s+angle)\b|"
+         r"(?:过肩|過肩|主观镜头|主觀鏡頭)"),
     )
-    found = []
-    for pattern in patterns:
-        found.extend(match.group(0).casefold() for match in re.finditer(pattern, text, re.IGNORECASE))
-    return len(dict.fromkeys(found))
+    counts = []
+    for pattern in categories:
+        found = {match.group(0).casefold()
+                 for match in re.finditer(pattern, str(text or ""), re.IGNORECASE)}
+        counts.append(len(found))
+    # Explicit editorial boundaries make separately named framing/angle
+    # tokens separate setups rather than one combined composition.
+    if _explicit_cut_count(str(text or "")):
+        return sum(counts)
+    return max(counts, default=0)
 
 
 def _action_beat_count(text):
@@ -4954,7 +4980,7 @@ class ProductionManager:
         current["segments"], current["planner"], current["planner_warning"] = prepared, planner, warning
         return self.save(current)
 
-    def materialise(self, ident, segment_id):
+    def materialise(self, ident, segment_id, *, allow_render_advisories=False):
         started = time.monotonic()
         production = self.get(ident)
         segment = next((s for s in production["segments"] if s["id"] == safe_id(segment_id)), None)
@@ -4968,7 +4994,8 @@ class ProductionManager:
             segment = next((s for s in production["segments"] if s["id"] == segment_id), None)
             if not segment:
                 raise ValueError("Production clip changed while repairing its shot plan.")
-        self.assert_storyboard_contract_current(production, segment)
+        self.assert_storyboard_contract_current(
+            production, segment, allow_render_advisories=allow_render_advisories)
         if segment.get("cast_timeline_version", 0) != CAST_TIMELINE_VERSION:
             raise ValueError(
                 "This storyboard predates temporal cast tracking. Replan this episode before rebuilding its video prompts.")
@@ -6135,10 +6162,15 @@ class ProductionManager:
             production["automation"] = normalise_automation(automation)
             return self.save(production)
 
-    def assert_storyboard_contract_current(self, production, segment):
+    def assert_storyboard_contract_current(self, production, segment, *,
+                                           allow_render_advisories=False):
         """Block prompt/video work through one unified shot preflight gate."""
-        preflight_errors = [row.get("message", "") for row in segment.get("preflight_issues", [])
-                            if row.get("severity") == "error"]
+        preflight_errors = [
+            row.get("message", "") for row in segment.get("preflight_issues", [])
+            if row.get("severity") == "error"
+            and not (allow_render_advisories and
+                     row.get("code") in AUTOMATION_RENDER_ADVISORY_CODES)
+        ]
         if preflight_errors:
             raise ValueError(
                 f"Clip {segment.get('index')} failed shot preflight. Fix or replan it before generating video: " +
