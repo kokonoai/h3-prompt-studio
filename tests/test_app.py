@@ -325,6 +325,79 @@ def test_stale_project_with_legacy_take_is_optional_upgrade_not_blocking(server,
     assert result['blocking_stale_count'] == 0
 
 
+def test_renderer_rule_upgrade_keeps_reviewed_adopted_take_usable(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(4))
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Existing reviewed clip',
+            'project_id': project_id, 'status': 'stale',
+            'stale_reasons': [
+                '本段需要新的最终人物、屏幕、镜子与文字道具渲染保护，请重新生成提示词后再生成视频'],
+            'selected_video_run_id': run_id,
+        }],
+    }
+    take = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+            'status': 'succeeded', 'video_url': '/reviewed.mp4', 'created_at': 100.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+        def list(self):
+            return []
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, '_production_quality_descriptor', lambda *_args: {
+        'status': 'passed', 'required': False, 'accepted': True,
+        'summary': 'Reviewed.', 'issues': [],
+    })
+
+    result = module.production_outputs(production_id, [take])
+
+    assert result['all_ready']
+    assert result['segments'][0]['legacy_upgrade'] is True
+    assert result['legacy_upgrade_count'] == 1
+    assert result['blocking_stale_count'] == 0
+
+
+def test_story_change_still_blocks_reviewed_stale_take(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id, project_id, run_id = (str(uuid.uuid4()) for _ in range(4))
+    production = {
+        'id': production_id, 'auto_merge': True, 'timings': {},
+        'segments': [{
+            'id': segment_id, 'index': 1, 'title': 'Changed story clip',
+            'project_id': project_id, 'status': 'stale',
+            'stale_reasons': ['分镜内容或时长在 H3 工程创建后发生了变化'],
+            'selected_video_run_id': run_id,
+        }],
+    }
+    take = {'id': run_id, 'project_id': project_id, 'operation': 'video',
+            'status': 'succeeded', 'video_url': '/old-story.mp4', 'created_at': 100.0}
+
+    class Productions:
+        def get(self, _ident):
+            return copy.deepcopy(production)
+
+        def list(self):
+            return []
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, '_production_quality_descriptor', lambda *_args: {
+        'status': 'passed', 'required': False, 'accepted': True,
+        'summary': 'Reviewed.', 'issues': [],
+    })
+
+    result = module.production_outputs(production_id, [take])
+
+    assert result['all_ready']
+    assert result['segments'][0]['legacy_upgrade'] is False
+    assert result['legacy_upgrade_count'] == 0
+    assert result['blocking_stale_count'] == 1
+
+
 def test_batch_legacy_review_returns_before_background_work(server, monkeypatch):
     module, client, _fake = server
     production_id = str(uuid.uuid4())

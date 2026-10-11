@@ -1985,7 +1985,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     return()=>{active=false;window.clearInterval(timer);};
   },[production?.id]);
   useEffect(()=>{
-    if(production?.task_state==="paused"||bulkAction||automationActive||!outputs?.all_ready||outputs.quality_pending_count>0||outputs.quality_batch?.status==="running"||outputs.active_jobs>0||outputs.uncertain_jobs>0||outputs.final_ready||!outputs.signature||merging)return;
+    if(busyRef.current||production?.task_state==="paused"||bulkAction||automationActive||!outputs?.all_ready||outputs.quality_pending_count>0||outputs.quality_batch?.status==="running"||outputs.active_jobs>0||outputs.uncertain_jobs>0||outputs.final_ready||!outputs.signature||merging)return;
     if(autoMergeAttempt.current===outputs.signature)return;
     autoMergeAttempt.current=outputs.signature;void buildFilm(true);
   },[production?.task_state,outputs?.all_ready,outputs?.quality_pending_count,outputs?.quality_batch?.status,outputs?.active_jobs,outputs?.uncertain_jobs,outputs?.final_ready,outputs?.signature,merging,bulkAction,automationActive]);
@@ -2156,8 +2156,25 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         if(job.status!=="succeeded")throw new Error(t("选中分镜批量重做停在第 "+target.index+" 段：","Selected rebuild stopped at clip "+target.index+": ","選択クリップの再生成はクリップ "+target.index+" で停止しました：","選取分鏡批量重做停在第 "+target.index+" 段：")+(job.error||job.stage||job.status));
         setSelectedSegmentIds(value=>value.filter(id=>id!==target.id));
       }
+      overview=await api("/productions/"+current.id+"/outputs") as ProductionOutputs;setOutputs(overview);
+      let assembled=false;
+      if(overview.all_ready&&overview.quality_ready&&overview.active_jobs===0&&overview.uncertain_jobs===0){
+        setBusy(t("选中分镜已重做：正在合并最新版成片","Selected clips rebuilt: assembling the updated film","選択クリップの再生成完了：最新版を結合中","選取分鏡已重做：正在合併最新版成片"));
+        overview=await api("/productions/"+current.id+"/film",{},undefined,"POST",{timeoutMs:1800000}) as ProductionOutputs;
+        setOutputs(overview);assembled=overview.final_ready;
+      }
       await refreshList();
-      setNotice(t("选中的 "+targets.length+" 段已完成提示词更新和视频重做；旧版本仍可在结果区查看。","Updated prompts and rendered new takes for all "+targets.length+" selected clips. Earlier versions remain available in Results.","選択した "+targets.length+" 件のプロンプト更新と映像再生成が完了しました。旧版は結果画面に残っています。","選取的 "+targets.length+" 段已完成提示詞更新和影片重做；舊版本仍可在結果區查看。"));
+      setNotice(assembled?t(
+        "选中的 "+targets.length+" 段已完成提示词更新和视频重做，并已与其余采用版本合并为最新版成片；旧提示词、视频和成片仍保留。",
+        "Updated prompts and rendered all "+targets.length+" selected clips, then assembled them with the other adopted takes into the latest film. Earlier prompts, takes and films remain available.",
+        "選択した "+targets.length+" 件のプロンプトと映像を更新し、他の採用テイクと合わせて最新版を結合しました。旧プロンプト・テイク・完成版も保持されています。",
+        "選取的 "+targets.length+" 段已完成提示詞更新和影片重做，並已與其餘採用版本合併為最新版成片；舊提示詞、影片和成片仍保留。"
+      ):t(
+        "选中的 "+targets.length+" 段已完成提示词更新和视频重做；旧版本仍可查看。其余片段尚未全部具备采用版本，因此暂未生成新成片。",
+        "Updated prompts and rendered all "+targets.length+" selected clips. Earlier versions remain available. Some other clips still lack adopted takes, so no new film was assembled yet.",
+        "選択した "+targets.length+" 件のプロンプト更新と映像再生成が完了しました。旧版も保持されています。他のクリップに採用テイクが不足しているため、新しい完成版はまだ結合していません。",
+        "選取的 "+targets.length+" 段已完成提示詞更新和影片重做；舊版本仍可查看。其餘片段尚未全部具備採用版本，因此暫未生成新成片。"
+      ));
     }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}
     finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production.id,true);}
   };

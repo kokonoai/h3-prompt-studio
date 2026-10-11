@@ -1472,6 +1472,21 @@ def _production_quality_descriptor(production_id, segment_id, run_id):
     return value
 
 
+_OPTIONAL_PRODUCTION_UPGRADE_REASON_MARKERS = (
+    '本段需要新的最终人物、屏幕、镜子与文字道具渲染保护',
+    '保存的提示词仍是旧版设备构图规则',
+)
+
+
+def _production_segment_is_optional_upgrade(segment):
+    """Keep adopted takes usable when only renderer safeguards were upgraded."""
+    reasons = [str(reason).strip() for reason in (segment.get('stale_reasons') or [])
+               if str(reason).strip()]
+    return bool(reasons) and all(
+        any(marker in reason for marker in _OPTIONAL_PRODUCTION_UPGRADE_REASON_MARKERS)
+        for reason in reasons)
+
+
 def _save_production_quality(production_id, segment_id, run_id, value):
     path = _production_quality_path(production_id, segment_id, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1925,7 +1940,8 @@ def production_outputs(production_id, runs=None):
             'candidates': candidates[:24], 'selected': selected, 'selection': selection,
             'legacy_upgrade': bool(
                 segment.get('status') == 'stale' and selected and
-                (selected.get('quality_review', {}).get('status') == 'legacy' or
+                (_production_segment_is_optional_upgrade(segment) or
+                 selected.get('quality_review', {}).get('status') == 'legacy' or
                  selected.get('quality_review', {}).get('legacy_take'))),
         })
     for index, row in enumerate(segments):
