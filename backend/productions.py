@@ -18,7 +18,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 9
+REFERENCE_STRATEGY_VERSION = 10
 CAST_TIMELINE_VERSION = 1
 STORY_CONTRACT_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
@@ -1552,9 +1552,8 @@ def character_aliases(production, story=None):
                for card in characters if card.get("id")}
     story = str(story if story is not None else current_episode_story(production) or "")
     matches = list(_CAST_LINE.finditer(story))
-    if not matches:
-        return aliases
-    tokens = [token.strip() for token in re.split(r"[、,，;；]", matches[0].group("names")) if token.strip()]
+    tokens = ([token.strip() for token in re.split(r"[、,，;；]", matches[0].group("names")) if token.strip()]
+              if matches else [])
     current = int(production.get("current_episode", 1) or 1)
     episodes = production.get("episodes") or []
     episode = episodes[current - 1] if 1 <= current <= len(episodes) else {}
@@ -1586,6 +1585,25 @@ def character_aliases(production, story=None):
                 continue
             aliases.setdefault(card["id"], set()).add(part.casefold())
 
+    # A screenplay often introduces a translated creature or guest as
+    # ``镜鸟／Mirror Bird`` outside the main cast line.  Dialogue then uses the
+    # local-language half.  Bind only an explicit slash-delimited pair whose
+    # other half names one exact card; ordinary prose containing a slash is not
+    # treated as an alias declaration.
+    alias_sources = "\n".join(str(value or "") for value in (
+        story, production.get("brief"), production.get("continuity_notes")))
+    for raw_line in alias_sources.splitlines():
+        label = re.split(r"[:：]", raw_line, maxsplit=1)[0]
+        label = re.sub(r"^\s*(?:[-*#]+\s*)+", "", label).strip().strip("* _`")
+        parts = [part.strip().strip("* _`") for part in re.split(r"\s*[／/]\s*", label)]
+        if len(parts) != 2 or not all(parts) or any(len(part) > 80 for part in parts):
+            continue
+        owners = [card for card in characters
+                  if any(part.casefold() == str(card.get("name", "")).strip().casefold()
+                         for part in parts)]
+        if len(owners) == 1:
+            aliases.setdefault(owners[0]["id"], set()).update(part.casefold() for part in parts)
+
     # Scripts often introduce a translated full role name in the cast line and
     # then use its distinctive CJK suffix (e.g. 发条维修守卫 -> 守卫). Add only
     # suffixes unique within this production so a generic role cannot bind two
@@ -1600,6 +1618,41 @@ def character_aliases(production, story=None):
         if len(owners) == 1:
             aliases[next(iter(owners))].add(suffix)
     return aliases
+
+
+_REFLECTION_SPEAKER_SUFFIX = re.compile(
+    r"(?i)(?:['’]s\s+(?:mirror\s+image|reflection)|\s+(?:mirror\s+image|reflection)|"
+    r"的(?:镜像|鏡像|倒影|镜中影像|鏡中影像)|"
+    r"の(?:鏡像|反射像))\s*$")
+_REFLECTION_SPEAKER_PREFIX = re.compile(
+    r"(?i)^\s*(?:(?:mirror\s+image|reflection)\s+of\s+|镜中的|鏡中的|镜像中的|鏡像中的)")
+
+
+def speaker_alias_keys(value):
+    """Return a speaker label plus its underlying reflected identity label."""
+    raw = str(value or "").split("|", 1)[0].strip()
+    if not raw:
+        return set()
+    values = {raw.casefold()}
+    base = _REFLECTION_SPEAKER_PREFIX.sub("", raw)
+    base = _REFLECTION_SPEAKER_SUFFIX.sub("", base).strip()
+    if base:
+        values.add(base.casefold())
+    return values
+
+
+def resolve_speaker_character(value, lookup):
+    """Resolve translated/reflected speaker labels without inventing a body."""
+    raw = str(value or "").split("|", 1)[0].strip()
+    base = _REFLECTION_SPEAKER_SUFFIX.sub(
+        "", _REFLECTION_SPEAKER_PREFIX.sub("", raw)).strip()
+    keys = [base.casefold(), raw.casefold()] if base and base.casefold() != raw.casefold() else [raw.casefold()]
+    return next((lookup[key] for key in keys if key in lookup), None)
+
+
+def reflected_speaker_label(value):
+    raw = str(value or "").split("|", 1)[0].strip()
+    return bool(_REFLECTION_SPEAKER_SUFFIX.search(raw) or _REFLECTION_SPEAKER_PREFIX.search(raw))
 
 
 def voice_character_aliases(production):
@@ -1788,13 +1841,61 @@ def _imagined_depiction(aliases, text):
     return False
 
 
+def _reflected_depiction(aliases, text):
+    """Recognise an explicitly authored mirror/reflection appearance.
+
+    A reflection is a visual occurrence of an existing identity, not a second
+    physical performer.  Keep this independent from the exclusive physical /
+    display / memory / off-screen role so a real actor and their reflection may
+    legitimately share one composition.
+    """
+    for context in _alias_contexts(text, aliases):
+        for alias in aliases:
+            token = _alias_pattern(alias)
+            patterns = (
+                rf"\b(?:reflection|mirror\s+image|reflected\s+(?:image|figure|form)|recorded\s+reflection)\s+of\s+{token}",
+                rf"{token}(?:['’]s)?\s+(?:reflection|mirror\s+image|reflected\s+(?:image|figure|form))\b",
+                rf"{token}\s+(?:is\s+)?reflected\b.{{0,60}}\b(?:in|inside|within)\s+(?:the\s+)?mirror\b",
+                rf"\bmirror[- ]{token}\b",
+                rf"(?:镜中|鏡中|镜面|鏡面|倒影|镜像|鏡像).{{0,40}}{token}",
+                rf"{token}.{{0,16}}(?:的)?(?:倒影|镜像|鏡像|镜中影像|鏡中影像)",
+                rf"(?:鏡の中|鏡像|反射像).{{0,40}}{token}|{token}.{{0,16}}(?:の)?(?:鏡像|反射像)",
+            )
+            if any(re.search(pattern, context, re.IGNORECASE) for pattern in patterns):
+                return True
+    return False
+
+
+def reflected_character_ids(production, segment, aliases_by_card=None):
+    """Return canonical card IDs allowed to appear inside a mirror surface."""
+    aliases_by_card = aliases_by_card or character_aliases(production)
+    text = "\n".join(str(segment.get(key, "")) for key in
+                     ("title", "story", "setting", "action", "ending", "image_prompt"))
+    reflected = []
+    for card in production.get("cards", {}).get("characters", []):
+        aliases = {alias for alias in aliases_by_card.get(card.get("id"), set()) if alias}
+        reflected_speaker = False
+        for line in segment.get("dialogue", []):
+            raw = str(line.get("speaker", "")).split("|", 1)[0].strip()
+            wrapped = bool(_REFLECTION_SPEAKER_SUFFIX.search(raw) or
+                           _REFLECTION_SPEAKER_PREFIX.search(raw))
+            if wrapped and speaker_alias_keys(raw) & aliases:
+                reflected_speaker = True
+                break
+        if (_reflected_depiction(aliases, text) or
+                reflected_speaker):
+            reflected.append(card["id"])
+    return reflected
+
+
 def _physically_staged(aliases, text):
     # Names written inside a card/message are story data, not another body.
     text = re.sub(r"(['\"“‘]).{0,240}?[\"'”’]", " ", str(text or ""))
     for context in _alias_contexts(text, aliases):
         # A sentence whose only visual relationship is a display or memory does
         # not physically stage that identity in the local room.
-        if _display_depiction(aliases, context) or _imagined_depiction(aliases, context):
+        if (_display_depiction(aliases, context) or _imagined_depiction(aliases, context)
+                or _reflected_depiction(aliases, context)):
             continue
         for alias in aliases:
             token = _alias_pattern(alias)
@@ -1828,10 +1929,11 @@ def character_presence_roles(production, segment):
                                    ("visible_start", "visible_end", "enters", "exits")))
     selected_labels = {str(name).strip().casefold()
                        for name in segment.get("card_selection", {}).get("characters", [])}
-    dialogue_labels = {str(line.get("speaker", "")).strip().casefold()
-                       for line in segment.get("dialogue", []) if str(line.get("speaker", "")).strip()}
-    voiceover_labels = {str(line.get("speaker", "")).strip().casefold()
-                        for line in segment.get("dialogue", []) if line.get("voiceover")}
+    dialogue_labels = set().union(*(speaker_alias_keys(line.get("speaker"))
+                                    for line in segment.get("dialogue", []))) if segment.get("dialogue") else set()
+    voiceover_labels = set().union(*(speaker_alias_keys(line.get("speaker"))
+                                     for line in segment.get("dialogue", []) if line.get("voiceover"))) \
+        if any(line.get("voiceover") for line in segment.get("dialogue", [])) else set()
     text = "\n".join(str(segment.get(key, "")) for key in
                      ("title", "story", "setting", "action", "ending", "image_prompt"))
     staged_text = "\n".join(str(segment.get(key, "")) for key in
@@ -1839,6 +1941,7 @@ def character_presence_roles(production, segment):
     split_layout = _split_layout_requested(staged_text)
     roles = {}
     aliases_by_card = character_aliases(production, text)
+    reflected_ids = set(reflected_character_ids(production, segment, aliases_by_card))
     separated_pairs = remote_separated_pairs(production, aliases_by_card)
     location_owners = _location_owner_ids(production, segment, aliases_by_card)
     remote_device_context = bool(_DEVICE_CUE.search(staged_text) or split_layout)
@@ -1878,6 +1981,11 @@ def character_presence_roles(production, segment):
                 role = "offscreen"
             else:
                 role = "absent"
+        elif card.get("id") in reflected_ids and not physical and not in_visible:
+            # The identity may be visible inside the mirror, but it has no
+            # second body in the real setting. Keep its acoustic location
+            # off-screen while reflected_subject_ids controls the pixels.
+            role = "offscreen"
         elif display and (split_layout or not physical):
             role = "display"
         elif imagined and not physical:
@@ -2109,11 +2217,14 @@ def effective_temporal_cast_lock(production, segment, roles=None):
     effective["cast_timeline"] = physical
     display = [card["name"] for card in cards if roles.get(card.get("id")) == "display"]
     imagined = [card["name"] for card in cards if roles.get(card.get("id")) == "imagined"]
+    reflected_ids = set(reflected_character_ids(production, segment))
+    reflected = [card["name"] for card in cards if card.get("id") in reflected_ids]
     text = "\n".join(str(segment.get(key, "")) for key in
                      ("story", "setting", "action", "ending", "image_prompt"))
     extra = [
         "Visible only inside a bounded device/remote display: " + (", ".join(display) or "none") + ".",
         "Visible only as a non-diegetic thought/memory image: " + (", ".join(imagined) or "none") + ".",
+        "Visible inside an authored mirror/reflection surface: " + (", ".join(reflected) or "none") + ".",
         "A display or memory identity is not a physical person in the local setting.",
     ]
     if (display or _split_layout_requested(text) or _DEVICE_CUE.search(text) or
@@ -2121,14 +2232,24 @@ def effective_temporal_cast_lock(production, segment, roles=None):
         extra.append(
             "DEVICE INTERACTION LOCK: use exactly one local phone/device prop. Its screen content stays geometrically inside the bezel and never becomes a second real room or a second full-size body. For typing or sending, show a readable hand-to-device action and one deliberate tap with a simple non-verbal sent-state cue; do not invent extra chat messages, subtitles, captions, floating UI, extra hands or a second phone. Exact on-screen typography should be added in post rather than hallucinated by the video model.")
         extra.append(device_screen_geometry_lock(segment, display))
-    if _MIRROR_CUE.search(text):
+    if reflected:
         extra.append(
-            "MIRROR GEOMETRY LOCK: each physically present identity may have at most one optically plausible reflection of that same identity, confined to the mirror surface and matching the real body's wardrobe, pose and action. A reflection is not another physical body. Display-only, imagined, off-screen and absent identities never appear in the mirror or elsewhere in the room. Do not add extra mirror panels, portraits, reflected phones or duplicate figures.")
+            "MIRROR GEOMETRY LOCK: the only named identities allowed inside any mirror surface are "
+            + ", ".join(reflected)
+            + ". Show each listed reflected identity at most once, confined completely to one explicitly authored mirror surface. A reflection is not another physical body: it has no floor contact, independent physical shadow, prop interaction or body outside that surface and does not increase the physical cast count. If its real body is present, match that body's identity, wardrobe and authored temporal action; if its real body is off-screen, render only the explicitly authored recorded/reflected image. Display-only, imagined, off-screen and absent identities never appear in the mirror unless explicitly listed in the authored mirror cast. Do not add extra panels, portraits, reflected phones or duplicate figures.")
+    elif _MIRROR_CUE.search(text):
+        extra.append(
+            "MIRROR GEOMETRY LOCK: no named character reflection is authored in this clip. Mirrors show only the established environment, light and abstract glare; never copy a physical actor, reference portrait, display identity or absent character into a mirror. Do not add extra mirror panels, portraits, reflected phones or duplicate figures.")
     absent = [card["name"] for card in cards if roles.get(card.get("id")) == "absent"]
     if absent:
         extra.append(
             "EMOTIONAL SUBTEXT LOCK: express longing, affection or thought about absent identities only through the physical actor's eyes, breath, pause, posture and an already scripted prop or screen cue. Do not materialize an absent person as a companion, ghost, silhouette, reflection, portrait or background extra unless that identity is explicitly listed in the display or memory roster above.")
-    return temporal_cast_lock(effective) + "\n" + "\n".join(extra)
+    base_lock = temporal_cast_lock(effective)
+    if reflected:
+        base_lock = base_lock.replace(
+            "Off-screen and mentioned-only identities must not appear as people, creatures, background figures, reflections, portraits, duplicates or disguised substitutes.",
+            "Off-screen and mentioned-only identities must not appear as people, creatures, background figures, portraits, duplicates or disguised substitutes. The only exception is an identity explicitly listed in the authored mirror/reflection roster below, which remains confined to that mirror surface and is never a physical body.")
+    return base_lock + "\n" + "\n".join(extra)
 
 
 def production_render_override(production, segment, relevant_cards=None, roles=None):
@@ -2247,9 +2368,8 @@ def segment_identity_repair_reasons(production, segment):
     legacy_voice_labels = []
     for line in segment.get("dialogue", []):
         label = str(line.get("speaker", "")).strip()
-        key = label.casefold()
-        voice_owner = voice_aliases.get(key)
-        character_owner = aliases.get(key)
+        voice_owner = resolve_speaker_character(label, voice_aliases)
+        character_owner = resolve_speaker_character(label, aliases)
         # A voice card is commonly named after its owning character (for
         # example both the character card and voice card are named ``Mimi``).
         # That overlap is a valid canonical screenplay speaker, not a legacy
@@ -2317,8 +2437,8 @@ def segment_identity_repair_reasons(production, segment):
     for line in segment.get("dialogue", []):
         if line.get("voiceover"):
             continue
-        raw = re.split(r"[|｜]", str(line.get("speaker", "")).strip().casefold(), maxsplit=1)[0].strip()
-        character = aliases.get(raw) or voice_aliases.get(raw)
+        character = (resolve_speaker_character(line.get("speaker"), aliases) or
+                     resolve_speaker_character(line.get("speaker"), voice_aliases))
         canonical = str(character.get("name", "")).strip() if character else ""
         # A remote/display speaker can be audible without occupying the local
         # physical cast timeline.  The visual-plane role is authoritative here;
@@ -2365,19 +2485,22 @@ def repair_segment_identity_contract(production, segment):
     timeline = segment.setdefault("cast_timeline", normalise_cast_timeline(None))
     changes = []
     for line in segment.get("dialogue", []):
-        raw = re.split(r"[|｜]", str(line.get("speaker", "")).strip().casefold(), maxsplit=1)[0].strip()
-        character = aliases.get(raw)
+        character = resolve_speaker_character(line.get("speaker"), aliases)
         if character is None:
             continue
         canonical = str(character.get("name", "")).strip()
         if not canonical:
             continue
-        if line.get("speaker") != canonical:
+        is_reflection = reflected_speaker_label(line.get("speaker"))
+        if line.get("speaker") != canonical and not is_reflection:
             changes.append(f"bound speaker {line.get('speaker')} to {canonical}")
             line["speaker"] = canonical
-        if line.get("voiceover"):
+        if line.get("voiceover") or is_reflection:
             if canonical not in timeline["offscreen"]:
                 timeline["offscreen"].append(canonical)
+            selected = segment.setdefault("card_selection", {}).setdefault("characters", [])
+            if canonical not in selected:
+                selected.append(canonical)
             continue
         visible = {
             str(name).strip().casefold()
@@ -2536,6 +2659,34 @@ def series_voice_character_rules(value, character_name):
     return " ".join(selected)[:1200]
 
 
+def acoustic_voice_text(value):
+    """Keep useful vocal traits without introducing visual human subjects.
+
+    Joint audio/video models can literalise phrases such as ``animated girl``
+    or ``adult man`` as an extra body even when they came from a voice card.
+    Convert those labels to acoustic register terms only in the render copy;
+    the reusable authored voice card remains unchanged.
+    """
+    text = " ".join(str(value or "").split())
+    replacements = (
+        (r"(?i)\b(?:young\s+)?(?:animated\s+)?girl(?:'s)?\s+voice\b", "youthful higher vocal register"),
+        (r"(?i)\b(?:young\s+)?(?:animated\s+)?boy(?:'s)?\s+voice\b", "youthful bright vocal register"),
+        (r"(?i)\b(?:adult\s+)?(?:human\s+)?(?:man|male)(?:'s)?\s+voice\b", "mature lower vocal register"),
+        (r"(?i)\b(?:adult\s+)?(?:human\s+)?(?:woman|female)(?:'s)?\s+voice\b", "mature feminine vocal register"),
+        (r"(?i)\b(?:female|male)\s+(?:protagonist|character|companion|performer)\s+voice\b",
+         lambda match: "feminine vocal register" if match.group(0).lower().startswith("female") else "masculine vocal register"),
+        (r"(?i)\b(?:girl|boy|man|woman|child|kid|person|human)\s+(?:character|companion|performer)\b",
+         "recurring speaker"),
+        (r"少女声|女孩声|女性角色声", "youthful higher vocal register"),
+        (r"少年声|男孩声|男性角色声", "youthful bright vocal register"),
+        (r"成年男性声|男人声", "mature lower vocal register"),
+        (r"成年女性声|女人声", "mature feminine vocal register"),
+    )
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return text[:1800]
+
+
 def voice_prompt_context(production, cards):
     """Build one non-rewritten block for the current clip's audible cast."""
     if not cards:
@@ -2564,7 +2715,8 @@ def voice_prompt_context(production, cards):
         character_name = character_names.get(card.get("character_card_id"), card["name"])
         character_rules = series_voice_character_rules(
             production.get("series_voice_style"), character_name)
-        exact = "\n".join(part for part in (card.get("description", ""), card.get("notes", "")) if part)
+        exact = acoustic_voice_text("\n".join(
+            part for part in (card.get("description", ""), card.get("notes", "")) if part))
         metadata = "; ".join(part for part in (
             "Voice ID: " + card.get("voice_id", "") if card.get("voice_id") else "",
             "Target language: " + PRODUCTION_LANGUAGES[production["language"]],
@@ -2579,7 +2731,9 @@ def voice_prompt_context(production, cards):
                             "and natural emotional variation. Do not substitute another character's voice or generic "
                             "text-to-speech. This supplement adds continuity only and does not replace or rewrite the "
                             "verbatim card above.")
-        sections.append("Voice Card — " + card["name"] + ":\n" + (exact or "Use the named stable voice identity.")
+        sections.append("Voice Card — " + card["name"] +
+                        " (AUDIO-ONLY ACOUSTIC METADATA; NEVER DEPICT A PERSON OR CHANGE THE VISUAL CAST):\n"
+                        + (exact or "Use the named stable voice identity.")
                         + ("\n" + metadata if metadata else "")
                         + ("\nSelected-speaker series rules: " + character_rules if character_rules else "")
                         + supplement)
@@ -4944,9 +5098,9 @@ class ProductionManager:
             requires_translation = False
             for row in expected:
                 speaker = row["speaker"]
-                folded = speaker.casefold()
-                card = character_by_alias.get(folded) or character_by_voice_alias.get(folded)
-                if card:
+                card = (resolve_speaker_character(speaker, character_by_alias) or
+                        resolve_speaker_character(speaker, character_by_voice_alias))
+                if card and not reflected_speaker_label(speaker):
                     speaker = card["name"]
                 exact.append({"speaker": speaker, "text": row["text"],
                               "language": PRODUCTION_LANGUAGES[current["language"]], "voiceover": False})
@@ -4999,23 +5153,24 @@ class ProductionManager:
                 visible_speaker_names = []
                 for line in item.get("dialogue", []):
                     speaker_key = str(line.get("speaker", "")).strip().casefold()
-                    # Screenplays commonly append acting direction after a
-                    # vertical bar. It is not part of the character's name.
-                    speaker_name = re.split(r"[|｜]", speaker_key, maxsplit=1)[0].strip()
-                    character = (character_by_alias.get(speaker_name) or character_by_name.get(speaker_name) or
-                                 character_by_voice_alias.get(speaker_name) or
-                                 character_by_alias.get(speaker_key) or character_by_name.get(speaker_key) or
-                                 character_by_voice_alias.get(speaker_key))
+                    speaker_lookup = dict(character_by_alias)
+                    speaker_lookup.update(character_by_name)
+                    speaker_lookup.update(character_by_voice_alias)
+                    character = resolve_speaker_character(line.get("speaker"), speaker_lookup)
+                    is_reflection = reflected_speaker_label(line.get("speaker"))
                     if character:
                         # Store the reusable canonical name so voice cards and
                         # prompt subjects remain bound in every UI language.
-                        line["speaker"] = character["name"]
+                        # Preserve an explicit reflection wrapper because it is
+                        # the authored visual plane, not a new speaker identity.
+                        if not is_reflection:
+                            line["speaker"] = character["name"]
                         speaker_key = character["name"].strip().casefold()
-                    if (character and not line.get("voiceover") and
+                    if (character and not line.get("voiceover") and not is_reflection and
                             not character_is_embedded_form(character, visible_text) and
                             character["name"] not in selected_characters):
                         selected_characters.append(character["name"])
-                    if character and not line.get("voiceover"):
+                    if character and not line.get("voiceover") and not is_reflection:
                         visible_speaker_names.append(character["name"])
                     voice_name = voices_by_character.get(speaker_key)
                     if voice_name and voice_name not in item["card_selection"]["voices"]:
@@ -5266,6 +5421,7 @@ class ProductionManager:
         physical = list(card_selection.get("physical_subject_ids", []))
         display = list(card_selection.get("display_subject_ids", []))
         imagined = list(card_selection.get("imagined_subject_ids", []))
+        reflected = list(card_selection.get("reflected_subject_ids", []))
         offscreen = list(card_selection.get("offscreen_subject_ids", []))
         lines, visible_dialogue, selected_voices, selected_voice_ids = [], [], [], set()
         collective_subjects = []
@@ -5278,8 +5434,8 @@ class ProductionManager:
             if card["name"].strip().casefold() in explicitly_selected_voice_names]
         scripted_voices_by_text = {}
         for scripted_line in segment["dialogue"]:
-            scripted_key = scripted_line["speaker"].strip().casefold()
-            scripted_character = character_by_speaker_alias.get(scripted_key)
+            scripted_character = resolve_speaker_character(
+                scripted_line["speaker"], character_by_speaker_alias)
             if scripted_character is None:
                 continue
             scripted_voice = self._voice_for_subject(
@@ -5296,7 +5452,7 @@ class ProductionManager:
             re.IGNORECASE)
         for line in segment["dialogue"]:
             key = line["speaker"].strip().casefold()
-            character = character_by_speaker_alias.get(key)
+            character = resolve_speaker_character(line["speaker"], character_by_speaker_alias)
             subject = names.get(character["name"].strip().casefold()) if character else names.get(key)
             is_collective = (collective_speaker(line["speaker"]) and not line["voiceover"]
                              and key not in selected_names)
@@ -5386,6 +5542,8 @@ class ProductionManager:
                                   if sid in character_by_subject) or "none"
         final_imagined = ", ".join(character_by_subject[sid] for sid in imagined
                                    if sid in character_by_subject) or "none"
+        final_reflected = ", ".join(character_by_subject[sid] for sid in reflected
+                                    if sid in character_by_subject) or "none"
         scene = shot(segment["duration"])
         scene.update({"action": "\n\n".join(x for x in [
                 clip_text(segment["action"] or segment["story"]), cast_lock, prop_lock] if x),
@@ -5394,14 +5552,16 @@ class ProductionManager:
                 clip_text(segment["ending"]),
                 f"FINAL-FRAME CAST LOCK: show exactly {final_cast} as physical cast in the real location; every other named identity is physically absent.",
                 f"FINAL-FRAME DISPLAY LOCK: {final_display} may appear only inside the declared bounded device/remote display.",
-                f"FINAL-FRAME MEMORY LOCK: {final_imagined} may appear only as the declared non-diegetic thought/memory image."
+                f"FINAL-FRAME MEMORY LOCK: {final_imagined} may appear only as the declared non-diegetic thought/memory image.",
+                f"FINAL-FRAME REFLECTION LOCK: {final_reflected} may appear inside a mirror only when the authored ending still shows that mirror image; no other named identity is reflected."
             ] if x), "dialogue": lines,
             "visible_subject_ids": visible,
             "display_subject_ids": display,
             "imagined_subject_ids": imagined,
+            "reflected_subject_ids": reflected,
             "offscreen_subject_ids": offscreen,
             "director_locks": ["setting", "final_state", "visible_subject_ids",
-                               "display_subject_ids", "imagined_subject_ids",
+                               "display_subject_ids", "imagined_subject_ids", "reflected_subject_ids",
                                "offscreen_subject_ids"]})
         base["shots"] = [scene]
         voice_context = voice_prompt_context(production, selected_voices)
@@ -5453,8 +5613,10 @@ class ProductionManager:
                 "cards": [{
                     "subject_id": local_subjects_by_name[
                         characters_by_id[card["character_card_id"]]["name"].strip().casefold()],
-                    "name": card["name"], "description": card.get("description", ""),
-                    "notes": card.get("notes", ""), "voice_id": card.get("voice_id", ""),
+                    "name": card["name"],
+                    "description": acoustic_voice_text(card.get("description", "")),
+                    "notes": acoustic_voice_text(card.get("notes", "")),
+                    "voice_id": card.get("voice_id", ""),
                     "pace": card.get("pace", ""),
                     "series_rules": series_voice_character_rules(
                         production.get("series_voice_style", ""),
@@ -5637,7 +5799,8 @@ class ProductionManager:
     def _relevant_cards(self, production, segment):
         text = "\n".join(str(segment.get(key, "")) for key in
             ("title", "story", "setting", "action", "ending", "image_prompt")).casefold()
-        speakers = {line.get("speaker", "").strip().casefold() for line in segment.get("dialogue", [])}
+        speakers = set().union(*(speaker_alias_keys(line.get("speaker"))
+                                for line in segment.get("dialogue", []))) if segment.get("dialogue") else set()
         alias_sets = character_aliases(production)
         voice_aliases = voice_character_aliases(production)
         voice_character_ids = {card["id"] for alias, card in voice_aliases.items() if alias in speakers}
@@ -5645,8 +5808,9 @@ class ProductionManager:
                          if (card["id"] in voice_character_ids or
                              any(alias in speakers for alias in alias_sets.get(card["id"], set())))}
         presence_roles = character_presence_roles(production, segment)
+        reflected_ids = set(reflected_character_ids(production, segment, alias_sets))
         visually_required = {card_id for card_id, role in presence_roles.items()
-                             if role in ("physical", "display", "imagined")}
+                             if role in ("physical", "display", "imagined")} | reflected_ids
         if segment.get("card_selection_source") == "local_ai":
             selection = segment.get("card_selection", {})
             result = {}
@@ -5816,8 +5980,10 @@ class ProductionManager:
 
         relevant = self._relevant_cards(production, segment)
         presence_roles = character_presence_roles(production, segment)
+        reflected_ids = set(reflected_character_ids(production, segment))
         visual_characters = [card for card in relevant["characters"]
-                             if presence_roles.get(card["id"]) in ("physical", "display", "imagined")]
+                             if (presence_roles.get(card["id"]) in ("physical", "display", "imagined")
+                                 or card["id"] in reflected_ids)]
         missing_visual_identity_names = []
         character_overview = production["overview_asset_ids"].get("characters")
         if not character_overview:
@@ -5839,17 +6005,12 @@ class ProductionManager:
             if not candidates or (not illustrated and not manual_overview):
                 continue
             missing_details = len(illustrated) < len(candidates)
-            # Up to three visible characters use independent identity images.
-            # Four or more are assembled into a clip-specific numbered sheet
-            # containing exactly this clip's cast. This follows the production
-            # card-library rule, saves H3 reference slots, and prevents a dense
-            # multi-reference ensemble from re-instantiating one character
-            # during a camera reveal. A full user library sheet may contain
-            # absent cast, so the automatic clip-specific sheet is safer here.
-            if kind == "characters" and len(illustrated) > 3:
-                mode = "automatic"
-            else:
-                mode = "manual" if manual_overview and (missing_details or not illustrated) else "individual"
+            # Independent character identity images are more reliable than a
+            # montage whenever they fit H3's reference budget. Compress only
+            # when the total would actually exceed that budget; four-to-eight
+            # characters must not be merged pre-emptively into a sheet that can
+            # cause identity swaps or clone one region.
+            mode = "manual" if manual_overview and (missing_details or not illustrated) else "individual"
             plans.append({"kind": kind, "cards": candidates, "illustrated": illustrated,
                           "manual": manual_overview, "mode": mode})
 
@@ -5951,17 +6112,11 @@ class ProductionManager:
                 selected_images.append(asset_id)
                 image_budget -= 1
 
+        # Style-card pixels frequently contain sample people. A joint visual
+        # model may reproduce those people despite a negative instruction, so
+        # production clips use the already approved style analysis/text only.
+        # The source style card remains in the library and is never modified.
         style_context = []
-        for card in relevant["styles"]:
-            if card["asset_ids"]:
-                asset_id = card["asset_ids"][0]
-                asset = self._asset_in_project(project, asset_id, "styles")
-                asset["role"] = "context"
-                asset["description"] = "\n".join(x for x in [
-                    "This image is the highest-priority visual style authority. Transfer only its lighting, palette, contrast, rendering medium and texture; never copy depicted subjects, objects or location.",
-                    card.get("image_analysis", ""), card["description"], card["notes"]] if x)
-                asset["approved_observation"] = card.get("image_analysis", "") or asset.get("approved_observation", "")
-                style_context.append(asset_id)
 
         selected_audio = []
         for card in relevant["voices"][:3]:
@@ -5970,9 +6125,10 @@ class ProductionManager:
                 continue
             asset_id = card["asset_ids"][0]
             asset = self._asset_in_project(project, asset_id, "voices", owner)
-            written = "\n".join(x for x in [card["description"], card["notes"]] if x)
+            written = acoustic_voice_text("\n".join(
+                x for x in [card["description"], card["notes"]] if x))
             asset["description"] = "\n".join(x for x in [
-                (f"PRIMARY VOICE IDENTITY AUTHORITY for {card['name']}. Follow this uploaded clean voice sample for timbre, pitch, accent, apparent age, cadence, pace and vocal texture. "
+                (f"AUDIO-ONLY AUTHORITY for the existing speaker {card['name']}; never create or alter any visible body from this audio metadata. Follow this uploaded clean voice sample for timbre, pitch, accent, apparent age, cadence, pace and vocal texture. "
                  "Written direction supplements acting intent, emotional limits and exclusions. Never copy the sample's words; speak only the exact scripted dialogue in the project's target language."),
                 written,
             ] if x)
@@ -5988,10 +6144,13 @@ class ProductionManager:
                    if presence_roles.get(card["id"]) == role]
             for role in ("physical", "display", "imagined", "offscreen")
         }
+        reflected_subject_ids = [subject_for_card[card["id"]] for card in relevant["characters"]
+                                 if card["id"] in reflected_ids]
         return {"subject_ids": active_subject_ids,
                 "physical_subject_ids": role_subject_ids["physical"],
                 "display_subject_ids": role_subject_ids["display"],
                 "imagined_subject_ids": role_subject_ids["imagined"],
+                "reflected_subject_ids": reflected_subject_ids,
                 "offscreen_subject_ids": role_subject_ids["offscreen"],
                 "presence_roles_by_name": {
                     card["name"].strip().casefold(): presence_roles.get(card["id"], "absent")

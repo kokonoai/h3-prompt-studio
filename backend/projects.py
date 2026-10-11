@@ -13,7 +13,7 @@ from pathlib import Path
 DIRECTOR_LOCK_FIELDS = frozenset({
     'camera.framing', 'camera.movement', 'camera.height', 'camera.focus', 'camera.speed',
     'transition', 'setting', 'visible_subject_ids', 'display_subject_ids',
-    'imagined_subject_ids', 'offscreen_subject_ids', 'final_state', 'scene_contract',
+    'imagined_subject_ids', 'reflected_subject_ids', 'offscreen_subject_ids', 'final_state', 'scene_contract',
 })
 PROJECT_LANGUAGES = frozenset({'zh-CN', 'zh-TW', 'en', 'ja'})
 _ATOMIC_JSON_LOCK = threading.Lock()
@@ -38,7 +38,8 @@ def shot(duration=5):
     return {'id': uid(), 'duration': duration, 'action': '', 'setting': '',
             'camera': {'framing': 'medium', 'movement': 'static', 'height': 'eye level', 'speed': 'slow', 'focus': ''},
             'performance': '', 'final_state': '', 'visible_subject_ids': [],
-            'display_subject_ids': [], 'imagined_subject_ids': [], 'offscreen_subject_ids': [],
+            'display_subject_ids': [], 'imagined_subject_ids': [], 'reflected_subject_ids': [],
+            'offscreen_subject_ids': [],
             'dialogue': [], 'sound': '', 'transition': 'continuous'}
 
 def new_project():
@@ -156,7 +157,7 @@ def check_project(project):
                 text_fields(value, ('action', 'setting', 'performance', 'final_state', 'sound', 'transition'), path)
                 text_object(value.get('camera'), path + '.camera')
                 for field in ('visible_subject_ids', 'display_subject_ids',
-                              'imagined_subject_ids', 'offscreen_subject_ids'):
+                              'imagined_subject_ids', 'reflected_subject_ids', 'offscreen_subject_ids'):
                     string_list(value.get(field, []), f'{path}.{field}')
                 if 'director_locks' in value:
                     string_list(value['director_locks'], path + '.director_locks')
@@ -210,7 +211,7 @@ def atomic_json(path: Path, value):
 ALLOWED_SHOT_FIELDS = {
     'action', 'setting', 'camera', 'performance', 'final_state', 'sound', 'transition',
     'visible_subject_ids', 'display_subject_ids', 'imagined_subject_ids',
-    'offscreen_subject_ids', 'scene_contract',
+    'reflected_subject_ids', 'offscreen_subject_ids', 'scene_contract',
 }
 
 def merge_plan(project, proposal):
@@ -272,7 +273,7 @@ def merge_plan(project, proposal):
                 if field == 'scene_contract':
                     target['scene_contract_source'] = source.get('scene_contract_source', 'authored')
         for field in ('visible_subject_ids', 'display_subject_ids',
-                      'imagined_subject_ids', 'offscreen_subject_ids'):
+                      'imagined_subject_ids', 'reflected_subject_ids', 'offscreen_subject_ids'):
             ids = target.get(field, [])
             target[field] = ids
             if not isinstance(ids, list) or not all(isinstance(v, str) and v in subjects for v in ids):
@@ -379,7 +380,7 @@ def merge_assist(project, shot_id, field, value):
     result = copy.deepcopy(check_project(project))
     if field not in ALLOWED_SHOT_FIELDS - {
             'visible_subject_ids', 'display_subject_ids', 'imagined_subject_ids',
-            'offscreen_subject_ids', 'transition', 'scene_contract'}:
+            'reflected_subject_ids', 'offscreen_subject_ids', 'transition', 'scene_contract'}:
         raise ValueError('This field is protected from AI replacement.')
     target = next((s for s in result['shots'] if s['id'] == shot_id), None)
     if not target:

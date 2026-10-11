@@ -198,6 +198,9 @@ def _voice_and_dialogue(project, shots, names, speaker_ids, soundscape=""):
                 prefix += ' (voice from the bounded device/remote display only)'
             elif sid in shot.get('imagined_subject_ids', []):
                 prefix += ' (voice tied only to the non-diegetic thought or memory image)'
+            elif (sid in shot.get('reflected_subject_ids', []) and
+                  sid not in shot.get('visible_subject_ids', [])):
+                prefix += ' (voice from the authored mirror playback only)'
             elif line.get('voiceover') or sid in shot.get('offscreen_subject_ids', []):
                 prefix += ' (off-screen voice)'
             lines.append(prefix + ': <d>[' + tag + '] ' + words + '</d>'
@@ -225,6 +228,7 @@ def render_narrative_prompt(*, project, references, active, bound,
         cast = [subject_names[sid] for sid in shot.get('visible_subject_ids', []) if sid in subject_names]
         display_cast = [subject_names[sid] for sid in shot.get('display_subject_ids', []) if sid in subject_names]
         imagined_cast = [subject_names[sid] for sid in shot.get('imagined_subject_ids', []) if sid in subject_names]
+        reflected_cast = [subject_names[sid] for sid in shot.get('reflected_subject_ids', []) if sid in subject_names]
         parts = []
         setting = _text(shot.get('setting'))
         if setting and setting.casefold() not in story_text.casefold():
@@ -250,6 +254,12 @@ def render_narrative_prompt(*, project, references, active, bound,
             parts.append(
                 'Imagined or remembered cast: ' + ', '.join(imagined_cast) +
                 '; each is confined to one clearly non-diegetic thought or memory image and is physically absent from the real location.')
+        if reflected_cast:
+            parts.append(
+                'Authored mirror cast: ' + ', '.join(reflected_cast) +
+                '; each appears at most once and only inside one explicitly authored mirror surface. '
+                'A reflection is an optical or recorded depiction of the same identity, not a second physical body; '
+                'it has no floor contact, independent shadow or prop interaction. No unlisted identity is reflected.')
         action = _text(shot.get('action'))
         if action:
             parts.append(_sentence(action))

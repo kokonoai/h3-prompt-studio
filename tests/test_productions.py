@@ -695,17 +695,13 @@ def test_local_ai_selects_exact_project_cards_uses_dense_cast_overview_and_appli
     assert project["production_language"] == "ja"
     assert project["shots"][0]["dialogue"][0]["language"] == "Japanese"
     assert "voice target language Japanese" in project["shots"][0]["dialogue"][0]["delivery"]
-    assert strategy["overview_kinds"] == ["characters"]
-    assert strategy["overview_sources"] == {"characters": "automatic"}
-    assert len(strategy["image_asset_ids"]) == 2
+    assert strategy["overview_kinds"] == []
+    assert strategy["overview_sources"] == {}
+    assert len(strategy["image_asset_ids"]) == 5
     assert strategy["audio_asset_ids"] == [voice_asset["id"]]
     assert strategy["voice_authority"] == "audio_primary"
     voice_reference = next(asset for asset in project["assets"] if asset["id"] == voice_asset["id"])
-    assert "PRIMARY VOICE IDENTITY AUTHORITY" in voice_reference["description"]
-    character_overview = next(asset for asset in project["assets"]
-                              if asset.get("reference_card_kind") == "characters")
-    assert character_overview["reference_overview"] is True
-    assert character_overview["reference_card_names"] == ["A", "B", "C", "D"]
+    assert "AUDIO-ONLY AUTHORITY" in voice_reference["description"]
     compiled = compile_project(project)
     assert compiled["valid"] is True
     assert "primary authority for that speaker's audible identity" in compiled["prompt"]
@@ -1598,6 +1594,73 @@ def test_mimic_and_recorded_speakers_reuse_the_selected_voice_authority(tmp_path
     assert "POKKE_V1" in second["shots"][0]["dialogue"][0]["delivery"]
 
 
+def test_bilingual_and_reflected_speakers_bind_existing_subjects_without_extra_bodies(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source,
+        "brief": "- **镜鸟／Mirror Bird：** a silver paper bird. Mimi appears in a mirror.",
+        "language": "en",
+    })
+    pokke = _card("Pokke", [_image(store_asset, "pokke", "green")["id"]])
+    bird = _card("Mirror Bird", [_image(store_asset, "bird", "silver")["id"]])
+    mimi = _card("Mimi", [_image(store_asset, "mimi", "pink")["id"]])
+    chappi = _card("Chappi", [_image(store_asset, "chappi", "yellow")["id"]])
+    production["cards"]["characters"] = [pokke, bird, mimi, chappi]
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Mimic", "story": "The Mirror Bird mimics Pokke.", "setting": "mirror hall",
+        "action": "Pokke watches the Mirror Bird repeat his words.", "ending": "The bird flies away.",
+        "duration": 5, "duration_reason": "one echo", "image_prompt": "Pokke and the Mirror Bird",
+        "dialogue": [{"speaker": "镜鸟", "text": "That is mine.", "language": "English", "voiceover": False}],
+        "card_selection": {"characters": ["Pokke", "Mirror Bird"]},
+    }, {
+        "title": "Recorded Mimi", "story": "Chappi sees a reflection of Mimi waving.",
+        "setting": "mirror hall", "action": "The reflection of Mimi repeats an old gesture inside the mirror.",
+        "ending": "Chappi stops before the mirror.", "duration": 5, "duration_reason": "one replay",
+        "image_prompt": "Mimi's reflection remains inside one mirror while Chappi watches",
+        "dialogue": [{"speaker": "Mimi的镜像", "text": "This way.", "language": "English", "voiceover": False}],
+        "card_selection": {"characters": ["Chappi"]},
+    }], "local_ai")
+
+    mimic = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    assert {subject["name"] for subject in mimic["subjects"]} == {"Pokke", "Mirror Bird"}
+    assert all(subject["name"] != "镜鸟" for subject in mimic["subjects"])
+
+    production = manager.get(production["id"])
+    reflected = manager.materialise(production["id"], production["segments"][1]["id"])["project"]
+    names = {subject["id"]: subject["name"] for subject in reflected["subjects"]}
+    scene = reflected["shots"][0]
+    assert [names[sid] for sid in scene["reflected_subject_ids"]] == ["Mimi"]
+    assert "Mimi" not in [names[sid] for sid in scene["visible_subject_ids"]]
+    assert all(subject["name"] != "Mimi的镜像" for subject in reflected["subjects"])
+    compiled = compile_project(reflected)
+    assert compiled["valid"], compiled["issues"]
+    assert "authored mirror cast:" in compiled["prompt"].casefold()
+    assert "the only named identities allowed inside any mirror surface are mimi" in compiled["prompt"].casefold()
+
+
+def test_render_voice_metadata_cannot_summon_a_human_body(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "Bokka speaks.", "language": "en"})
+    bokka = _card("Bokka")
+    voice = _card("Bokka voice", character_card_id=bokka["id"],
+                  description="A slightly husky, confident animated girl voice.", voice_id="BOKKA_V1")
+    production["cards"].update({"characters": [bokka], "voices": [voice]})
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Reply", "story": "Bokka replies.", "setting": "hall", "action": "Bokka answers.",
+        "ending": "Bokka waits.", "duration": 5, "duration_reason": "one line",
+        "image_prompt": "Bokka alone", "dialogue": [{"speaker": "Bokka", "text": "My turn.",
+        "language": "English", "voiceover": False}], "card_selection": {"characters": ["Bokka"]},
+    }], "local_ai")
+
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+
+    assert "animated girl voice" not in project["custom_instructions"].casefold()
+    assert "audio-only acoustic metadata" in project["custom_instructions"].casefold()
+    assert "youthful higher vocal register" in project["custom_instructions"].casefold()
+
+
 def test_director_version_keeps_voice_metadata_scoped_and_classic_available(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({
@@ -1935,8 +1998,8 @@ def test_text_only_clip_falls_back_from_ref2va_without_using_style_image_as_subj
     assert project["production_link"]["reference_strategy"]["effective_mode"] == "t2va"
     assert project["production_link"]["reference_strategy"]["missing_visual_identity_names"] == ["Hero"]
     assert "TEXT-ONLY VISIBLE IDENTITY WARNING" in project["production_planning_context"]
-    assert [(asset["id"], asset["role"]) for asset in project["assets"]] == [
-        (style_image["id"], "context")]
+    assert project["assets"] == []
+    assert "Loose watercolor pigment on paper" in project["style"]["genre"]
     compiled = compile_project(project)
     assert compiled["valid"] is True, compiled["issues"]
 
@@ -2144,7 +2207,7 @@ def test_manual_overviews_reduce_cross_category_reference_pressure(tmp_path):
     assert "characters" not in strategy["overview_sources"]
 
 
-def test_dense_cast_uses_clip_specific_overview_even_when_nine_slots_fit(tmp_path):
+def test_dense_cast_keeps_individual_identity_images_when_nine_slots_fit(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "Eight friends inspect a clock."})
     characters = [_card(f"Actor {index}", [_image(store_asset, f"actor-{index}", "blue")["id"]])
@@ -2166,15 +2229,12 @@ def test_dense_cast_uses_clip_specific_overview_even_when_nine_slots_fit(tmp_pat
     project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
     strategy = project["production_link"]["reference_strategy"]
 
-    assert len(strategy["image_asset_ids"]) == 2
+    assert len(strategy["image_asset_ids"]) == 9
     assert cast_overview["id"] not in strategy["image_asset_ids"]
-    assert not set(card["asset_ids"][0] for card in characters).intersection(strategy["image_asset_ids"])
+    assert set(card["asset_ids"][0] for card in characters) <= set(strategy["image_asset_ids"])
     assert props[0]["asset_ids"][0] in strategy["image_asset_ids"]
     assert prop_overview["id"] not in strategy["image_asset_ids"]
-    assert strategy["overview_sources"] == {"characters": "automatic"}
-    overview = next(asset for asset in project["assets"]
-                    if asset.get("reference_card_kind") == "characters")
-    assert overview["reference_card_names"] == [card["name"] for card in characters]
+    assert strategy["overview_sources"] == {}
 
 
 def test_explicit_heuristic_cast_does_not_expand_and_badge_form_is_not_a_body(tmp_path):
@@ -2456,11 +2516,9 @@ def test_style_image_analysis_outranks_custom_text_and_preset(tmp_path):
     production = manager.apply_plan(production["id"], planned, "local_ai")
     result = manager.materialise(production["id"], production["segments"][0]["id"])
     strategy = result["project"]["production_link"]["reference_strategy"]
-    assert strategy["style_context_asset_ids"] == [style_asset["id"]]
-    materialised = next(asset for asset in result["project"]["assets"] if asset["id"] == style_asset["id"])
-    assert materialised["role"] == "context"
-    assert materialised["approved_observation"] == "low contrast violet palette; fine paper grain"
-    assert "highest-priority visual style authority" in materialised["description"]
+    assert strategy["style_context_asset_ids"] == []
+    assert all(asset["id"] != style_asset["id"] for asset in result["project"]["assets"])
+    assert "low contrast violet palette; fine paper grain" in result["project"]["style"]["genre"]
 
 
 def test_legacy_production_gains_safe_task_timing_prompt_and_keyframe_defaults(tmp_path):

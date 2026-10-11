@@ -148,8 +148,9 @@ def normalise_structured_dialogue_directions(project):
         if not speaker_ids:
             continue
         visible = set(shot.get("visible_subject_ids", []))
+        reflected_only = set(shot.get("reflected_subject_ids", [])) - set(shot.get("visible_subject_ids", []))
         remote = set(shot.get("display_subject_ids", [])) | set(
-            shot.get("imagined_subject_ids", [])) | set(shot.get("offscreen_subject_ids", []))
+            shot.get("imagined_subject_ids", [])) | reflected_only | set(shot.get("offscreen_subject_ids", []))
         has_local_dialogue = bool(speaker_ids & visible)
         has_remote_dialogue = bool(speaker_ids & remote)
         for field in ("action", "performance", "sound"):

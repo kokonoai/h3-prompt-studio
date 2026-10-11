@@ -1706,6 +1706,7 @@ export default function App() {
                           target.visible_subject_ids = target.visible_subject_ids.filter((id) => id !== s.id);
                           target.display_subject_ids = (target.display_subject_ids || []).filter((id) => id !== s.id);
                           target.imagined_subject_ids = (target.imagined_subject_ids || []).filter((id) => id !== s.id);
+                          target.reflected_subject_ids = (target.reflected_subject_ids || []).filter((id) => id !== s.id);
                           target.offscreen_subject_ids = target.offscreen_subject_ids.filter((id) => id !== s.id);
                           pruneSceneActors(d, target.id);
                         }

@@ -422,6 +422,18 @@ def compile_project(project: dict) -> dict:
                     issue("error", "conflicting_subject_roster", path,
                           f"A subject cannot be assigned to both {previous} and {key} in the same shot.")
                 assigned[sid] = key
+        reflected_ids = shot.get("reflected_subject_ids", [])
+        if not isinstance(reflected_ids, list) or any(not isinstance(v, str) for v in reflected_ids):
+            issue("error", "invalid_subject_roster", path + ".reflected_subject_ids",
+                  "Expected a list of subject IDs.")
+            reflected_ids = []
+        for sid in reflected_ids:
+            if sid not in subject_map:
+                issue("error", "unknown_subject", path + ".reflected_subject_ids",
+                      "A shot refers to an unknown reflected subject ID.")
+        if len(set(reflected_ids)) != len(reflected_ids):
+            issue("error", "duplicate_subject_roster", path + ".reflected_subject_ids",
+                  "A subject is listed twice in the reflected roster.")
         dialogue = collection(shot.get("dialogue", []), path + ".dialogue")
         word_count = 0
         for j, line in enumerate(dialogue):
@@ -558,6 +570,7 @@ def compile_project(project: dict) -> dict:
             ordered_ids.extend(shot.get("visible_subject_ids", []))
             ordered_ids.extend(shot.get("display_subject_ids", []))
             ordered_ids.extend(shot.get("imagined_subject_ids", []))
+            ordered_ids.extend(shot.get("reflected_subject_ids", []))
             ordered_ids.extend(shot.get("offscreen_subject_ids", []))
         ordered_ids.extend(subject["id"] for subject in subjects)
         order = {subject_id: index for index, subject_id in enumerate(dict.fromkeys(ordered_ids))}
@@ -712,6 +725,7 @@ def compile_project(project: dict) -> dict:
                     if not (viewpoint == 'pov' and sid == project.get('game_player_id'))]
         display_ids = list(dict.fromkeys(shot.get("display_subject_ids", [])))
         imagined_ids = list(dict.fromkeys(shot.get("imagined_subject_ids", [])))
+        reflected_ids = list(dict.fromkeys(shot.get("reflected_subject_ids", [])))
         if cast_ids:
             paragraphs.append(_sentence(
                 "Exact named visible roster: " + "; ".join(name(sid) for sid in cast_ids)
@@ -737,6 +751,10 @@ def compile_project(project: dict) -> dict:
             paragraphs.append(_sentence(
                 "IMAGINED OR REMEMBERED CAST: " + "; ".join(name(sid) for sid in imagined_ids)
                 + ". These identities may appear only inside one clearly non-diegetic thought or memory image with an unmistakable soft boundary or editorial transition. They are absent from the physical location and cannot touch its people or props, cast a physical shadow, appear in a reflection, or gain a second body"))
+        if reflected_ids:
+            paragraphs.append(_sentence(
+                "AUTHORED MIRROR CAST: " + "; ".join(name(sid) for sid in reflected_ids)
+                + ". Each may appear at most once inside one explicitly authored mirror surface and nowhere else because of this roster. A reflection is an optical or recorded depiction, not another physical actor: it has no floor contact, independent physical shadow, prop interaction or body outside the mirror. No unlisted identity may be reflected, and reference images must never create extra reflections or duplicate bodies"))
         identity_lock = visible_identity_lock(subjects, cast_ids, name)
         if identity_lock:
             paragraphs.append(identity_lock)
@@ -790,11 +808,13 @@ def compile_project(project: dict) -> dict:
             offscreen = sid in shot.get("offscreen_subject_ids", [])
             display_only = sid in display_ids
             imagined_only = sid in imagined_ids
+            reflected_only = sid in reflected_ids and sid not in shot.get("visible_subject_ids", [])
             collective = bool(subject_map[sid].get("collective_member_ids"))
             verb = ("say together in exact unison" if collective else
                     "says in an off-screen voiceover" if voiceover else
                     "speaks only from the bounded device display" if display_only else
                     "is heard only with the non-diegetic memory image" if imagined_only else
+                     "is heard only from the authored mirror playback" if reflected_only else
                     "speaks off-screen" if offscreen else "says")
             utterance = f"{name(sid)} {speaker_ids[sid]} {verb}"
             if delivery:

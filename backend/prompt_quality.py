@@ -118,7 +118,7 @@ def review_generated_plan(production, segment, baseline, candidate):
                 f"Restore the exact locked {label}; improve staging only."))
 
     locked_fields = ("setting", "final_state", "visible_subject_ids", "display_subject_ids",
-                     "imagined_subject_ids", "offscreen_subject_ids")
+                     "imagined_subject_ids", "reflected_subject_ids", "offscreen_subject_ids")
     for index, source in enumerate(baseline_shots):
         if index >= len(candidate_shots) or not isinstance(source, dict) or not isinstance(candidate_shots[index], dict):
             continue
@@ -133,6 +133,9 @@ def review_generated_plan(production, segment, baseline, candidate):
                 issues.append(_issue(
                     f"locked_{field}_changed", f"The generated plan changed locked shot field {field}.",
                     f"Restore {field} exactly; do not change physical, display, memory or off-screen cast placement."))
+        # Reflections intentionally may overlap a physical or off-screen
+        # identity: they are an optical depiction of the same person, not a
+        # second mutually exclusive performer plane.
         planes = [set(target.get(field, [])) for field in
                   ("visible_subject_ids", "display_subject_ids", "imagined_subject_ids", "offscreen_subject_ids")]
         if any(planes[left] & planes[right] for left in range(len(planes))

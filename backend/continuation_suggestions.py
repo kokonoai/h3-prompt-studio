@@ -449,6 +449,7 @@ def compact_plan(client, model, project, instructions="", persona="universal"):
                 "setting": _brief(source.get("setting"), limit * 2),
                 "camera": {key: _brief(value, 80) for key, value in source["camera"].items()},
                 "visible": [names[sid] for sid in source["visible_subject_ids"] if sid in names],
+                "reflected": [names[sid] for sid in source.get("reflected_subject_ids", []) if sid in names],
                 "offscreen": [names[sid] for sid in source["offscreen_subject_ids"] if sid in names],
                 "speech": [{"speaker": names.get(line["speaker_id"], ""), "words": len(line["text"].split())} for line in source["dialogue"]],
                 "transition": _brief(source.get("transition"), 80)}

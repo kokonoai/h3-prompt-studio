@@ -269,7 +269,7 @@ def project_context(project):
                           for s in project.get("subjects", [])]
     result["assets"] = [{k: copy.deepcopy(a.get(k)) for k in ("id", "name", "prompt_tag", "role", "semantic_role", "enabled", "locked_order", "description", "approved_observation", "simple_owner_id")}
                         for a in project.get("assets", []) if a.get("enabled", True)]
-    result["shots"] = [{k: copy.deepcopy(s.get(k)) for k in ("id", "duration", "action", "setting", "camera", "performance", "final_state", "visible_subject_ids", "offscreen_subject_ids", "dialogue", "sound", "transition", "director_locks", "scene_contract", "scene_contract_source")}
+    result["shots"] = [{k: copy.deepcopy(s.get(k)) for k in ("id", "duration", "action", "setting", "camera", "performance", "final_state", "visible_subject_ids", "display_subject_ids", "imagined_subject_ids", "reflected_subject_ids", "offscreen_subject_ids", "dialogue", "sound", "transition", "director_locks", "scene_contract", "scene_contract_source")}
                        for s in project.get("shots", [])]
     continuation = project.get('simple', {}).get('continuation')
     if isinstance(continuation, dict):

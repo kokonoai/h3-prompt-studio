@@ -54,6 +54,8 @@ export type Shot = {
   visible_subject_ids: string[];
   display_subject_ids?: string[];
   imagined_subject_ids?: string[];
+  /** Optical/recorded depictions inside authored mirror surfaces; may overlap a physical or off-screen identity. */
+  reflected_subject_ids?: string[];
   offscreen_subject_ids: string[];
   dialogue: any[];
   sound: string;
@@ -100,6 +102,7 @@ export const newShot = (duration = 5): Shot => ({
   visible_subject_ids: [],
   display_subject_ids: [],
   imagined_subject_ids: [],
+  reflected_subject_ids: [],
   offscreen_subject_ids: [],
   dialogue: [],
   sound: "",
