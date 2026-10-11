@@ -614,18 +614,23 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     source = {'id': str(uuid.uuid4()), 'project_id': previous_project_id,
         'status': 'succeeded', 'can_continue': True,
         'continuation_source': 'verified-state.mmh3'}
-    submitted = []
+    submitted, boundary_actions = [], []
 
     class Manager:
         def assert_active(self, _ident):
             return production
         def has_inherited_clip_directions(self, _production, _project):
             return False
-        def assert_video_project_current(self, _production, _project):
+        def assert_video_project_current(self, _production, _project, **_kwargs):
             return None
         def set_segment_prompt(self, *_args):
             return production
         def set_video_run(self, *_args):
+            return production
+        def apply_boundary_action(self, _production_id, previous_segment_id,
+                                  segment_id, _run_id, action):
+            boundary_actions.append((previous_segment_id, segment_id, action))
+            production['segments'][1]['continue_previous'] = False
             return production
 
     class Videos:
@@ -655,6 +660,15 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     source['can_continue'] = False
     with pytest.raises(ValueError, match='verified .mmh3'):
         module.production_segment_video(production['id'], current_id, {'new_seed': False})
+    assert len(submitted) == 1
+
+    production['segments'][1]['continue_previous'] = True
+    with pytest.raises(ValueError, match='boundary was changed to a hard cut'):
+        module.production_segment_video(
+            production['id'], current_id,
+            {'new_seed': False, '_automation': True})
+    assert boundary_actions == [(previous_id, current_id, 'hard_cut')]
+    assert production['segments'][1]['continue_previous'] is False
     assert len(submitted) == 1
 
     production['segments'][1]['continue_previous'] = False

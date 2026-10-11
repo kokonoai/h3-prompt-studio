@@ -8,11 +8,13 @@ from PIL import Image, ImageDraw
 from backend.compiler import compile_project
 from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
                                  _segment_hash_with_empty_prop_state,
+                                 audit_storyboard_contract,
                                  authored_internal_timing,
                                  card_plan_source_hash, card_planning_chunks, card_planning_payload,
                                  character_aliases, current_episode_story,
                                  character_presence_roles,
                                  continuity_visual_lock, device_screen_geometry_lock,
+                                 dialogue_minimum_seconds,
                                  effective_temporal_cast_lock, inscribed_prop_continuity_lock,
                                  episode_timing_targets, fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
@@ -612,6 +614,31 @@ def test_video_admission_rejects_old_or_missing_character_identity_strategy(tmp_
     project["production_link"]["reference_strategy"]["reference_strategy_version"] -= 1
     with pytest.raises(ValueError, match="outdated character-reference assignment"):
         manager.assert_video_project_current(production, project)
+
+
+def test_automation_video_admission_matches_initial_cut_advisory_policy(tmp_path):
+    manager, _source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production_id, segment_id, project_id = _id(), _id(), _id()
+    production = {"id": production_id, "segments": [{
+        "id": segment_id, "index": 1, "project_id": project_id, "status": "ready",
+        "reference_strategy_version": REFERENCE_STRATEGY_VERSION,
+        "preflight_issues": [{
+            "severity": "error", "code": "cast_capacity",
+            "message": "The shot exceeds the nine-reference budget.",
+        }],
+    }]}
+    project = {"id": project_id, "production_link": {
+        "production_id": production_id, "segment_id": segment_id,
+        "reference_strategy": {
+            "reference_strategy_version": REFERENCE_STRATEGY_VERSION,
+            "missing_visual_identity_names": [],
+        },
+    }}
+
+    with pytest.raises(ValueError, match="failed shot preflight"):
+        manager.assert_video_project_current(production, project)
+    manager.assert_video_project_current(
+        production, project, allow_render_advisories=True)
 
 
 def test_generated_card_image_is_project_scoped_and_newest_is_primary(tmp_path):
@@ -3036,6 +3063,22 @@ def test_shot_preflight_unifies_dialogue_camera_and_internal_cut_failures(tmp_pa
         production, segment, allow_render_advisories=True)
 
 
+def test_initial_cut_fallback_keeps_cast_capacity_and_plane_defects_advisory():
+    manager = object.__new__(ProductionManager)
+    production = {"segments": []}
+    segment = {"index": 1, "preflight_issues": [
+        {"severity": "error", "code": "cast_capacity",
+         "message": "The shot exceeds the reference budget."},
+        {"severity": "error", "code": "nonphysical_character_in_reality",
+         "message": "A remote character appears in physical space."},
+    ]}
+
+    with pytest.raises(ValueError, match="failed shot preflight"):
+        manager.assert_storyboard_contract_current(production, segment)
+    assert manager.assert_storyboard_contract_current(
+        production, segment, allow_render_advisories=True)
+
+
 def test_shot_preflight_blocks_a_match_cut_hidden_inside_a_sentence():
     production = {"brief": "A remote exchange.",
                   "cards": {kind: [] for kind in CARD_KINDS}}
@@ -3189,6 +3232,65 @@ def test_modest_authored_dialogue_overrun_warns_but_large_overrun_blocks():
     overloaded_issues = shot_preflight_for_segment(production, overloaded)
     assert any(row["code"] == "dialogue_overflow" and row["severity"] == "error"
                for row in overloaded_issues)
+
+
+def test_materialise_auto_extends_dialogue_clip_without_rewriting_source(tmp_path):
+    manager, source, projects, _assets, _store_asset = _rig(tmp_path)
+    source["story"]["text"] = (
+        'Bokka: "I look especially good from this side today, too."\n'
+        'Chappi: "That\'s the same side."'
+    )
+    projects[source["id"]] = copy.deepcopy(source)
+    production = manager.create({
+        "source_project": source,
+        "brief": source["story"]["text"],
+        "language": "en",
+    })
+    production["cards"]["characters"] = [_card("Bokka"), _card("Chappi")]
+    timeline = {"visible_start": ["Bokka", "Chappi"],
+                "visible_end": ["Bokka", "Chappi"], "enters": [], "exits": [],
+                "offscreen": [], "mentioned_only": []}
+    clip = _planned_clip("Mirror moment", ["Bokka", "Chappi"], timeline, "hard_cut")
+    clip.update({
+        "story": "Bokka admires himself and Chappi corrects him.",
+        "setting": "A mirror beside their camp.",
+        "action": "Bokka poses at the mirror while Chappi watches.",
+        "ending": "Bokka holds the same pose.",
+        "duration": 5,
+        "duration_reason": "brief comic exchange",
+        "dialogue": [
+            {"speaker": "Bokka", "text": "I look especially good from this side today, too.",
+             "language": "English", "voiceover": False},
+            {"speaker": "Chappi", "text": "That's the same side.",
+             "language": "English", "voiceover": False},
+        ],
+        "continuity_state": _continuity_state(
+            "Bokka and Chappi at mirror", "Bokka and Chappi at mirror",
+            ["Bokka", "Chappi"], mmh3=False),
+        "shot_contract": _shot_contract("hard_cut", "medium"),
+    })
+    production = manager.apply_plan(production["id"], [clip], "fallback")
+    # apply_plan normally expands a single-clip fixture to the episode target;
+    # restore the authored short timing to exercise materialisation recovery.
+    production["segments"][0]["duration"] = 5
+    production["segments"][0]["duration_reason"] = "brief comic exchange"
+    production["segments"][0]["dialogue"] = copy.deepcopy(clip["dialogue"])
+    audit_storyboard_contract(production, backfill_legacy=True)
+    production = manager.save(production)
+    segment = production["segments"][0]
+    original_dialogue = copy.deepcopy(segment["dialogue"])
+    assert any(row["code"] == "dialogue_overflow" and row["severity"] == "error"
+               for row in segment["preflight_issues"])
+
+    repaired = manager.materialise(production["id"], segment["id"])["production"]
+    repaired_segment = repaired["segments"][0]
+
+    assert repaired_segment["duration"] == dialogue_minimum_seconds(repaired_segment)
+    assert repaired_segment["duration"] > 5
+    assert repaired_segment["dialogue"] == original_dialogue
+    assert not [row for row in repaired_segment["preflight_issues"]
+                if row["severity"] == "error"]
+    assert "automatically extended" in repaired_segment["duration_reason"]
 
 
 def test_boundary_actions_save_verified_continuation_or_force_hard_cut(tmp_path):

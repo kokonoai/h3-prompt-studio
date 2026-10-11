@@ -162,6 +162,22 @@ def test_generate_is_background_ready_idempotent_and_exact(rig, schema):
     assert all(path != '/history' for _, path in server.calls)
 
 
+def test_preparation_failure_preserves_bounded_root_cause_for_orchestration(rig):
+    manager, project, _server, _resources, _prepared = rig
+
+    def broken_prepare(_project, _prompt):
+        raise RuntimeError('Graph adapter could not resolve the selected clip input.')
+
+    manager.prepare = broken_prepare
+    job = manager.submit(uid(), project, 'Exact private compiled prompt.')
+    result = manager.process(job['id'])
+
+    assert result['status'] == 'failed'
+    assert result['error'] == (
+        'RuntimeError: Graph adapter could not resolve the selected clip input.')
+    assert 'LM Studio connections' not in result['error']
+
+
 def test_own_result_has_safe_video_state_snapshot_and_no_private_payload(rig):
     manager, project, server, _, _ = rig
     result = complete(rig)

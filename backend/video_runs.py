@@ -769,9 +769,21 @@ class VideoRunManager:
             self.resources.prepare_h3_then(queue_once)
         except Exception as exc:
             uncertain = bool(record.get('submission_intent')) and record['status'] != 'failed'
-            message = ('The submission response was lost. Studio will not submit this request again. Check ComfyUI’s queue before starting another video.'
-                       if uncertain else str(exc)[:700] if isinstance(exc, (ValueError, ResourceError)) else
-                       'Video preparation could not finish. Check the ComfyUI and LM Studio connections; nothing was queued.')
+            if uncertain:
+                message = ('The submission response was lost. Studio will not submit this request again. '
+                           'Check ComfyUI’s queue before starting another video.')
+            elif isinstance(exc, (ValueError, ResourceError)):
+                message = _error_text(str(exc), 700) or exc.__class__.__name__
+            elif isinstance(exc, httpx.HTTPError):
+                detail = _error_text(str(exc), 620)
+                message = 'ComfyUI request failed' + (': ' + detail if detail else '.')
+            else:
+                # Do not erase a clip-local graph/preparation defect behind a
+                # generic connection hint. The orchestration layer needs the
+                # actual bounded diagnostic to decide whether other clips can
+                # continue or shared infrastructure must pause the episode.
+                detail = _error_text(str(exc), 620)
+                message = (exc.__class__.__name__ + (': ' + detail if detail else ''))[:700]
             self._save(record, status='uncertain' if uncertain else 'failed', stage='Check submission' if uncertain else 'Needs attention',
                        error=message, **({} if uncertain else {'finished_at': time.time()}))
         finally:

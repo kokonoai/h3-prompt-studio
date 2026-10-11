@@ -43,6 +43,11 @@ PROMPT_REPAIR_MARKERS = (
     "wardrobe-card selection changes across a continuous boundary",
     "camera axis changes during continuous action",
     "previous-ending continuation is enabled but this transition is not mmh3-safe",
+    # Runtime evidence can prove that an intended MMH3 continuation is not
+    # available even though the storyboard contract looked valid. The video
+    # endpoint downgrades that one boundary to a hard cut before asking the
+    # automation worker to rebuild its prompt.
+    "automatic continuation was unavailable; the boundary was changed to a hard cut",
 )
 TRANSIENT_MARKERS = (
     "timeout", "timed out", "readtimeout", "connecttimeout", "connection",
@@ -80,6 +85,7 @@ GLOBAL_FAILURE_MARKERS = (
     "comfyui’s queue status could not be verified",
     "original comfyui connection is unknown",
     "comfyui transfer did not finish",
+    "comfyui request failed",
     "check the comfyui and lm studio connections",
     # These are compiler-owned invariants, not scene-authoring defects. If one
     # is absent after compilation, every following clip would fail for the same
@@ -88,6 +94,14 @@ GLOBAL_FAILURE_MARKERS = (
     "failed final h3 prompt quality: the final h3 prompt must contain exactly one final audio override",
     "failed final h3 prompt quality: the final audio override does not match the locked dialogue count",
     "failed final h3 prompt quality: the final h3 prompt lost or duplicated its production continuity override",
+)
+MISSING_VIDEO_REQUEST_MARKERS = (
+    # The resolver checked the saved request against ComfyUI and found neither
+    # an active job nor a recoverable output.  Reusing the old request ID would
+    # only rediscover the same terminal record; a fresh ID is safe because the
+    # resolver has explicitly ruled out duplicate work.
+    "no active task or recoverable result matching this request was found",
+    "previous request released; no active comfy job found",
 )
 
 
@@ -112,6 +126,12 @@ def is_global_failure(message: str) -> bool:
     value = str(message).casefold()
     return (any(marker in value for marker in GLOBAL_FAILURE_MARKERS)
             or is_transient_failure(value))
+
+
+def is_missing_video_request(message: str) -> bool:
+    """Return whether a durable request was conclusively released as absent."""
+    value = str(message).casefold()
+    return any(marker in value for marker in MISSING_VIDEO_REQUEST_MARKERS)
 
 
 class ProductionAutomationManager:
@@ -428,11 +448,27 @@ class ProductionAutomationManager:
                 self._update(production_id, run_id=None, request_id=None, attempt=0,
                              last_error="", stage_detail="Video ready")
                 return
-            raise RuntimeError(job.get("error") or job.get("stage") or
-                               f"Clip {index} video failed.")
+            prior_error = (job.get("error") or job.get("stage") or
+                           f"Clip {index} video failed.")
+            if is_missing_video_request(prior_error):
+                # The old durable cursor is terminal and ComfyUI has confirmed
+                # that it owns no matching work. Clear it and fall through to
+                # one normal fresh submission in this same worker pass.
+                self._update(
+                    production_id, run_id=None, request_id=None, attempt=0,
+                    last_error="",
+                    stage_detail=f"Previous request for clip {index} is absent; submitting a new take",
+                )
+            else:
+                raise RuntimeError(prior_error)
 
         repaired = False
         fallback_used = False
+        missing_request_retried = False
+        # The persisted cursor may have been cleared above after a conclusive
+        # missing-request resolution. Reload it so the fresh take never reuses
+        # the released idempotency key.
+        automation = self.get_production(production_id).get("automation", {})
         request_id = automation.get("request_id") or str(uuid.uuid4())
         max_attempts = len(self.retry_delays) + 1
         for attempt in range(max_attempts):
@@ -467,10 +503,21 @@ class ProductionAutomationManager:
                     return
                 # A returned terminal failure is confirmed not to be queued. A
                 # later retry therefore receives a new idempotency key.
+                terminal_error = (job.get("error") or job.get("stage") or
+                                  f"Clip {index} video failed.")
                 request_id = str(uuid.uuid4())
                 self._update(production_id, run_id=None, request_id=request_id)
-                raise RuntimeError(job.get("error") or job.get("stage") or
-                                   f"Clip {index} video failed.")
+                if (is_missing_video_request(terminal_error)
+                        and not missing_request_retried
+                        and attempt + 1 < max_attempts):
+                    missing_request_retried = True
+                    self._update(
+                        production_id, status="running", stage="videos",
+                        attempt=attempt + 1, last_error="",
+                        stage_detail=f"Submitting a fresh take for clip {index}",
+                    )
+                    continue
+                raise RuntimeError(terminal_error)
             except Exception as exc:
                 message = str(exc)
                 if is_prompt_repairable(message) and not repaired:

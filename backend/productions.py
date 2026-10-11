@@ -45,6 +45,10 @@ AUTO_HARD_CUT_CONTINUITY_CODES = frozenset({
 AUTOMATION_RENDER_ADVISORY_CODES = frozenset({
     "multiple_internal_cuts", "internal_editorial_cut",
     "impossible_camera_change", "face_screen_geometry",
+    # The author chose an initial-cut-first workflow. These spatial/capacity
+    # defects remain prominently visible in preflight and later manual QC, but
+    # they must not leave an otherwise renderable episode without a first cut.
+    "nonphysical_character_in_reality", "cast_capacity",
 })
 SHOT_ROLES = ("master", "reaction", "close_up", "insert", "establishing", "over_shoulder", "cutaway")
 SHOT_SIZES = ("extreme_wide", "wide", "medium", "medium_close", "close_up", "extreme_close_up")
@@ -6338,8 +6342,10 @@ class ProductionManager:
         Unsafe adjacent continuation is downgraded to a normal hard cut. One
         explicit two-setup editorial transition may also be split when it has
         no dialogue and its source contract can be partitioned without loss.
-        Ambiguous cuts and dialogue-bearing cuts remain blocking rather than
-        guessing who speaks in which newly created clip.
+        A dialogue-bearing clip whose exact lines fit inside H3's maximum
+        duration is lengthened instead of rushing or rewriting the speech.
+        Ambiguous cuts remain blocking rather than guessing how to repartition
+        their source contract.
         """
         errors = [row for row in segment.get("preflight_issues", [])
                   if row.get("severity") == "error"]
@@ -6352,6 +6358,26 @@ class ProductionManager:
 
         repaired_codes = sorted(codes & AUTO_HARD_CUT_CONTINUITY_CODES)
         changed = False
+
+        if "dialogue_overflow" in codes:
+            dialogue_floor = int(math.ceil(dialogue_minimum_seconds(segment)))
+            current_duration = int(segment.get("duration") or PLANNED_MIN_SECONDS)
+            if current_duration < dialogue_floor <= MAX_SECONDS:
+                segment["duration"] = dialogue_floor
+                prior_reason = str(segment.get("duration_reason") or "").rstrip(".。；; ")
+                repair_reason = (
+                    f"automatically extended from {current_duration}s to {dialogue_floor}s "
+                    "to preserve the exact source dialogue"
+                )
+                segment["duration_reason"] = (
+                    f"{prior_reason}; {repair_reason}" if prior_reason else repair_reason)
+                warning = (
+                    f"Auto-extended this clip from {current_duration}s to {dialogue_floor}s; "
+                    "the locked dialogue, story and cast were preserved."
+                )
+                segment["continuity_warnings"] = list(dict.fromkeys(
+                    [*segment.get("continuity_warnings", []), warning]))[:16]
+                changed = True
 
         if "cut_relation_conflict" in codes:
             segment.setdefault("shot_contract", {})["relation_previous"] = (
@@ -6625,7 +6651,8 @@ class ProductionManager:
             production["automation"]["total"] = len(segments)
         return True
 
-    def assert_video_project_current(self, production, project):
+    def assert_video_project_current(self, production, project, *,
+                                     allow_render_advisories=False):
         """Reject stale or visually ungrounded production snapshots.
 
         A browser can keep an old one-click queue in memory across a server
@@ -6640,7 +6667,9 @@ class ProductionManager:
                         if item.get("id") == segment_id), None)
         if segment is None:
             raise ValueError("This production clip no longer exists. Rebuild its video prompt before rendering.")
-        self.assert_storyboard_contract_current(production, segment)
+        self.assert_storyboard_contract_current(
+            production, segment,
+            allow_render_advisories=allow_render_advisories)
         strategy = link.get("reference_strategy") if isinstance(link.get("reference_strategy"), dict) else {}
         if (strategy.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or
                 segment.get("reference_strategy_version", 0) != REFERENCE_STRATEGY_VERSION or

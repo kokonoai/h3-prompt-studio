@@ -3229,7 +3229,9 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
         production = production_manager().materialise(production_id, segment_id)['production']
         segment = next(item for item in production['segments'] if item['id'] == safe_id(segment_id))
     project = copy.deepcopy(load_project(segment['project_id']))
-    production_manager().assert_video_project_current(production, project)
+    production_manager().assert_video_project_current(
+        production, project,
+        allow_render_advisories=body.get('_automation') is True)
     if production_manager().has_inherited_clip_directions(production, project):
         raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
     profile = video_workflow_manager().get(project.get('comfy_render', {}).get('workflow_profile_id', 'builtin'))
@@ -3252,6 +3254,17 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
             source = previous_row.get('selected') if previous_row else None
             if (not source or source.get('status') != 'succeeded' or not source.get('can_continue')
                     or not source.get('continuation_source') or source.get('project_id') != previous.get('project_id')):
+                if body.get('_automation') is True:
+                    # A missing MMH3 tail is an editorial boundary problem,
+                    # not a reason to stop the initial-cut queue. Preserve the
+                    # exact scene/dialogue and downgrade only this transition;
+                    # the worker recognises the message and rebuilds the prompt
+                    # once before submitting it as an ordinary hard cut.
+                    production_manager().apply_boundary_action(
+                        production_id, previous['id'], segment['id'], '', 'hard_cut')
+                    raise ValueError(
+                        'Automatic continuation was unavailable; the boundary was changed to a hard cut. '
+                        'Rebuild this clip prompt before video.')
                 raise ValueError('The preceding clip has no adopted take with verified .mmh3 motion state. Render or adopt that clip with automatic continuation enabled, then retry this one.')
             parent_run_id = source['id']
             render.update(continuation_source=source['continuation_source'],

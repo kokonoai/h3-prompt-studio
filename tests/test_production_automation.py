@@ -4,6 +4,7 @@ import time
 from backend.production_automation import (
     ProductionAutomationManager,
     is_global_failure,
+    is_missing_video_request,
     is_prompt_repairable,
     is_transient_failure,
 )
@@ -154,6 +155,8 @@ def test_failure_classification_is_narrow_and_safe():
         "Continuous clip adds characters at its opening: Nox")
     assert is_prompt_repairable(
         "Continuous clip loses characters at its opening: Mr. Tsukiguma")
+    assert is_prompt_repairable(
+        "Automatic continuation was unavailable; the boundary was changed to a hard cut.")
     assert is_transient_failure("ReadTimeout contacting ComfyUI")
     assert is_transient_failure("A video request is already active.")
     assert not is_transient_failure("Visible character identity references are missing")
@@ -162,11 +165,51 @@ def test_failure_classification_is_narrow_and_safe():
     assert is_global_failure("Cannot reach Ollama at http://127.0.0.1:11434")
     assert is_global_failure("Studio did not respond in time while saving the request")
     assert is_global_failure("ComfyUI queue state could not be verified")
+    assert is_global_failure("ComfyUI request failed: connection refused")
     assert is_global_failure(
         "Clip 3 failed final H3 prompt quality: The final H3 prompt must contain "
         "exactly one final audio override.")
     assert not is_global_failure("Clip 7 failed shot preflight: split this internal cut")
     assert not is_global_failure("The model response was truncated; shorten the request")
+    assert is_missing_video_request(
+        "No active task or recoverable result matching this request was found. "
+        "You can generate a new take.")
+    assert not is_missing_video_request("A video request is already active.")
+
+
+def test_confirmed_missing_saved_request_submits_a_fresh_take_without_attention():
+    manager, state, submitted_ids, merged = fake_manager(initial_status="running")
+    state["automation"].update({
+        "current_segment_id": "segment-1",
+        "current_index": 1,
+        "run_id": "run-missing",
+        "request_id": "request-missing",
+    })
+    original_get_run = manager.get_run
+
+    def get_run(run_id):
+        if run_id == "run-missing":
+            return {
+                "id": run_id,
+                "status": "failed",
+                "stage": "Previous request released; no active Comfy job found",
+                "error": (
+                    "No active task or recoverable result matching this request was found. "
+                    "It was not submitted again. You can generate a new take."
+                ),
+            }
+        return original_get_run(run_id)
+
+    manager.get_run = get_run
+    manager.resolve_run = get_run
+
+    manager.recover()
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    assert len(submitted_ids) == 1
+    assert submitted_ids[0] != "request-missing"
+    assert state["automation"].get("blocked_segments", []) == []
+    assert merged == [state["id"]]
 
 
 def test_local_prompt_quality_failure_uses_locked_fallback_and_finishes():
