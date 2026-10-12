@@ -105,11 +105,11 @@ def test_new_production_starts_with_an_empty_independent_card_library(tmp_path):
         "characters": None, "props": None, "environments": None, "wardrobe": None,
     }
     assert production["auto_quality_review"] is False
-    assert production["auto_prompt_repair"] is True
+    assert production["auto_prompt_repair"] is False
     assert projects[source["id"]]["subjects"][0]["name"] == "Source-only hero"
 
-    production = manager.update(production["id"], {"auto_prompt_repair": False})
-    assert production["auto_prompt_repair"] is False
+    production = manager.update(production["id"], {"auto_prompt_repair": True})
+    assert production["auto_prompt_repair"] is True
 
 
 def test_legacy_auto_quality_setting_migrates_to_unified_manual_review(tmp_path):
@@ -117,12 +117,14 @@ def test_legacy_auto_quality_setting_migrates_to_unified_manual_review(tmp_path)
     production = manager.create({"source_project": source, "brief": ""})
     production["auto_merge"] = False
     production["auto_quality_review"] = True
+    production.pop("auto_prompt_repair")
     production["automation"].update(merge=False, review=True)
 
     saved = manager.save(production)
 
     assert saved["auto_merge"] is True
     assert saved["auto_quality_review"] is False
+    assert saved["auto_prompt_repair"] is False
     assert saved["automation"]["merge"] is True
     assert saved["automation"]["review"] is False
 

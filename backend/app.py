@@ -3068,7 +3068,7 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     )
     project = materialised['project']
     started = time.monotonic()
-    review_and_repair = production.get('auto_prompt_repair', True)
+    review_and_repair = production.get('auto_prompt_repair', False)
     if use_ai:
         from .dialogue_audio import (normalise_structured_dialogue_directions,
                                      silence_unstructured_speech_directions)
@@ -3321,7 +3321,7 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
         errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
         raise ValueError('\n'.join(errors) or 'This clip needs a valid video prompt before generation.')
     prompt_quality = None
-    if production.get('auto_prompt_repair', True):
+    if production.get('auto_prompt_repair', False):
         from .prompt_quality import review_compiled_prompt
         prompt_quality = review_compiled_prompt(production, segment, project, compiled['prompt'])
         if prompt_quality['status'] != 'passed':

@@ -419,7 +419,7 @@ class ProductionAutomationManager:
             except Exception as exc:
                 message = str(exc)
                 repair_enabled = self.get_production(production_id).get(
-                    "auto_prompt_repair", True)
+                    "auto_prompt_repair", False)
                 if repair_enabled and is_prompt_repairable(message) and not repaired:
                     repaired = True
                     self._update(production_id, last_error=message[:2000],
@@ -523,7 +523,7 @@ class ProductionAutomationManager:
             except Exception as exc:
                 message = str(exc)
                 repair_enabled = self.get_production(production_id).get(
-                    "auto_prompt_repair", True)
+                    "auto_prompt_repair", False)
                 if repair_enabled and is_prompt_repairable(message) and not repaired:
                     repaired = True
                     self._update(production_id, status="running", stage="prompts",

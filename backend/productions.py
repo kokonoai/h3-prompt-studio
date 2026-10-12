@@ -4373,7 +4373,7 @@ class ProductionManager:
         result["auto_continue_previous"] = result.get("auto_continue_previous", False)
         if type(result["auto_continue_previous"]) is not bool:
             raise ValueError("Automatic continuation from the preceding clip must be true or false.")
-        result["auto_prompt_repair"] = result.get("auto_prompt_repair", True)
+        result["auto_prompt_repair"] = result.get("auto_prompt_repair", False)
         if type(result["auto_prompt_repair"]) is not bool:
             raise ValueError("Automatic prompt review and repair must be true or false.")
         legacy_auto_quality_review = result.get("auto_quality_review", False)
@@ -4590,7 +4590,7 @@ class ProductionManager:
             "overview_asset_ids": empty_overview_assets(),
             "auto_merge": True,
             "auto_continue_previous": False,
-            "auto_prompt_repair": True,
+            "auto_prompt_repair": False,
             "auto_quality_review": False,
             "auto_keyframes_enabled": False,
             "auto_keyframe_model": "z_image_turbo_bf16.safetensors",

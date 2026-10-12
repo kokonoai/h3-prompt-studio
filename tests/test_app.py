@@ -774,7 +774,7 @@ def test_production_prompt_repairs_pre_render_quality_before_saving(server, monk
     }
     production = {
         'id': production_id, 'language': 'en', 'prompt_version': 'continuity_director',
-        'automation': {}, 'segments': [segment],
+        'auto_prompt_repair': True, 'automation': {}, 'segments': [segment],
     }
     project = new_project()
     prompts, saved = [], []
@@ -915,7 +915,7 @@ def test_production_prompt_repairs_duplicate_speech_without_another_llm_call(ser
     segment = {'id': segment_id, 'index': 13, 'duration': 5, 'status': 'ready',
                'prompt_direction': ''}
     production = {'id': production_id, 'language': 'en',
-                  'prompt_version': 'continuity_director', 'automation': {},
+                  'prompt_version': 'continuity_director', 'auto_prompt_repair': True, 'automation': {},
                   'segments': [segment]}
     project = new_project()
     prompts, saved = [], []
@@ -979,7 +979,7 @@ def test_production_prompt_falls_back_to_locked_scene_after_two_bad_repairs(serv
     segment = {'id': segment_id, 'index': 1, 'duration': 10, 'status': 'ready',
                'prompt_direction': ''}
     production = {'id': production_id, 'language': 'en',
-                  'prompt_version': 'continuity_director', 'automation': {},
+                  'prompt_version': 'continuity_director', 'auto_prompt_repair': True, 'automation': {},
                   'segments': [segment]}
     project = new_project()
     project['duration'] = 10
