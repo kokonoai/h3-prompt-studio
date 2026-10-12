@@ -20,14 +20,14 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  normalise_segment, production_schema_for_story, render_character_identity,
-                                 production_source_manifest,
+                                 production_render_override, production_source_manifest,
                                  reconcile_transition_contract,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
                                  split_truncated_card_chunk,
                                  storyboard_timed_batches, timed_batch_source_manifest,
                                  timed_batch_story,
-                                 storyboard_output_token_budget,
+                                 storyboard_output_token_budget, temporal_cast_lock,
                                  timed_clip_groups, timed_group_story, timed_story_beats,
                                  validate_planned_chunk_source_contract,
                                  validate_planned_timed_batch_source_contract)
@@ -105,7 +105,11 @@ def test_new_production_starts_with_an_empty_independent_card_library(tmp_path):
         "characters": None, "props": None, "environments": None, "wardrobe": None,
     }
     assert production["auto_quality_review"] is False
+    assert production["auto_prompt_repair"] is True
     assert projects[source["id"]]["subjects"][0]["name"] == "Source-only hero"
+
+    production = manager.update(production["id"], {"auto_prompt_repair": False})
+    assert production["auto_prompt_repair"] is False
 
 
 def test_legacy_auto_quality_setting_migrates_to_unified_manual_review(tmp_path):
@@ -345,7 +349,8 @@ def test_online_only_canon_repairs_planner_colocation_and_survives_final_prompt(
     assert compiled["valid"], compiled["issues"]
     assert "production_render_override:" in compiled["prompt"]
     assert "Visible at opening: Koko" in compiled["prompt"]
-    assert "Off-screen for the entire clip: Besi" in compiled["prompt"]
+    assert "Off-screen for the entire clip: Besi" not in compiled["prompt"]
+    assert "VISUAL IDENTITY WHITELIST" in compiled["prompt"]
 
     # Accepting the rebuilt prompt must migrate the repaired timeline back to
     # the production clip.  Without this write-back, normalisation would see
@@ -570,6 +575,94 @@ def test_mirror_lock_keeps_remote_and_absent_people_out_of_the_reflection():
     assert "MIRROR GEOMETRY LOCK" in lock
     assert "A reflection is not another physical body" in lock
     assert "Display-only, imagined, off-screen and absent identities never appear in the mirror" in lock
+
+
+def test_visual_cast_lock_does_not_name_non_visual_identities():
+    segment = {
+        "transition_mode": "hard_cut",
+        "card_selection": {"characters": ["Local", "Remote", "Remembered"]},
+        "cast_timeline": {
+            "visible_start": ["Local"], "visible_end": ["Local"],
+            "enters": [], "exits": [], "offscreen": ["Remote"],
+            "mentioned_only": ["Remembered"],
+        },
+    }
+
+    lock = temporal_cast_lock(segment)
+
+    assert "Visible at opening: Local" in lock
+    assert "Remote" not in lock
+    assert "Remembered" not in lock
+    assert "VISUAL IDENTITY WHITELIST" in lock
+
+
+def _boundary_guard(transition_mode):
+    local = _card("CurrentHero")
+    prior_only = _card("PriorOnlySentinel")
+    production = {
+        "brief": "", "cards": {kind: [] for kind in CARD_KINDS},
+        "source_manifest": {"version": 1, "chunks": []},
+    }
+    production["cards"]["characters"] = [local, prior_only]
+    previous = {
+        "id": _id(), "index": 1, "title": "Previous", "transition_mode": "hard_cut",
+        "cast_timeline": {"visible_start": ["CurrentHero", "PriorOnlySentinel"],
+                          "visible_end": ["CurrentHero", "PriorOnlySentinel"],
+                          "enters": [], "exits": [], "offscreen": [], "mentioned_only": []},
+        "continuity_state": {
+            "ending_state": "Both finish the previous beat.",
+            "positions_end": [
+                {"character": "CurrentHero", "position": "left", "facing": "right"},
+                {"character": "PriorOnlySentinel", "position": "right", "facing": "left"},
+            ],
+            "prop_holders_end": [],
+        },
+        "shot_contract": {"shot_size": "wide", "relation_previous": "hard_cut"},
+    }
+    current = {
+        "id": _id(), "index": 2, "title": "Current", "story": "CurrentHero acts alone.",
+        "setting": "A new room", "action": "CurrentHero raises one hand.",
+        "ending": "CurrentHero holds still.", "image_prompt": "CurrentHero alone",
+        "transition_mode": transition_mode,
+        "card_selection": {"characters": ["CurrentHero"], "props": []},
+        "cast_timeline": {"visible_start": ["CurrentHero"], "visible_end": ["CurrentHero"],
+                          "enters": [], "exits": [], "offscreen": [], "mentioned_only": []},
+        "source_refs": {"scene_ids": [], "paragraph_ids": [], "dialogue_ids": [], "event_ids": []},
+        "continuity_state": {
+            "opening_state": "PriorOnlySentinel stands beside CurrentHero.",
+            "ending_state": "CurrentHero remains alone.",
+            "positions_start": [
+                {"character": "CurrentHero", "position": "left", "facing": "right"},
+                {"character": "PriorOnlySentinel", "position": "right", "facing": "left"},
+            ],
+            "positions_end": [{"character": "CurrentHero", "position": "center", "facing": "front"}],
+            "prop_holders_start": [], "prop_holders_end": [],
+        },
+        "shot_contract": {
+            "shot_size": "medium", "relation_previous": transition_mode,
+            "opening_composition": "PriorOnlySentinel and CurrentHero in a medium frame.",
+            "ending_composition": "CurrentHero alone at center.",
+        },
+    }
+    production["segments"] = [previous, current]
+    roles = {local["id"]: "physical", prior_only["id"]: "absent"}
+    return production_render_override(production, current, roles=roles)
+
+
+def test_hard_cut_never_serialises_previous_cast_into_current_prompt():
+    guard = _boundary_guard("hard_cut")
+
+    assert "FRESH EDITORIAL SETUP" in guard
+    assert "PriorOnlySentinel" not in guard
+    assert "PREVIOUS END SNAPSHOT" not in guard
+
+
+def test_continuous_boundary_keeps_only_shared_current_identities():
+    guard = _boundary_guard("continuous")
+
+    assert "SHARED BOUNDARY STATE" in guard
+    assert "CurrentHero left facing right" in guard
+    assert "PriorOnlySentinel" not in guard
 
 
 def test_written_prop_lock_preserves_one_authored_card_and_defers_exact_type():
@@ -3068,6 +3161,8 @@ def test_source_coverage_and_adjacent_edit_contract_gate_video_prompt(tmp_path):
     compiled = compile_project(first_project)
     assert "SOURCE COVERAGE LOCK" in compiled["prompt"]
     assert "SHOT EDIT CONTRACT" in compiled["prompt"]
+    assert compiled["prompt"].count("Hello.") == 1
+    assert "Original dialogue:" not in compiled["prompt"]
     repaired = manager.materialise(
         production["id"], production["segments"][1]["id"])["production"]
     repaired_segment = repaired["segments"][1]

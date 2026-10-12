@@ -409,6 +409,29 @@ def test_compiled_prompt_gate_requires_exact_cues_language_and_final_audio_lock(
     assert all(not row["repairable"] for row in failed["issues"])
 
 
+def test_compiled_prompt_gate_rejects_dialogue_repeated_in_continuity_metadata():
+    production, segment, project = fixture()
+    subject_id = "8687ec74-29b9-439d-bd2d-c65847566029"
+    project["subjects"] = [{"id": subject_id, "name": "Koko", "description": "", "asset_ids": []}]
+    project["shots"][0]["dialogue"] = [{
+        "id": "b2f71fd8-ea5f-48a7-abdb-edc32f382cc6", "speaker_id": subject_id,
+        "text": "Stay with me.", "language": "English", "delivery": "quiet",
+        "locked": True, "voiceover": False,
+    }]
+    project["production_render_override"] = "Original dialogue: Koko: Stay with me."
+    prompt = (
+        "dialogue_and_audio:\nKoko: <d>[English] Stay with me.</d>\n\n"
+        "production_render_override:\nOriginal dialogue: Koko: Stay with me.\n\n"
+        "FINAL AUDIO OVERRIDE — HIGHEST PRIORITY: Spoken-utterance count is exactly "
+        "1 utterance total (cue 1=Koko)."
+    )
+
+    report = review_compiled_prompt(production, segment, project, prompt)
+
+    assert report["status"] == "failed"
+    assert any(row["code"] == "dialogue_in_continuity_metadata" for row in report["issues"])
+
+
 def test_compiled_prompt_gate_checks_sound_fields_even_without_ai_planning():
     production, segment, project = fixture()
     subject_id = "8687ec74-29b9-439d-bd2d-c65847566029"

@@ -147,6 +147,17 @@ describe("episode batch production",()=>{
     expect(productionAutomationSnapshot(automation,segments,{segment_count:3,ready_count:0,segments:[]} as any)?.promptReady).toBe(1);
   });
 
+  it("counts formatted prompts as ready when prompt fast mode skips review",()=>{
+    const automation:any={status:"running",stage:"prompts",current_index:1,completed:0,total:2,merge:true};
+    const segments:any[]=[
+      {status:"ready",video_prompt:"unchecked one",stale_reasons:[],prompt_quality:{status:"unreviewed"}},
+      {status:"ready",video_prompt:"unchecked two",stale_reasons:[]},
+    ];
+    const outputs:any={segment_count:2,ready_count:0,segments:[]};
+
+    expect(productionAutomationSnapshot(automation,segments,outputs,false)?.promptReady).toBe(2);
+  });
+
   it("counts an adopted current take as proof that its prompt stage completed",()=>{
     const automation:any={status:"running",stage:"prompts",current_index:12,completed:11,total:27,merge:true};
     const segments:any[]=[

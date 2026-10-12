@@ -18,7 +18,7 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
 MAX_SEGMENT_KEYFRAMES = 12
-REFERENCE_STRATEGY_VERSION = 10
+REFERENCE_STRATEGY_VERSION = 12
 CAST_TIMELINE_VERSION = 1
 STORY_CONTRACT_VERSION = 1
 TIMING_KEYS = ("episode_plan_seconds", "storyboard_plan_seconds", "merge_seconds")
@@ -1383,13 +1383,12 @@ def temporal_cast_lock(segment):
         ("Enter physically during this clip", "enters"),
         ("Exit physically during this clip", "exits"),
         ("Visible in the final frame", "visible_end"),
-        ("Off-screen for the entire clip", "offscreen"),
-        ("Mentioned only; never depict", "mentioned_only"),
     )
     rows = [f"{label}: {', '.join(timeline[key]) or 'none'}." for label, key in labels]
     rows.extend([
         "Opening visibility and final-frame visibility are different contracts; an exiting identity must not remain in the final frame.",
-        "Off-screen and mentioned-only identities must not appear as people, creatures, background figures, reflections, portraits, duplicates or disguised substitutes.",
+        "VISUAL IDENTITY WHITELIST: only identities named in the four physical cast rows above may appear as physical people or creatures in this clip.",
+        "Off-screen and mentioned-only identities are tracked outside this visual prompt. Do not invent or import any other person, creature, background extra, reflection, portrait, duplicate, costume variant or disguised substitute.",
         f"Editorial transition from the preceding clip: {segment.get('transition_mode', 'hard_cut')}.",
     ])
     return "TEMPORAL CAST AND STATE LOCK — CURRENT CLIP\n" + "\n".join(rows)
@@ -2247,8 +2246,8 @@ def effective_temporal_cast_lock(production, segment, roles=None):
     base_lock = temporal_cast_lock(effective)
     if reflected:
         base_lock = base_lock.replace(
-            "Off-screen and mentioned-only identities must not appear as people, creatures, background figures, reflections, portraits, duplicates or disguised substitutes.",
-            "Off-screen and mentioned-only identities must not appear as people, creatures, background figures, portraits, duplicates or disguised substitutes. The only exception is an identity explicitly listed in the authored mirror/reflection roster below, which remains confined to that mirror surface and is never a physical body.")
+            "Do not invent or import any other person, creature, background extra, reflection, portrait, duplicate, costume variant or disguised substitute.",
+            "Do not invent or import any other person, creature, background extra, portrait, duplicate, costume variant or disguised substitute. The only non-physical exception is an identity explicitly listed in the authored mirror/reflection roster below, confined to that mirror surface.")
     return base_lock + "\n" + "\n".join(extra)
 
 
@@ -2271,40 +2270,69 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
     guard = effective_temporal_cast_lock(production, segment, roles)
     prop_guard = inscribed_prop_continuity_lock(props)
     state = normalise_continuity_state(segment.get("continuity_state"), segment)
+    alias_sets = character_aliases(production)
+    physical_aliases = {
+        alias
+        for card_id, aliases in alias_sets.items()
+        if roles.get(card_id) == "physical"
+        for alias in aliases
+    }
+    reflected_ids = set(reflected_character_ids(production, segment))
+    blocked_names = [
+        card.get("name", "") for card in production.get("cards", {}).get("characters", [])
+        if roles.get(card.get("id")) in ("offscreen", "absent") and
+        card.get("id") not in reflected_ids and card.get("name", "").strip()
+    ]
+
+    def physical_position(row):
+        return str(row.get("character", "")).strip().casefold() in physical_aliases
+
+    def current_visual_text(value, fallback):
+        """Drop a planner field wholesale if it names a forbidden identity.
+
+        Free-form continuity prose is useful, but attempting to remove just a
+        name can leave an instruction such as "stands beside the hero" that
+        still summons the unwanted body. Structured current-clip fields remain
+        authoritative, so a neutral fallback is safer than partial rewriting.
+        """
+        text = str(value or "").strip()
+        for name in blocked_names:
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.IGNORECASE):
+                return fallback
+        return text or fallback
+
+    positions_start_rows = [row for row in state["positions_start"] if physical_position(row)]
+    positions_end_rows = [row for row in state["positions_end"] if physical_position(row)]
     positions_start = "; ".join(
         f"{row['character']}={row['position']} facing {row['facing'] or 'unchanged'}, moving {row.get('movement_direction') or 'unchanged'}, eyeline {row.get('eyeline_direction') or 'unchanged'} toward {row.get('eyeline_target') or 'authored target'}"
-        for row in state["positions_start"]) or "not additionally specified"
+        for row in positions_start_rows) or "not additionally specified"
     positions_end = "; ".join(
         f"{row['character']}={row['position']} facing {row['facing'] or 'unchanged'}, moving {row.get('movement_direction') or 'unchanged'}, eyeline {row.get('eyeline_direction') or 'unchanged'} toward {row.get('eyeline_target') or 'authored target'}"
-        for row in state["positions_end"]) or "not additionally specified"
+        for row in positions_end_rows) or "not additionally specified"
     holders_start = "; ".join(f"{row['prop']} held by {row['holder']}"
                               + (f" ({row['state']})" if row.get("state") else "")
                               for row in state["prop_holders_start"]) or "not additionally specified"
     holders_end = "; ".join(f"{row['prop']} held by {row['holder']}"
                             + (f" ({row['state']})" if row.get("state") else "")
                             for row in state["prop_holders_end"]) or "not additionally specified"
-    manifest = production.get("source_manifest") or production_source_manifest(production)
     refs = segment.get("source_refs", {})
-    source_rows = {row["id"]: row for kind in ("scenes", "paragraphs", "dialogue", "events")
-                   for row in _flatten_manifest(manifest, kind)}
     source_parts = []
-    for label, key in (("Original scene", "scene_ids"), ("Original paragraph", "paragraph_ids"),
-                       ("Original dialogue", "dialogue_ids"), ("Plot event", "event_ids")):
-        values = []
-        for ident in refs.get(key, []):
-            row = source_rows.get(ident, {})
-            value = row.get("title") or ((row.get("speaker", "") + ": " if row.get("speaker") else "") +
-                                          str(row.get("text", "")))
-            if value:
-                values.append(f"{ident}={value}")
+    for label, key in (("scene IDs", "scene_ids"), ("paragraph IDs", "paragraph_ids"),
+                       ("dialogue IDs", "dialogue_ids"), ("event IDs", "event_ids")):
+        values = [str(ident).strip() for ident in refs.get(key, []) if str(ident).strip()]
         if values:
-            source_parts.append(label + ": " + " | ".join(values))
+            source_parts.append(label + ": " + ", ".join(values))
     source_guard = (
-        "SOURCE COVERAGE LOCK: this clip is responsible only for the following authored material, in this order. " +
-        "\n".join(source_parts))[:7000]
+        "SOURCE COVERAGE LOCK — SILENT METADATA ONLY: the complete source text and exact spoken words "
+        "have already been compiled into the current shot and its structured <d> dialogue cues. "
+        "The identifiers below are traceability metadata, not screenplay text; never read, narrate, "
+        "spell or visually render them. Do not infer additional dialogue from them. " +
+        ("\n".join(source_parts) if source_parts else "No additional source identifiers."))[:3000]
     continuity_guard = (
-        "ADJACENT CLIP STATE LOCK: opening=" + (state["opening_state"] or "use the authored opening") +
-        "; ending=" + (state["ending_state"] or "use the authored ending") +
+        "ADJACENT CLIP STATE LOCK: opening=" + current_visual_text(
+            state["opening_state"], "use the current clip's authored opening") +
+        "; ending=" + current_visual_text(
+            state["ending_state"], "use the current clip's authored ending") +
         ". Opening positions: " + positions_start + ". Ending positions: " + positions_end +
         ". Opening prop holders: " + holders_start + ". Ending prop holders: " + holders_end +
         f". Cut relation={segment.get('transition_mode', 'hard_cut')}; MMH3 continuation allowed=" +
@@ -2314,27 +2342,51 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
     shot_contract = normalise_shot_contract(segment.get("shot_contract"), segment)
     previous = next((row for row in production.get("segments", [])
                      if row.get("index") == segment.get("index", 0) - 1), None)
-    previous_snapshot = "none; this is the opening clip"
-    if previous:
+    transition_mode = segment.get("transition_mode", "hard_cut")
+    previous_snapshot = ""
+    if previous and transition_mode in ("continuous", "matched_cut"):
         prior_state = normalise_continuity_state(previous.get("continuity_state"), previous)
         prior_shot = normalise_shot_contract(previous.get("shot_contract"), previous)
+        current_props = {
+            str(row.get("prop", "")).strip().casefold()
+            for key in ("prop_holders_start", "prop_holders_end")
+            for row in state.get(key, []) if str(row.get("prop", "")).strip()
+        }
+        current_props.update(
+            str(name).strip().casefold()
+            for name in segment.get("card_selection", {}).get("props", [])
+            if str(name).strip())
+        shared_positions = [
+            row for row in prior_state["positions_end"]
+            if physical_position(row)
+        ]
+        shared_props = [
+            row for row in prior_state["prop_holders_end"]
+            if str(row.get("prop", "")).strip().casefold() in current_props
+        ]
         previous_snapshot = (
-            f"ending state={prior_state['ending_state']}; ending composition={prior_shot['ending_composition']}; "
-            f"shot size={prior_shot['shot_size']}; camera axis={prior_shot['camera_axis'] or 'unspecified'}; "
-            "positions=" + ("; ".join(
+            "SHARED BOUNDARY STATE — current-clip identities and props only: "
+            f"previous shot size={prior_shot['shot_size']}; camera axis={prior_shot['camera_axis'] or 'unspecified'}; "
+            "shared positions=" + ("; ".join(
                 f"{row['character']} {row['position']} facing {row['facing']}, moving {row.get('movement_direction')}, eyeline {row.get('eyeline_direction')} toward {row.get('eyeline_target')}"
-                for row in prior_state["positions_end"]) or "unspecified") + "; props=" +
+                for row in shared_positions) or "none") + "; shared props=" +
             ("; ".join(f"{row['prop']} held by {row['holder']}"
                        + (f" ({row['state']})" if row.get("state") else "")
-                       for row in prior_state["prop_holders_end"])
-             or "unspecified"))
+                       for row in shared_props) or "none") +
+            ". Preserve only this filtered shared state; never carry a previous-only identity into the current clip. ")
+    elif previous:
+        previous_snapshot = (
+            "FRESH EDITORIAL SETUP: this boundary does not inherit the preceding frame. "
+            "Do not carry any person, creature, reflection, portrait, costume, pose, prop holder or background extra from the preceding clip. ")
+    else:
+        previous_snapshot = "OPENING CLIP: there is no preceding visual state to inherit. "
     edit_guard = (
         f"SHOT EDIT CONTRACT: role={shot_contract['role']}; shot size={shot_contract['shot_size']}; "
-        f"opening composition={shot_contract['opening_composition']}; ending composition={shot_contract['ending_composition']}; "
+        f"opening composition={current_visual_text(shot_contract['opening_composition'], 'use one current-clip composition')}; "
+        f"ending composition={current_visual_text(shot_contract['ending_composition'], 'end on the current authored beat')}; "
         f"axis={shot_contract['camera_axis'] or 'unspecified'}; allow axis crossing={shot_contract['allow_axis_cross']}; "
         f"edit reason={shot_contract['edit_reason']}; relation to previous={shot_contract['relation_previous']}. "
-        f"PREVIOUS END SNAPSHOT: {previous_snapshot}. Preserve: {shot_contract['preserve_from_previous'] or 'only authored continuity'}. "
-        f"Must change: {shot_contract['must_change'] or 'only what the authored beat changes'}. "
+        + previous_snapshot +
         "Keep reciprocal dialogue eyelines, screen direction and action phase. Avoid an accidental jump cut or replaying the preceding action.")
     return "\n\n".join(part for part in [
         "FINAL PRODUCTION RENDER OVERRIDE — this block supersedes any conflicting earlier staging, cast, screen, reflection, prop or audio prose. Do not reinterpret it as story content.",
@@ -4321,6 +4373,9 @@ class ProductionManager:
         result["auto_continue_previous"] = result.get("auto_continue_previous", False)
         if type(result["auto_continue_previous"]) is not bool:
             raise ValueError("Automatic continuation from the preceding clip must be true or false.")
+        result["auto_prompt_repair"] = result.get("auto_prompt_repair", True)
+        if type(result["auto_prompt_repair"]) is not bool:
+            raise ValueError("Automatic prompt review and repair must be true or false.")
         legacy_auto_quality_review = result.get("auto_quality_review", False)
         if type(legacy_auto_quality_review) is not bool:
             raise ValueError("Automatic post-render quality review must be true or false.")
@@ -4535,6 +4590,7 @@ class ProductionManager:
             "overview_asset_ids": empty_overview_assets(),
             "auto_merge": True,
             "auto_continue_previous": False,
+            "auto_prompt_repair": True,
             "auto_quality_review": False,
             "auto_keyframes_enabled": False,
             "auto_keyframe_model": "z_image_turbo_bf16.safetensors",
@@ -4551,7 +4607,7 @@ class ProductionManager:
 
     def update(self, ident, body):
         current = self.get(ident)
-        allowed = {"title", "language", "prompt_version", "brief", "style_bible", "character_bible", "continuity_notes", "cards", "segments", "auto_merge", "auto_continue_previous", "auto_quality_review", "task_state", "auto_keyframes_enabled", "auto_keyframe_model",
+        allowed = {"title", "language", "prompt_version", "brief", "style_bible", "character_bible", "continuity_notes", "cards", "segments", "auto_merge", "auto_continue_previous", "auto_prompt_repair", "auto_quality_review", "task_state", "auto_keyframes_enabled", "auto_keyframe_model",
                    "video_aspect_ratio", "video_resolution", "video_quality", "video_steps",
                    "visual_style_preset", "visual_style_custom", "narrative_style", "narrative_style_custom", "narrative_notes", "episode_count", "episode_minutes",
                    "current_episode", "episodes", "card_collection_id", "card_collection_name", "overview_asset_ids", "series_voice_style"}

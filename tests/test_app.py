@@ -690,6 +690,8 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     submitted, boundary_actions = [], []
 
     class Manager:
+        def list(self):
+            return []
         def assert_active(self, _ident):
             return production
         def has_inherited_clip_directions(self, _production, _project):
@@ -754,6 +756,13 @@ def test_production_auto_continuation_uses_only_verified_preceding_take(server, 
     module.production_segment_video(production['id'], current_id, {'new_seed': False})
     render, parent = submitted[-1]
     assert parent is None and 'continuation_source' not in render
+
+    production['auto_prompt_repair'] = False
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt',
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            AssertionError('fast mode must not review before video submission')))
+    module.production_segment_video(production['id'], current_id, {'new_seed': False})
+    assert len(submitted) == 4
 
 
 def test_production_prompt_repairs_pre_render_quality_before_saving(server, monkeypatch):
@@ -830,6 +839,74 @@ def test_production_prompt_repairs_pre_render_quality_before_saving(server, monk
     assert result['prompt_quality']['repairs'] == [
         'The generated prompt contains one internal cut.']
     assert saved[-1][-1] == result['prompt_quality']
+
+
+def test_prompt_fast_mode_skips_review_and_repair(server, monkeypatch):
+    module, _client, _fake = server
+    production_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+    segment = {
+        'id': segment_id, 'index': 1, 'duration': 10, 'status': 'ready',
+        'prompt_direction': '',
+    }
+    production = {
+        'id': production_id, 'language': 'en', 'prompt_version': 'continuity_director',
+        'auto_prompt_repair': False, 'automation': {}, 'segments': [segment],
+    }
+    project = new_project()
+    prompts, saved = [], []
+
+    class Manager:
+        def list(self):
+            return []
+
+        def assert_active(self, _ident):
+            return copy.deepcopy(production)
+
+        def materialise(self, _ident, _segment_id, **_kwargs):
+            return {'production': copy.deepcopy(production), 'project': copy.deepcopy(project)}
+
+        def set_segment_prompt(self, *args):
+            saved.append(args)
+            return copy.deepcopy(production)
+
+    class Planner:
+        def propose_plan(self, _model, _project, instructions, _persona):
+            prompts.append(instructions)
+            return {}
+
+    from backend import prompt_quality
+    monkeypatch.setattr(module, 'production_manager', lambda: Manager())
+    monkeypatch.setattr(module, 'client', lambda: Planner())
+    monkeypatch.setattr(module.RESOURCES, 'run_ai', lambda model, operation: operation(model))
+    monkeypatch.setitem(module.SETTINGS, 'ai_memory_mode', 'staged')
+    monkeypatch.setattr(module, 'save_project', lambda candidate: None)
+    monkeypatch.setattr(module, 'merge_plan', lambda baseline, _proposal: copy.deepcopy(baseline))
+    monkeypatch.setattr(module, '_production_prompt_instructions', lambda *_args: 'Build one shot.')
+    monkeypatch.setattr(module, '_localise_candidate_for_h3', lambda _lm, _model, candidate: (
+        candidate, {'valid': True, 'issues': [], 'prompt': 'fast prompt'}))
+    monkeypatch.setattr(prompt_quality, 'review_generated_plan',
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            AssertionError('fast mode must not review the generated plan')))
+    monkeypatch.setattr(prompt_quality, 'review_compiled_prompt',
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            AssertionError('fast mode must not review the compiled prompt')))
+
+    result = module.production_segment_prompt(
+        production_id, segment_id, {'use_ai': True, '_automation': True})
+
+    assert len(prompts) == 1
+    assert result['compiled']['prompt'] == 'fast prompt'
+    assert result['prompt_quality'] is None
+    assert saved[-1][-1] is None
+
+    from backend import compiler
+    monkeypatch.setattr(compiler, 'compile_project', lambda _candidate: {
+        'valid': True, 'issues': [], 'prompt': 'compiled fast prompt'})
+    compiled_result = module.production_segment_prompt(
+        production_id, segment_id, {'use_ai': False, '_automation': True})
+    assert compiled_result['compiled']['valid'] is True
+    assert compiled_result['prompt_quality'] is None
+    assert saved[-1][-1] is None
 
 
 def test_production_prompt_repairs_duplicate_speech_without_another_llm_call(server, monkeypatch):

@@ -3068,6 +3068,7 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     )
     project = materialised['project']
     started = time.monotonic()
+    review_and_repair = production.get('auto_prompt_repair', True)
     if use_ai:
         from .dialogue_audio import (normalise_structured_dialogue_directions,
                                      silence_unstructured_speech_directions)
@@ -3091,6 +3092,21 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
                                          with_repair_history)
             lm = client()
             base_instructions = _production_prompt_instructions(production, segment)
+            if not review_and_repair:
+                RESOURCES.stage = f"Building video prompt for clip {segment['index']} (fast mode)"
+                if SETTINGS.get('ai_memory_mode') == 'resident_small':
+                    from .continuation_suggestions import compact_plan
+                    planning_project.setdefault('simple', {})['directed'] = True
+                    proposal = compact_plan(
+                        lm, model, planning_project, base_instructions, SETTINGS['persona'])
+                else:
+                    proposal = lm.propose_plan(
+                        model, planning_project, base_instructions, SETTINGS['persona'])
+                candidate = merge_plan(planning_project, proposal)
+                candidate = normalise_structured_dialogue_directions(candidate)
+                candidate, compiled = _localise_candidate_for_h3(lm, model, candidate)
+                return {'proposal': proposal, 'candidate': candidate, 'compiled': compiled,
+                        'prompt_quality': None}
             failures, repair = [], ''
             for quality_attempt in range(MAX_AUTOMATIC_REPAIRS + 1):
                 RESOURCES.stage = (f"Building video prompt for clip {segment['index']}" if not quality_attempt else
@@ -3196,7 +3212,6 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
     else:
         from .dialogue_audio import (normalise_structured_dialogue_directions,
                                      silence_unstructured_speech_directions)
-        from .prompt_quality import review_compiled_prompt
         candidate = normalise_structured_dialogue_directions(project)
         # The deterministic fallback is the final completion path when local
         # AI cannot produce a prettier plan that passes advisory preflight.
@@ -3205,12 +3220,15 @@ def production_segment_prompt(production_id: str, segment_id: str, body: dict):
         candidate = silence_unstructured_speech_directions(candidate, project)
         proposal, source = None, 'compiled'
         compiled = compile_project(candidate)
-        prompt_quality = review_compiled_prompt(
-            production, segment, candidate, compiled.get('prompt', '')) if compiled.get('valid') else None
+        prompt_quality = None
+        if review_and_repair and compiled.get('valid'):
+            from .prompt_quality import review_compiled_prompt
+            prompt_quality = review_compiled_prompt(
+                production, segment, candidate, compiled.get('prompt', ''))
     if not compiled['valid']:
         errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
         raise ValueError('\n'.join(errors) or 'This clip could not produce a valid H3 prompt.')
-    if not prompt_quality or prompt_quality['status'] != 'passed':
+    if review_and_repair and (not prompt_quality or prompt_quality['status'] != 'passed'):
         if prompt_quality:
             production_manager().set_segment_prompt_quality(
                 production_id, segment_id, prompt_quality)
@@ -3302,17 +3320,19 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
     if not compiled['valid']:
         errors = [item['message'] for item in compiled['issues'] if item['severity'] == 'error']
         raise ValueError('\n'.join(errors) or 'This clip needs a valid video prompt before generation.')
-    from .prompt_quality import review_compiled_prompt
-    prompt_quality = review_compiled_prompt(production, segment, project, compiled['prompt'])
-    if prompt_quality['status'] != 'passed':
-        production_manager().set_segment_prompt_quality(
-            production_id, segment_id, prompt_quality)
-        messages = ' '.join(
-            row.get('message', '') for row in prompt_quality['issues']
-            if row.get('severity') == 'error')
-        raise ValueError(
-            f"Clip {segment['index']} failed pre-render prompt quality. "
-            f"Regenerate this clip prompt before video: {messages}")
+    prompt_quality = None
+    if production.get('auto_prompt_repair', True):
+        from .prompt_quality import review_compiled_prompt
+        prompt_quality = review_compiled_prompt(production, segment, project, compiled['prompt'])
+        if prompt_quality['status'] != 'passed':
+            production_manager().set_segment_prompt_quality(
+                production_id, segment_id, prompt_quality)
+            messages = ' '.join(
+                row.get('message', '') for row in prompt_quality['issues']
+                if row.get('severity') == 'error')
+            raise ValueError(
+                f"Clip {segment['index']} failed pre-render prompt quality. "
+                f"Regenerate this clip prompt before video: {messages}")
     production = production_manager().set_segment_prompt(
         production_id, segment_id, compiled['prompt'], segment.get('video_prompt_source') or 'compiled',
         segment.get('prompt_seconds') or 0, project['id'], prompt_quality)

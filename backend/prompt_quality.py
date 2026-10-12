@@ -256,6 +256,20 @@ def review_compiled_prompt(production, segment, project, prompt, *, attempts=0, 
         issues.append(_issue(
             "continuity_lock_missing", "The final H3 prompt lost or duplicated its production continuity override.",
             "Recompile from the current production scene so the continuity override appears exactly once.", repairable=False))
+    continuity_override = str(project.get("production_render_override") or "")
+    folded_continuity_override = continuity_override.casefold()
+    repeated_lines = list(dict.fromkeys(
+        str(line.get("text") or "").strip() for line in dialogue
+        if str(line.get("text") or "").strip() and
+        str(line.get("text") or "").strip().casefold() in folded_continuity_override
+    ))
+    if repeated_lines:
+        issues.append(_issue(
+            "dialogue_in_continuity_metadata",
+            "The production continuity metadata repeats locked dialogue text outside its tagged cue: " +
+            " | ".join(repeated_lines[:4]),
+            "Rebuild the production render override with source identifiers only; exact spoken words must appear only in structured dialogue cues.",
+            repairable=False))
     for block in project.get("h3_verbatim_blocks", []):
         if block and (prompt or "").count(block) != 1:
             issues.append(_issue(

@@ -418,7 +418,9 @@ class ProductionAutomationManager:
                 return
             except Exception as exc:
                 message = str(exc)
-                if is_prompt_repairable(message) and not repaired:
+                repair_enabled = self.get_production(production_id).get(
+                    "auto_prompt_repair", True)
+                if repair_enabled and is_prompt_repairable(message) and not repaired:
                     repaired = True
                     self._update(production_id, last_error=message[:2000],
                                  stage_detail=f"Repairing prompt for clip {index}")
@@ -520,7 +522,9 @@ class ProductionAutomationManager:
                 raise RuntimeError(terminal_error)
             except Exception as exc:
                 message = str(exc)
-                if is_prompt_repairable(message) and not repaired:
+                repair_enabled = self.get_production(production_id).get(
+                    "auto_prompt_repair", True)
+                if repair_enabled and is_prompt_repairable(message) and not repaired:
                     repaired = True
                     self._update(production_id, status="running", stage="prompts",
                                  stage_detail=f"Repairing prompt for clip {index}",
