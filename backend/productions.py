@@ -4295,29 +4295,108 @@ class ProductionManager:
         # started them.  Serialize file reads/writes so an explicit pause cannot
         # be lost when one of those older requests eventually saves its result.
         self.lock = threading.RLock()
+        # Production JSON grows with storyboard contracts, prompts and review
+        # history.  Revalidating every file just to paint the project picker
+        # made startup scale with the complete archive (roughly ten seconds for
+        # twenty mature projects).  Cache full validation only for recently
+        # opened projects, and keep a tiny independently invalidated summary
+        # cache for the picker.
+        self._validated_cache = {}
+        self._summary_cache = {}
+        self._validated_cache_limit = 4
 
     def _path(self, ident):
         return self.directory / (safe_id(ident) + ".json")
+
+    @staticmethod
+    def _file_fingerprint(path):
+        stat = path.stat()
+        return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+    @staticmethod
+    def _summary(value):
+        """Validate only fields needed by the project picker.
+
+        Full production migration and storyboard auditing belongs to ``get``
+        and ``save``.  Keeping it out of ``list`` prevents opening the picker
+        from deep-copying and auditing every historical production.
+        """
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValueError("This is not a version 1 production.")
+        ident = safe_id(value.get("id"))
+        title = _text(value.get("title"), "production title", 160, "Untitled production") or "Untitled production"
+        updated_at = value.get("updated_at")
+        if type(updated_at) not in (int, float) or not math.isfinite(updated_at):
+            raise ValueError("Production update time must be a finite number.")
+        segments = value.get("segments", [])
+        if (not isinstance(segments, list) or len(segments) > MAX_SEGMENTS or
+                any(not isinstance(segment, dict) for segment in segments)):
+            raise ValueError(f"A production can contain at most {MAX_SEGMENTS} clips.")
+        episode_count = value.get("episode_count", 1)
+        if type(episode_count) is not int or not 1 <= episode_count <= MAX_EPISODES:
+            raise ValueError(f"Episode count must be 1-{MAX_EPISODES}.")
+        current_episode = value.get("current_episode", 1)
+        if type(current_episode) is not int:
+            current_episode = 1
+        return {
+            "id": ident,
+            "title": title,
+            "updated_at": float(updated_at),
+            "segment_count": len(segments),
+            "ready_count": sum(segment.get("status") == "ready" for segment in segments),
+            "episode_count": episode_count,
+            "current_episode": max(1, min(current_episode, episode_count)),
+        }
+
+    def _remember_validated(self, ident, fingerprint, value):
+        # A plain ordered dict is sufficient on supported Python versions.
+        # Reinsert on access so the first key remains the least recently used.
+        self._validated_cache.pop(ident, None)
+        self._validated_cache[ident] = (fingerprint, copy.deepcopy(value))
+        while len(self._validated_cache) > self._validated_cache_limit:
+            self._validated_cache.pop(next(iter(self._validated_cache)))
 
     def get(self, ident):
         with self.lock:
             path = self._path(ident)
             if not path.is_file():
                 raise ValueError("Production not found.")
-            return self.validate(json.loads(path.read_text(encoding="utf-8")))
+            ident = safe_id(ident)
+            fingerprint = self._file_fingerprint(path)
+            cached = self._validated_cache.get(ident)
+            if cached and cached[0] == fingerprint:
+                value = copy.deepcopy(cached[1])
+                self._validated_cache.pop(ident, None)
+                self._validated_cache[ident] = cached
+                return value
+            result = self.validate(json.loads(path.read_text(encoding="utf-8")))
+            self._remember_validated(ident, fingerprint, result)
+            self._summary_cache[ident] = (fingerprint, self._summary(result))
+            return result
 
     def list(self):
-        values = []
-        for path in self.directory.glob("*.json"):
-            try:
-                item = self.validate(json.loads(path.read_text(encoding="utf-8")))
-                values.append({"id": item["id"], "title": item["title"],
-                    "updated_at": item["updated_at"], "segment_count": len(item["segments"]),
-                    "ready_count": sum(s["status"] == "ready" for s in item["segments"]),
-                    "episode_count": item["episode_count"], "current_episode": item["current_episode"]})
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-        return sorted(values, key=lambda x: x["updated_at"], reverse=True)
+        with self.lock:
+            values, present = [], set()
+            for path in self.directory.glob("*.json"):
+                try:
+                    ident = safe_id(path.stem)
+                    present.add(ident)
+                    fingerprint = self._file_fingerprint(path)
+                    cached = self._summary_cache.get(ident)
+                    if cached and cached[0] == fingerprint:
+                        summary = copy.deepcopy(cached[1])
+                    else:
+                        summary = self._summary(json.loads(path.read_text(encoding="utf-8")))
+                        if summary["id"] != ident:
+                            raise ValueError("Production filename does not match its id.")
+                        self._summary_cache[ident] = (fingerprint, copy.deepcopy(summary))
+                    values.append(summary)
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    continue
+            for ident in set(self._summary_cache) - present:
+                self._summary_cache.pop(ident, None)
+                self._validated_cache.pop(ident, None)
+            return sorted(values, key=lambda x: x["updated_at"], reverse=True)
 
     def validate(self, value):
         if not isinstance(value, dict) or value.get("schema_version") != 1:
@@ -4527,6 +4606,9 @@ class ProductionManager:
                     result["task_state"] = "paused"
             result["updated_at"] = time.time()
             atomic_json(path, result)
+            fingerprint = self._file_fingerprint(path)
+            self._remember_validated(result["id"], fingerprint, result)
+            self._summary_cache[result["id"]] = (fingerprint, self._summary(result))
             return result
 
     def delete(self, ident):
@@ -4547,6 +4629,8 @@ class ProductionManager:
         archive.mkdir(parents=True, exist_ok=True)
         target = archive / f"{ident}-{int(time.time())}.json"
         path.replace(target)
+        self._validated_cache.pop(ident, None)
+        self._summary_cache.pop(ident, None)
         return {"deleted": True, "id": ident,
                 "linked_projects_preserved": True, "video_results_preserved": True,
                 "card_library_preserved": True,

@@ -113,6 +113,49 @@ def test_new_production_starts_with_an_empty_independent_card_library(tmp_path):
     assert production["auto_prompt_repair"] is True
 
 
+def test_production_list_reads_lightweight_summaries_without_full_validation(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    first = manager.create({"source_project": source, "title": "First", "brief": ""})
+    second = manager.create({"source_project": source, "title": "Second", "brief": ""})
+    manager._summary_cache.clear()
+
+    def fail_if_fully_validated(_value):
+        raise AssertionError("the project picker must not fully validate production files")
+
+    manager.validate = fail_if_fully_validated
+    summaries = manager.list()
+
+    assert {item["id"] for item in summaries} == {first["id"], second["id"]}
+    assert {item["title"] for item in summaries} == {"First", "Second"}
+    assert all(item["segment_count"] == 0 for item in summaries)
+
+
+def test_production_get_cache_invalidates_when_file_changes(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "title": "Cached", "brief": ""})
+    manager._validated_cache.clear()
+    original_validate = manager.validate
+    validate_calls = []
+
+    def counted_validate(value):
+        validate_calls.append(value.get("title"))
+        return original_validate(value)
+
+    manager.validate = counted_validate
+    assert manager.get(production["id"])["title"] == "Cached"
+    assert manager.get(production["id"])["title"] == "Cached"
+    assert validate_calls == ["Cached"]
+
+    path = manager._path(production["id"])
+    external = json.loads(path.read_text(encoding="utf-8"))
+    external["title"] = "Changed outside Studio"
+    path.write_text(json.dumps(external, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert manager.list()[0]["title"] == "Changed outside Studio"
+    assert manager.get(production["id"])["title"] == "Changed outside Studio"
+    assert validate_calls == ["Cached", "Changed outside Studio"]
+
+
 def test_legacy_auto_quality_setting_migrates_to_unified_manual_review(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": ""})

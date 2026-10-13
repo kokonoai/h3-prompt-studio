@@ -1214,6 +1214,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const autoMergeAttempt=useRef("");
   const automation=outputs?.automation;
   const automationActive=automation?.status==="running"||automation?.status==="retrying";
+  const outputsNeedPolling=automationActive||(outputs?.active_jobs||0)>0||
+    outputs?.quality_batch?.status==="running"||merging;
   const totalSeconds=useMemo(()=>production?.segments.reduce((n,s)=>n+s.duration,0)||0,[production?.segments]);
   const currentEpisodeTiming=useMemo(()=>episodeTiming(production?.episode_minutes||draft.episode_minutes),[production?.episode_minutes,draft.episode_minutes]);
   const currentEpisodeForPlan=production?.episodes.find(episode=>episode.index===production.current_episode)||production?.episodes[0];
@@ -1512,7 +1514,12 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   });
   const load=async(id:string,page:ProductionPage="script")=>{
     if(!id){setProduction(null);setDraft(blank(project));setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setProductionPage("script");return;}
-    const value=await api("/productions/"+id);setProduction(value);setDraft(value);setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setError("");setNotice("");setProductionPage(page);
+    setBusy(t("正在加载项目…","Loading project…","プロジェクトを読み込み中…","正在載入專案…"));
+    setError("");setNotice("");setOutputs(null);
+    try{
+      const value=await api("/productions/"+id);setProduction(value);setDraft(value);setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setProductionPage(page);
+    }catch(e){setError((e as Error).message);}
+    finally{setBusy("");}
   };
   const startNewProduction=()=>{setProduction(null);setDraft(blank(project));setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setError("");setNotice("");setProductionPage("script");};
   const importCurrentStudioContent=()=>setDraft(current=>({
@@ -1982,9 +1989,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     if(!production?.id){setOutputs(null);return;}
     let active=true;
     const poll=async()=>{try{const value=await api("/productions/"+production.id+"/outputs") as ProductionOutputs;if(active)setOutputs(value);}catch{/* Keep editing while ComfyUI or a result is unavailable. */}};
-    void poll();const timer=window.setInterval(()=>void poll(),5000);
-    return()=>{active=false;window.clearInterval(timer);};
-  },[production?.id]);
+    void poll();
+    const timer=outputsNeedPolling?window.setInterval(()=>void poll(),5000):null;
+    return()=>{active=false;if(timer!==null)window.clearInterval(timer);};
+  },[production?.id,outputsNeedPolling]);
   useEffect(()=>{
     if(busyRef.current||production?.task_state==="paused"||bulkAction||automationActive||!outputs?.all_ready||outputs.quality_pending_count>0||outputs.quality_batch?.status==="running"||outputs.active_jobs>0||outputs.uncertain_jobs>0||outputs.final_ready||!outputs.signature||merging)return;
     if(autoMergeAttempt.current===outputs.signature)return;
