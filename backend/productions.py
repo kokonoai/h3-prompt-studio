@@ -7003,7 +7003,18 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
     source_manifest = (copy.deepcopy(source_manifest_override)
                        if isinstance(source_manifest_override, dict)
                        else source_manifest_for_text(source_story, chunk_index))
-    return json.dumps({
+    # Timed batches keep both per-group chunks (used by deterministic server
+    # validation) and equivalent flattened rows (used by the planner). Sending
+    # both copies can push an otherwise small 900-character scene past the
+    # local client's 48,000-character request limit. The global Cxx IDs already
+    # preserve group ownership in the flattened view, so omit only the
+    # redundant nested copy from the LLM request; validation still rebuilds the
+    # complete chunked manifest from the untouched source groups.
+    if source_manifest.get("chunks") and all(
+            isinstance(source_manifest.get(kind), list)
+            for kind in ("scenes", "paragraphs", "dialogue", "events")):
+        source_manifest.pop("chunks", None)
+    payload = {
         "title": production["title"], "story_or_script": source_story,
         "project_output_language": PRODUCTION_LANGUAGES[production["language"]],
         "current_episode": production.get("current_episode", 1),
@@ -7054,7 +7065,12 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
                     "positions, facing, motion, eyelines, prop holders, shot size, composition and axis as the authoritative prior "
                     "frame. State explicitly what the first new clip preserves and what it changes; never replay the prior action. "
                     "Start continuously only when that handoff is physically compatible; otherwise author a motivated cut.")
-    }, ensure_ascii=False, indent=2)
+    }
+    # Whitespace indentation has no semantic value to the JSON planner and can
+    # add more than ten thousand characters to a dense storyboard request.
+    # Keep the default compact separators so every bounded batch stays below
+    # the same limit enforced by LMStudioClient._validated_content.
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def episode_planning_payload(production, start_index, count, previous_ending=""):

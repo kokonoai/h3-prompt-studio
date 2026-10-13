@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 import uuid
 
 import pytest
@@ -987,6 +988,53 @@ def test_timed_storyboard_batches_reduce_serial_calls_without_losing_order():
     assert [row["start_index"] for row in batches] == [1, 4]
     assert [len(row["groups"]) for row in batches] == [3, 3]
     assert timed_batch_story(batches[0]["groups"]).count("-") == 3
+
+
+def test_timed_planning_payload_omits_duplicate_manifest_and_fits_local_client(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    blocks = []
+    for index in range(3):
+        start, end = index * 10, (index + 1) * 10
+        actions = "\n".join(
+            f"Action {index}-{row}: the cast preserves a distinct authored visual state."
+            for row in range(11))
+        blocks.append(
+            f"0:{start:02d}-0:{end:02d}\n{actions}\nHero {index}: \"Exact line {index}.\"")
+    screenplay = "\n\n".join(blocks)
+    production = manager.create({"source_project": source, "brief": screenplay})
+    production["character_bible"] = "Stable character canon. " * 45
+    production["series_voice_style"] = "Stable voice direction. " * 100
+    production["cards"]["characters"] = [
+        _card(f"Character {index}", description="character identity " * 14)
+        for index in range(11)]
+    production["cards"]["props"] = [
+        _card(f"Prop {index}", description="prop continuity " * 15)
+        for index in range(12)]
+    production["cards"]["environments"] = [
+        _card(f"Environment {index}", description="environment geography " * 11)
+        for index in range(5)]
+    production["cards"]["voices"] = [
+        _card(f"Voice {index}", description="voice identity " * 16,
+              character_card_id=production["cards"]["characters"][index]["id"],
+              voice_id=f"VOICE_{index}")
+        for index in range(9)]
+    production["cards"]["styles"] = [
+        _card("Series style", description="style continuity " * 15,
+              image_analysis="watercolor line and palette authority " * 18)]
+    production = manager.save(production)
+    groups = timed_clip_groups(screenplay)
+    manifest = timed_batch_source_manifest(groups, 1)
+
+    payload = planning_payload(
+        production, timed_batch_story(groups), 1, 1,
+        source_manifest_override=manifest)
+    decoded = json.loads(payload)
+
+    assert 0 < len(payload) <= 48_000
+    assert "chunks" not in decoded["source_manifest"]
+    assert decoded["source_manifest"]["paragraphs"]
+    assert decoded["source_manifest"]["dialogue"]
+    assert "Exact line 0." in payload
 
 
 def test_timed_batch_contract_keeps_global_source_ids_and_group_durations():
