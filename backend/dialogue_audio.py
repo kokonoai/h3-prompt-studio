@@ -357,6 +357,16 @@ def audible_speech_lock(shots, names, soundscape=""):
     count = len(dialogue)
     line_count = "exactly one structured dialogue line" if count == 1 else f"exactly {count} structured dialogue lines"
     roster = ", ".join(speakers) or "the explicitly assigned speaker or speakers"
+    silent = []
+    if isinstance(names, dict):
+        silent = [label for label in (_text(value) for value in names.values())
+                  if label and label not in speakers]
+    silent_lock = (
+        " All other named subjects (" + ", ".join(dict.fromkeys(silent))
+        + ") remain silent with closed mouths for the entire clip, including entrances, "
+          "reactions, prop handling and the final hold."
+        if silent else ""
+    )
     return (
         "AUDIBLE SPEECH LOCK — CURRENT CLIP: The clip contains " + line_count
         + ", and those tagged words are the complete and exclusive audible speech. "
@@ -365,10 +375,12 @@ def audible_speech_lock(shots, names, soundscape=""):
         + "narration or lyrics, and must never be vocalised. Every character without an "
         + "assigned line remains silent with a closed mouth; do not invent replies, "
         + "follow-up words, ad-libs, whispers, muttering, crowd speech or speech-like "
-        + "vocalisation. " + nonverbal_lock + " Waiting for an answer or response is visual "
+        + "vocalisation." + silent_lock + " Visual identity descriptions and character "
+          "capabilities never authorize sound. " + nonverbal_lock + " Waiting for an answer or response is visual "
         + "acting only unless a later structured dialogue line explicitly supplies that "
         + "reply. Do not fill unused clip duration with new voices. After the final scripted "
-        + "line, only the explicitly requested non-speech ambience is audible."
+        + "line, every mouth stays closed through the final frame and only the explicitly "
+          "requested non-speech ambience is audible."
     )
 
 
@@ -408,6 +420,20 @@ def final_audio_override(shots, names, soundscape=""):
         cue_speakers.append(f"cue {index}={label or 'assigned speaker'}")
     count = len(dialogue)
     noun = "utterance" if count == 1 else "utterances"
+    speaking_labels = {
+        _text(names.get(line.get("speaker_id")))
+        for line in dialogue if isinstance(names, dict)
+    }
+    silent = []
+    if isinstance(names, dict):
+        silent = [label for label in (_text(value) for value in names.values())
+                  if label and label not in speaking_labels]
+    silent_lock = (
+        " Every other named subject (" + ", ".join(dict.fromkeys(silent))
+        + ") is silent with a closed mouth for the entire clip, including entrances, "
+          "reactions, prop handling and the final hold."
+        if silent else ""
+    )
     return (
         "FINAL AUDIO OVERRIDE — HIGHEST PRIORITY: Spoken-utterance count is exactly "
         + str(count) + " " + noun + " total (" + "; ".join(cue_speakers) + "). "
@@ -416,6 +442,7 @@ def final_audio_override(shots, names, soundscape=""):
         "source-coverage text, headings, camera directions and sound-effect labels are silent metadata "
         "and must never be read aloud. Quoted onomatopoeia describes a non-vocal effect, not a spoken "
         "word. Do not add a narrator, reaction voice, reply, ad-lib, whisper, chant, crowd voice or "
-        "background conversation. " + nonverbal_lock + " During every gap and after the final cue, "
-        "only the requested ambience or effects continue."
+        "background conversation." + silent_lock + " Visual identity descriptions and character "
+        "capabilities never authorize sound. " + nonverbal_lock + " During every gap and after the final cue, "
+        "all mouths stay closed and only the requested ambience or effects continue through the final frame."
     )

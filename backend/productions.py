@@ -1472,7 +1472,17 @@ def render_character_identity(card):
                     not _CLIP_ONLY_CHARACTER_FACT.search(sentence)):
                 lines.append(sentence)
                 seen.add(key)
-    return " ".join(lines)
+    text = " ".join(lines)
+    # A visual identity such as "talking backpack" describes an
+    # anthropomorphic design, not permission to add dialogue. Keep that visual
+    # fact while removing speech-capability words from the detached render copy;
+    # the authored library card remains unchanged.
+    text = re.sub(
+        r"(?i)\b(?:talking|speaking)\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,2})(?=\s+with\b)",
+        r"anthropomorphic \1",
+        text,
+    )
+    return text
 
 
 def character_is_embedded_form(card, text):
@@ -2687,22 +2697,54 @@ def collective_speaker(value):
                    "众人", "大家", "全员", "所有人", "眾人", "全員", "みんな"}
 
 
-def series_voice_character_rules(value, character_name):
+def series_voice_character_rules(value, character_name, character_names=None):
     """Keep only one selected speaker's rules from a shared voice bible.
 
     Series voice styles often contain both global acting direction and a long
     per-character roster.  Sending the whole roster to every clip can summon
     silent names or blur identities, while dropping it entirely loses useful
     exclusions such as ``Pokke should not sound robotic``.  This narrow pass
-    retains only lines that explicitly name the current speaking character.
+    retains only lines owned by the current speaking character.
+
+    Ownership matters more than simple containment.  For example, a Nox rule
+    may say that his dry delivery contrasts with Pokke.  Treating every line
+    containing ``Pokke`` as a Pokke rule leaks Nox's voice direction into a
+    clip where Nox is silent and can make a joint audio/video model invent an
+    extra reply.  When the character roster is available, the first explicitly
+    named character on the line owns that rule; later names are comparisons.
     """
     name = str(character_name or "").strip()
     if not name:
         return ""
+    roster = []
+    for item in character_names or []:
+        label = str(item or "").strip()
+        if label and label.casefold() not in {entry.casefold() for entry in roster}:
+            roster.append(label)
+    if name.casefold() not in {entry.casefold() for entry in roster}:
+        roster.append(name)
+
+    def owner(line):
+        occurrences = []
+        folded = line.casefold()
+        for label in roster:
+            needle = label.casefold()
+            if re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", label):
+                position = folded.find(needle)
+            else:
+                match = re.search(rf"(?<![\w]){re.escape(needle)}(?![\w])", folded)
+                position = match.start() if match else -1
+            if position >= 0:
+                # Prefer the longest identity when two names begin together.
+                occurrences.append((position, -len(needle), label))
+        return min(occurrences)[2] if occurrences else ""
+
     selected = []
     for raw in str(value or "").splitlines():
         line = re.sub(r"^\s*(?:[-*]+|#{1,6})\s*", "", raw).strip()
         if not line or not _name_occurs(name.casefold(), line.casefold()):
+            continue
+        if roster and owner(line).casefold() != name.casefold():
             continue
         if line.casefold() not in {item.casefold() for item in selected}:
             selected.append(line)
@@ -2746,6 +2788,7 @@ def voice_prompt_context(production, cards):
     from .narrative_prompt import _brief_series_style
     character_names = {card["id"]: card["name"]
                        for card in production["cards"]["characters"]}
+    all_character_names = list(character_names.values())
     audio_cards = [card["name"] for card in cards if card.get("asset_ids")]
     sections = [
         "VOICE DIRECTION — CURRENT CLIP ONLY",
@@ -2766,7 +2809,7 @@ def voice_prompt_context(production, cards):
     for card in cards:
         character_name = character_names.get(card.get("character_card_id"), card["name"])
         character_rules = series_voice_character_rules(
-            production.get("series_voice_style"), character_name)
+            production.get("series_voice_style"), character_name, all_character_names)
         exact = acoustic_voice_text("\n".join(
             part for part in (card.get("description", ""), card.get("notes", "")) if part))
         metadata = "; ".join(part for part in (
@@ -5760,7 +5803,8 @@ class ProductionManager:
                     "pace": card.get("pace", ""),
                     "series_rules": series_voice_character_rules(
                         production.get("series_voice_style", ""),
-                        characters_by_id[card["character_card_id"]]["name"]),
+                        characters_by_id[card["character_card_id"]]["name"],
+                        [item["name"] for item in production["cards"]["characters"]]),
                     "has_audio": bool(card.get("asset_ids")),
                 } for card in selected_voices
                     if card.get("character_card_id") in characters_by_id

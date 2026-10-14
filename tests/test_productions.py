@@ -1713,7 +1713,7 @@ def test_series_voice_roster_restores_only_the_current_speakers_rules(tmp_path):
         "series_voice_style": (
             "Animated ensemble dialogue.\n"
             "- Pokke should remain fast and bouncy, never robotic.\n"
-            "- Nox should remain smoky and dry, never growling.\n"
+            "- Nox should remain smoky and dry, contrasting with Pokke, never growling.\n"
             "#### The characters should have clearly differentiated voices:\n"
             "Pokke: bright youthful momentum.\n"
             "Nox: controlled quiet amusement."),
@@ -1739,6 +1739,18 @@ def test_series_voice_roster_restores_only_the_current_speakers_rules(tmp_path):
     assert "Pokke: bright youthful momentum" in context
     assert "Nox should remain smoky" not in context
     assert "Nox: controlled quiet amusement" not in context
+
+
+def test_render_character_identity_removes_visual_speech_authority():
+    card = {
+        "description": "Mint-green talking backpack with a zipper mouth and two pencil antennae.",
+        "notes": "Compact plush proportions.",
+    }
+
+    rendered = render_character_identity(card)
+
+    assert "anthropomorphic backpack" in rendered
+    assert "talking backpack" not in rendered
 
 
 def test_mimic_and_recorded_speakers_reuse_the_selected_voice_authority(tmp_path):

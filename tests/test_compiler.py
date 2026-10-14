@@ -224,13 +224,15 @@ def test_all_prompt_versions_lock_short_dialogue_and_unused_time(prompt_version)
     assert text.count("<d>") == 1
     assert "exactly one structured dialogue line" in text
     assert "Do not fill unused clip duration with new voices" in text
-    assert "After the final scripted line, only the explicitly requested non-speech ambience is audible" in text
+    assert "every mouth stays closed through the final frame" in text
     assert text.rstrip().endswith(
-        "only the requested ambience or effects continue."
+        "only the requested ambience or effects continue through the final frame."
     )
     assert "AUTHORIZED NONVERBAL VOCAL EVENTS: none" in text
     assert "Spoken-utterance count is exactly 1 utterance total (cue 1=Visitor)" in text
     assert "Perform each existing tagged dialogue cue exactly once" in text
+    assert "Visual identity descriptions and character capabilities never authorize sound" in text
+    assert "all mouths stay closed" in text
     assert "sound-effect labels are silent metadata" in text
     assert "waits for an answer" not in text
     assert "waits for a response" not in text
