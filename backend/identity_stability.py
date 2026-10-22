@@ -39,7 +39,7 @@ def visible_identity_lock(subjects, visible_ids, label_fn=None):
     """
     by_id = {item.get("id"): item for item in subjects if isinstance(item, dict)}
     ordered = [ident for ident in dict.fromkeys(visible_ids) if ident in by_id]
-    if len(ordered) < 2:
+    if not ordered:
         return ""
     label_fn = label_fn or (lambda ident: str(by_id[ident].get("name", "character")))
     rows = []
@@ -59,5 +59,9 @@ def visible_identity_lock(subjects, visible_ids, label_fn=None):
         ("Every visible body must match exactly one row. Never transfer body shape, face, surface pattern, "
          "clothing or signature accessories between rows; never blend two rows into a hybrid. When identities "
          "share a colour, size, species or silhouette, preserve their different geometry and unique markers. "
-         "If the frame is crowded, use stable spacing or partial occlusion—never an extra, mirrored or replacement body."),
+         "If the frame is crowded, use stable spacing or partial occlusion—never an extra, mirrored or replacement body. "
+         "A moving character is the same continuous body travelling from its old position to its new position; the old "
+         "position becomes empty, so never leave a copy behind or create a second body at the destination. Signature "
+         "headwear, clothing, badges and worn accessories stay physically attached to that same body throughout motion; "
+         "never detach them into a freestanding prop, duplicate them, or generate an accessory-less copy of the wearer."),
     ])

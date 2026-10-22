@@ -148,6 +148,8 @@ def test_all_prompt_versions_repeat_compact_one_to_one_cast_bindings(prompt_vers
     assert "rectangular backpack body" in result["prompt"]
     assert "round striped watermelon body" in result["prompt"]
     assert "never blend two rows into a hybrid" in result["prompt"]
+    assert "headwear, clothing, badges and worn accessories stay physically attached" in result["prompt"]
+    assert "the old position becomes empty" in result["prompt"]
 
 
 @pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
@@ -170,6 +172,34 @@ def test_dense_ensemble_uses_fixed_master_and_stable_screen_lanes(prompt_version
     assert "Do not begin on a close-up and then reveal the ensemble" in result["prompt"]
     assert "Visitor = lane 1" in result["prompt"]
     assert "Actor 4 = lane 4" in result["prompt"]
+
+
+@pytest.mark.parametrize("prompt_version", ["classic", "continuity_director", "storyboard_narrative"])
+def test_dense_ensemble_does_not_pre_place_declared_entrants(prompt_version):
+    p = project()
+    p["prompt_version"] = prompt_version
+    for index in range(2, 6):
+        sid = f"s{index}"
+        aid = f"a{index}"
+        p["subjects"].append({"id": sid, "name": f"Actor {index}",
+                              "asset_ids": [aid], "description": f"Distinct actor {index}."})
+        p["assets"].append(asset(aid))
+        p["shots"][0]["visible_subject_ids"].append(sid)
+    p["shots"][0]["scene_contract"] = {
+        "actors": [
+            {"subject_id": "s", "activity": "hold", "start": "at center", "action": "holds position", "end": "at center"},
+            {"subject_id": "s2", "activity": "act", "start": "outside frame", "action": "walks into frame and stops", "end": "in lane 2"},
+        ],
+        "objects": [], "environment": "A room", "background_activity": "None",
+    }
+
+    text = compile_project(p)["prompt"]
+
+    assert "Actor 2" in text
+    assert "fully outside the frame" in text
+    assert "Entrants start fully outside the frame:" in text
+    assert "Never pre-place an entrant" in text
+    assert "All listed bodies are present together at the opening" not in text
 
 
 def test_director_continuity_uses_narrative_storyboard_and_current_speaker_only():

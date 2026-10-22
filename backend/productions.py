@@ -2350,6 +2350,25 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
         ". Do not repeat the preceding action, swap a prop holder, reverse established screen direction, "
         "or import an off-screen/display/memory identity into the physical set.")
     shot_contract = normalise_shot_contract(segment.get("shot_contract"), segment)
+    timeline = effective_cast_timeline(production, segment, roles)
+    dense_roster = list(dict.fromkeys(
+        timeline.get("visible_start", []) + timeline.get("enters", []) +
+        timeline.get("exits", []) + timeline.get("visible_end", [])))
+    dense_cast_guard = ""
+    if len(dense_roster) > 4:
+        opening_names = [name for name in timeline.get("visible_start", [])
+                         if name not in timeline.get("enters", [])]
+        entrant_names = list(dict.fromkeys(timeline.get("enters", [])))
+        dense_cast_guard = (
+            "DENSE CAST RENDER LOCK: keep one fixed wide master composition and stable, non-overlapping screen "
+            "lanes for all " + str(len(dense_roster)) + " physical identities. Opening physical roster: exactly " +
+            (", ".join(opening_names) if opening_names else "no named body") + ". " +
+            (("Entrants start fully outside the image and cross the frame boundary exactly once, one at a time: " +
+              ", ".join(entrant_names) + ". Never show an entrant before that entrance, leave an earlier copy "
+              "behind, or recreate the entrant at another depth. ") if entrant_names else "") +
+            "At any moment animate only the identity performing the next authored beat; every other body holds its "
+            "reserved lane with minimal reaction. Preserve every story event, but never stage simultaneous independent "
+            "entrances, camera reveals or repeated views of the ensemble.")
     previous = next((row for row in production.get("segments", [])
                      if row.get("index") == segment.get("index", 0) - 1), None)
     transition_mode = segment.get("transition_mode", "hard_cut")
@@ -2390,17 +2409,42 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
             "Do not carry any person, creature, reflection, portrait, costume, pose, prop holder or background extra from the preceding clip. ")
     else:
         previous_snapshot = "OPENING CLIP: there is no preceding visual state to inherit. "
+    opening_composition = current_visual_text(
+        shot_contract['opening_composition'], 'use one current-clip composition')
+    ending_composition = current_visual_text(
+        shot_contract['ending_composition'], 'end on the current authored beat')
+    composition_text = opening_composition + "\n" + ending_composition
+    internal_edit_cue = re.search(
+        r"\b(?:rapid|quick|fast)\s+cuts?\b|\bcuts?\s+between\b|\b(?:cutaway|montage|"
+        r"reverse\s+shot|insert\s+shot|split[- ]screen|match[- ]cut|jump\s+cut)\b|"
+        r"快速切换|快速切換|镜头切换|鏡頭切換|蒙太奇|反打|插入镜头|插入鏡頭|分屏|"
+        r"モンタージュ|カットアウェイ|リバースショット",
+        composition_text, re.IGNORECASE)
+    conflicting_views = _camera_view_count(composition_text) >= 2
+    if internal_edit_cue or conflicting_views:
+        stable_size = shot_contract['shot_size'].replace('_', '-')
+        opening_composition = f"one stable {stable_size} master composition"
+        ending_composition = f"hold the same {stable_size} master composition on the authored ending beat"
+        contract_axis = "fixed"
+        allow_axis_cross = False
+    else:
+        contract_axis = shot_contract['camera_axis'] or 'unspecified'
+        allow_axis_cross = shot_contract['allow_axis_cross']
     edit_guard = (
         f"SHOT EDIT CONTRACT: role={shot_contract['role']}; shot size={shot_contract['shot_size']}; "
-        f"opening composition={current_visual_text(shot_contract['opening_composition'], 'use one current-clip composition')}; "
-        f"ending composition={current_visual_text(shot_contract['ending_composition'], 'end on the current authored beat')}; "
-        f"axis={shot_contract['camera_axis'] or 'unspecified'}; allow axis crossing={shot_contract['allow_axis_cross']}; "
+        f"opening composition={opening_composition}; ending composition={ending_composition}; "
+        f"axis={contract_axis}; allow axis crossing={allow_axis_cross}; "
         f"edit reason={shot_contract['edit_reason']}; relation to previous={shot_contract['relation_previous']}. "
         + previous_snapshot +
-        "Keep reciprocal dialogue eyelines, screen direction and action phase. Avoid an accidental jump cut or replaying the preceding action.")
+        "SINGLE-TAKE CAMERA LOCK: one H3 render contains one continuous camera setup. Earlier wording about rapid "
+        "cuts, multiple angles, inserts, reactions, reverse shots or ending on another camera view is editorial intent "
+        "only and is restaged inside this one composition without a cut or repeated view of any character. Keep "
+        "reciprocal dialogue eyelines, screen direction and action phase. Avoid an accidental jump cut or replaying "
+        "the preceding action.")
     return "\n\n".join(part for part in [
         "FINAL PRODUCTION RENDER OVERRIDE — this block supersedes any conflicting earlier staging, cast, screen, reflection, prop or audio prose. Do not reinterpret it as story content.",
         guard,
+        dense_cast_guard,
         source_guard,
         continuity_guard,
         edit_guard,

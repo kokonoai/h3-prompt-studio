@@ -8,7 +8,8 @@ from typing import Any
 
 from .dialogue_audio import audible_speech_lock, clarify_unanswered_wait, final_audio_override
 from .identity_stability import visible_identity_lock
-from .scene_contract import contract_texts, map_contract_texts, render_scene_contract, validate_scene_contract
+from .scene_contract import (contract_texts, entering_subject_ids, map_contract_texts,
+                             render_scene_contract, validate_scene_contract)
 
 MODES = {"ref2va", "fl2va", "i2va", "l2va", "t2va"}
 PROFILES = {"official", "director", "concise", "custom"}
@@ -723,13 +724,16 @@ def compile_project(project: dict) -> dict:
             paragraphs.append(_sentence(shot["setting"]))
         cast_ids = [sid for sid in shot.get("visible_subject_ids", [])
                     if not (viewpoint == 'pov' and sid == project.get('game_player_id'))]
+        entering_ids = set(entering_subject_ids(shot))
         display_ids = list(dict.fromkeys(shot.get("display_subject_ids", [])))
         imagined_ids = list(dict.fromkeys(shot.get("imagined_subject_ids", [])))
         reflected_ids = list(dict.fromkeys(shot.get("reflected_subject_ids", [])))
         if cast_ids:
             paragraphs.append(_sentence(
                 "Exact named visible roster: " + "; ".join(name(sid) for sid in cast_ids)
-                + ". Show one physical instance of each listed identity, never an additional copy from its reference image or overview sheet; no unlisted principal character"))
+                + ". This roster covers the complete clip, not necessarily its opening frame. Show one physical "
+                "instance of each listed identity, never an additional copy from its reference image or overview "
+                "sheet; no unlisted principal character"))
         else:
             paragraphs.append("No named character is visible in this shot; do not turn a reference portrait into a background extra.")
         for sid in shot.get("visible_subject_ids", []):
@@ -740,7 +744,12 @@ def compile_project(project: dict) -> dict:
             # entire identity card here inflated ensemble prompts and obscured
             # the actual staging. Unreferenced subjects still need inline detail.
             desc = "" if sid in subject_tokens else _text(subject_map[sid].get("description"))
-            paragraphs.append(_sentence(name(sid) + " is visible" + (": " + desc if desc else "")))
+            if sid in entering_ids:
+                paragraphs.append(_sentence(
+                    name(sid) + " begins fully outside the frame, enters exactly once as the same continuous body, "
+                    "and is never visible as a pre-entry duplicate" + (": " + desc if desc else "")))
+            else:
+                paragraphs.append(_sentence(name(sid) + " is visible from the opening" + (": " + desc if desc else "")))
         for sid in shot.get("offscreen_subject_ids", []):
             paragraphs.append(_sentence(name(sid) + " remains off-screen"))
         if display_ids:

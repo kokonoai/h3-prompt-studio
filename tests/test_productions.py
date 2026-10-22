@@ -711,6 +711,66 @@ def test_continuous_boundary_keeps_only_shared_current_identities():
     assert "PriorOnlySentinel" not in guard
 
 
+def test_render_override_restages_internal_camera_edits_as_one_master():
+    local = _card("Hero")
+    production = {
+        "brief": "", "cards": {kind: [] for kind in CARD_KINDS},
+        "source_manifest": {"version": 1, "chunks": []}, "segments": [],
+    }
+    production["cards"]["characters"] = [local]
+    segment = {
+        "id": _id(), "index": 1, "title": "One take", "transition_mode": "hard_cut",
+        "story": "Hero finds the clue.", "setting": "Desk", "action": "Hero finds the clue.",
+        "ending": "Hero holds the clue.", "dialogue": [],
+        "card_selection": {"characters": ["Hero"], "props": []},
+        "cast_timeline": {"visible_start": ["Hero"], "visible_end": ["Hero"],
+                          "enters": [], "exits": [], "offscreen": [], "mentioned_only": []},
+        "shot_contract": {"role": "close_up", "shot_size": "close_up",
+                          "opening_composition": "Rapid cuts between paper and glass edge",
+                          "ending_composition": "Low-angle close-up through the glass",
+                          "camera_axis": "variable", "allow_axis_cross": True,
+                          "edit_reason": "information_reveal", "relation_previous": "hard_cut"},
+    }
+    production["segments"] = [segment]
+
+    guard = production_render_override(production, segment, roles={local["id"]: "physical"})
+
+    assert "opening composition=one stable close-up master composition" in guard
+    assert "ending composition=hold the same close-up master composition" in guard
+    assert "axis=fixed; allow axis crossing=False" in guard
+    assert "SINGLE-TAKE CAMERA LOCK" in guard
+    assert "Rapid cuts between" not in guard
+
+
+def test_dense_cast_render_override_serialises_entrances_without_preplacing_them():
+    names = ["A", "B", "C", "D", "E"]
+    cards = [_card(name) for name in names]
+    production = {
+        "brief": "", "cards": {kind: [] for kind in CARD_KINDS},
+        "source_manifest": {"version": 1, "chunks": []}, "segments": [],
+    }
+    production["cards"]["characters"] = cards
+    segment = {
+        "id": _id(), "index": 1, "title": "Team", "transition_mode": "hard_cut",
+        "story": "The team assembles.", "setting": "Desk", "action": "The team assembles.",
+        "ending": "The team is ready.", "dialogue": [],
+        "card_selection": {"characters": names, "props": []},
+        "cast_timeline": {"visible_start": ["A", "B"], "visible_end": names,
+                          "enters": ["C", "D", "E"], "exits": [],
+                          "offscreen": [], "mentioned_only": []},
+        "shot_contract": {"shot_size": "wide", "relation_previous": "hard_cut"},
+    }
+    production["segments"] = [segment]
+    roles = {card["id"]: "physical" for card in cards}
+
+    guard = production_render_override(production, segment, roles=roles)
+
+    assert "DENSE CAST RENDER LOCK" in guard
+    assert "Opening physical roster: exactly A, B" in guard
+    assert "cross the frame boundary exactly once, one at a time: C, D, E" in guard
+    assert "Never show an entrant before that entrance" in guard
+
+
 def test_written_prop_lock_preserves_one_authored_card_and_defers_exact_type():
     lock = inscribed_prop_continuity_lock([{
         "name": "Cream confession card",

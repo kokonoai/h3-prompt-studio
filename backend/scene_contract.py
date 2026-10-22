@@ -18,9 +18,35 @@ MAX_ACTORS = 32
 MAX_OBJECTS = 24
 MAX_CONTRACT_CHARS = 18000
 ENSEMBLE_STABILITY_MIN = 4
+_FRAME_ENTRY_CUE = re.compile(
+    r"\b(?:enter(?:s|ed|ing)?|walk(?:s|ed|ing)?|step(?:s|ped|ping)?|run(?:s|ning)?|"
+    r"fl(?:y|ies|ew|ying)|hop(?:s|ped|ping)?|move(?:s|d|ing)?|come(?:s|came|coming)?)\b"
+    r".{0,48}\b(?:into|onto)\s+(?:the\s+)?frame\b|"
+    r"(?:进入|進入|走入|步入|跑入|飞入|飛入|跳入|移入)(?:画面|畫面|镜头|鏡頭)|入镜|入鏡|"
+    r"(?:フレーム|画面)(?:内)?(?:に|へ)(?:入る|入って|登場)",
+    re.IGNORECASE,
+)
 
 
-def ensemble_stability_direction(visible_ids, name_fn):
+def entering_subject_ids(shot):
+    """Return visible identities explicitly directed to enter this take.
+
+    The visible roster describes the whole clip, not necessarily its first
+    frame. Keeping this tiny deterministic distinction prevents a dense-cast
+    guard from pre-placing an entrant and then creating a second copy when the
+    authored entrance occurs.
+    """
+    visible = set(shot.get('visible_subject_ids', []))
+    result = []
+    for row in (shot.get('scene_contract') or {}).get('actors', []):
+        sid = row.get('subject_id')
+        action = str(row.get('action') or '')
+        if sid in visible and _FRAME_ENTRY_CUE.search(action):
+            result.append(sid)
+    return list(dict.fromkeys(result))
+
+
+def ensemble_stability_direction(visible_ids, name_fn, entering_ids=(), primary_ids=()):
     """Return deterministic blocking for dense named casts.
 
     H3 can recreate a reference identity when a close-up pulls out to reveal a
@@ -30,14 +56,31 @@ def ensemble_stability_direction(visible_ids, name_fn):
     bodies = list(dict.fromkeys(visible_ids))
     if len(bodies) < ENSEMBLE_STABILITY_MIN:
         return ""
+    entering = [sid for sid in dict.fromkeys(entering_ids) if sid in bodies]
+    present = [sid for sid in bodies if sid not in entering]
+    primary = [sid for sid in dict.fromkeys(primary_ids) if sid in bodies]
     lanes = '; '.join(f"{name_fn(sid)} = lane {index + 1}" for index, sid in enumerate(bodies))
+    if entering:
+        opening_rule = (
+            'Opening physical roster: exactly ' +
+            (', '.join(name_fn(sid) for sid in present) if present else 'no named body') +
+            '. Entrants start fully outside the frame: ' + ', '.join(name_fn(sid) for sid in entering) +
+            '. Each entrant crosses the frame boundary exactly once into the reserved lane, then remains that same '
+            'single body. Never pre-place an entrant, leave a pre-entry copy behind, or make the entrant disappear '
+            'and reappear elsewhere. ')
+    else:
+        opening_rule = 'All listed bodies are present together at the opening and remain the same physical instances. '
+    primary_rule = (
+        ('Dialogue focus remains on ' + ', '.join(name_fn(sid) for sid in primary) + '. ')
+        if primary else '')
     return (
         'ENSEMBLE STABILITY MODE: use one fixed medium-wide or wide master composition from the first frame '
         'through the final frame. Do not begin on a close-up and then reveal the ensemble; do not pull back, '
-        'pan, arc, track, cut, mirror, or reframe through an already established character. All listed bodies '
-        'are present together at the opening and remain the same physical instances. Reserve stable screen '
+        'pan, arc, track, cut, mirror, or reframe through an already established character. ' + opening_rule +
+        'Reserve stable screen '
         f'lanes from left to right: {lanes}. Only the explicitly assigned primary actor changes position at '
-        'one time; supporting reactions stay inside their original lanes. A character may be occluded but '
+        'one time; perform separate authored actions sequentially while supporting reactions stay inside their '
+        'original lanes. ' + primary_rule + 'A character may be occluded but '
         'must not disappear and reappear, leave and re-enter, or be recreated at another depth or screen '
         'position. This ensemble camera-and-blocking rule overrides conflicting camera-reveal wording in '
         'descriptive action prose.'
@@ -192,7 +235,9 @@ def render_scene_contract(project, shot, name_fn):
                 'one actor occupies one place at a time. Do not create a second view, inset, mirrored copy or background '
                 'duplicate of any listed identity. If the frame becomes crowded, keep a non-acting actor partially '
                 'occluded or at a stable edge position rather than inventing, blending or replacing a body.')
-        ensemble_direction = ensemble_stability_direction(bodies, name_fn)
+        dialogue_ids = [row.get('speaker_id') for row in shot.get('dialogue', [])]
+        ensemble_direction = ensemble_stability_direction(
+            bodies, name_fn, entering_subject_ids(shot), dialogue_ids)
         if ensemble_direction:
             paragraphs.append(ensemble_direction)
     elif visible and pov_id:

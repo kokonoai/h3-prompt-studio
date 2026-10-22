@@ -10,7 +10,7 @@ from decimal import Decimal
 
 from .dialogue_audio import audible_speech_lock
 from .identity_stability import visible_identity_lock
-from .scene_contract import ensemble_stability_direction
+from .scene_contract import ensemble_stability_direction, entering_subject_ids
 
 
 def _text(value):
@@ -226,6 +226,7 @@ def render_narrative_prompt(*, project, references, active, bound,
         visual.append(_sentence(story_text))
     for index, shot in enumerate(shots, 1):
         cast = [subject_names[sid] for sid in shot.get('visible_subject_ids', []) if sid in subject_names]
+        entering = entering_subject_ids(shot)
         display_cast = [subject_names[sid] for sid in shot.get('display_subject_ids', []) if sid in subject_names]
         imagined_cast = [subject_names[sid] for sid in shot.get('imagined_subject_ids', []) if sid in subject_names]
         reflected_cast = [subject_names[sid] for sid in shot.get('reflected_subject_ids', []) if sid in subject_names]
@@ -234,7 +235,12 @@ def render_narrative_prompt(*, project, references, active, bound,
         if setting and setting.casefold() not in story_text.casefold():
             parts.append(_sentence('Setting: ' + setting))
         if cast:
-            parts.append('Visible cast: ' + ', '.join(cast) + '; one physical instance of each.')
+            parts.append('Visible cast across the complete clip: ' + ', '.join(cast) + '; one physical instance of each.')
+            if entering:
+                parts.append(
+                    'These entrants begin fully outside the frame and cross its boundary exactly once as the same '
+                    'continuous body: ' + ', '.join(subject_names[sid] for sid in entering if sid in subject_names) +
+                    '. Never pre-place one or leave a copy behind at the starting position.')
             identity_lock = visible_identity_lock(
                 project.get('subjects', []), shot.get('visible_subject_ids', []),
                 lambda ident: subject_names.get(ident, 'character'))
@@ -242,7 +248,8 @@ def render_narrative_prompt(*, project, references, active, bound,
                 parts.append(identity_lock)
             ensemble_direction = ensemble_stability_direction(
                 shot.get('visible_subject_ids', []),
-                lambda ident: subject_names.get(ident, 'character'))
+                lambda ident: subject_names.get(ident, 'character'), entering,
+                [row.get('speaker_id') for row in shot.get('dialogue', [])])
             if ensemble_direction:
                 parts.append(ensemble_direction)
         if display_cast:
