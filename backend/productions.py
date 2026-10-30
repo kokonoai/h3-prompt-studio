@@ -440,6 +440,12 @@ def normalise_card(value, kind, index):
         "asset_ids": list(dict.fromkeys(asset_ids)),
         "locked": locked,
     }
+    if kind == "characters":
+        raw_aliases = value.get("aliases", [])
+        if not isinstance(raw_aliases, list) or len(raw_aliases) > 32:
+            raise ValueError("A character card can contain at most 32 aliases.")
+        clean_aliases = [_text(alias, "character alias", 120) for alias in raw_aliases]
+        result["aliases"] = list(dict.fromkeys(alias for alias in clean_aliases if alias))
     # These optional links make the cards operational while remaining portable.
     for key in ("subject_id", "owner_card_id", "character_card_id", "voice_card_id"):
         link = value.get(key)
@@ -449,6 +455,36 @@ def normalise_card(value, kind, index):
     for key, limit in (("voice_id", 100), ("language", 80), ("pace", 160)):
         result[key] = _text(value.get(key), key, limit)
     return result
+
+
+_CHARACTER_PRODUCTION_SUFFIX = re.compile(
+    r"(?i)(?:[\s_-]+(?:final|approved|locked|master|ref(?:erence)?|"
+    r"v\s*\d+|ver\s*\d+|version\s*\d+))+$")
+
+
+def character_identity_key(value):
+    """Return the stable identity behind a production/version label.
+
+    Screenplays and card drafts often use identifiers such as ``KOKO_FINAL``
+    or ``Koko v2``.  Those labels select a version of Koko; they are not new
+    performers.  Strip only explicit, separated production suffixes so normal
+    character names remain untouched.
+    """
+    raw = str(value or "").strip()
+    base = _CHARACTER_PRODUCTION_SUFFIX.sub("", raw).strip(" _-") or raw
+    return re.sub(r"[\s_-]+", " ", base).strip().casefold()
+
+
+def _preferred_identity_card(cards):
+    """Prefer the human-facing base card and then its strongest references."""
+    return max(cards, key=lambda card: (
+        not bool(_CHARACTER_PRODUCTION_SUFFIX.search(str(card.get("name", "")))),
+        bool(card.get("asset_ids")),
+        len(card.get("asset_ids", [])),
+        bool(card.get("subject_id")),
+        bool(card.get("image_analysis")),
+        len(str(card.get("description", ""))),
+    ))
 
 
 def normalise_cards(value):
@@ -1557,8 +1593,25 @@ def character_aliases(production, story=None):
     never modify the card library.
     """
     characters = production.get("cards", {}).get("characters", [])
-    aliases = {card["id"]: {card.get("name", "").strip().casefold()}
-               for card in characters if card.get("id")}
+    aliases = {card["id"]: set() for card in characters if card.get("id")}
+    identity_groups = {}
+    for card in characters:
+        if card.get("id"):
+            identity_groups.setdefault(character_identity_key(card.get("name")), []).append(card)
+    # A legacy project may already contain both ``Koko`` and ``KOKO_FINAL``.
+    # Route every spelling to one real card, preferring the ordinary name and
+    # its identity image.  Keep the duplicate record inert so old IDs remain
+    # readable without allowing an assetless production label to become a new
+    # visible performer.
+    for group in identity_groups.values():
+        owner = _preferred_identity_card(group)
+        values = {
+            str(value or "").strip().casefold()
+            for card in group
+            for value in (card.get("name"), *card.get("aliases", []))
+            if str(value or "").strip()
+        }
+        aliases.setdefault(owner["id"], set()).update(values)
     story = str(story if story is not None else current_episode_story(production) or "")
     matches = list(_CAST_LINE.finditer(story))
     tokens = ([token.strip() for token in re.split(r"[、,，;；]", matches[0].group("names")) if token.strip()]
@@ -1573,7 +1626,7 @@ def character_aliases(production, story=None):
     token_owner = {}
     for token_index, token in enumerate(tokens):
         for card in characters:
-            if _name_occurs(card.get("name"), token):
+            if any(_name_occurs(alias, token) for alias in aliases.get(card.get("id"), set())):
                 token_owner[token_index] = card
                 break
     # A planned episode stores its cast in the same order as the authored cast
@@ -2590,6 +2643,39 @@ def repair_segment_identity_contract(production, segment):
     aliases.update(voice_character_aliases(production))
     timeline = segment.setdefault("cast_timeline", normalise_cast_timeline(None))
     changes = []
+
+    def canonical_label(value):
+        character = resolve_speaker_character(value, aliases)
+        return (str(character.get("name", "")).strip()
+                if character is not None else str(value or "").strip())
+
+    # Version/status labels describe which approved design to use; they do not
+    # create a second actor.  Upgrade old saved selections and temporal state
+    # before reference allocation so KOKO_FINAL can reuse Koko's identity image.
+    selected = segment.setdefault("card_selection", {}).setdefault("characters", [])
+    repaired_selected = list(dict.fromkeys(
+        canonical_label(name) for name in selected if canonical_label(name)))
+    if repaired_selected != selected:
+        segment["card_selection"]["characters"] = repaired_selected
+        changes.append("resolved versioned character selections")
+    for key in ("visible_start", "enters", "exits", "visible_end", "offscreen", "mentioned_only"):
+        original = list(timeline.get(key, []))
+        repaired = list(dict.fromkeys(
+            canonical_label(name) for name in original if canonical_label(name)))
+        if repaired != original:
+            timeline[key] = repaired
+            changes.append(f"resolved {key} character labels")
+
+    state = segment.get("continuity_state")
+    if isinstance(state, dict):
+        for key in ("positions_start", "positions_end"):
+            for row in state.get(key, []):
+                if isinstance(row, dict) and row.get("character"):
+                    row["character"] = canonical_label(row["character"])
+        for key in ("prop_holders_start", "prop_holders_end"):
+            for row in state.get(key, []):
+                if isinstance(row, dict) and row.get("holder"):
+                    row["holder"] = canonical_label(row["holder"])
     for line in segment.get("dialogue", []):
         character = resolve_speaker_character(line.get("speaker"), aliases)
         if character is None:
@@ -2622,6 +2708,16 @@ def repair_segment_identity_contract(production, segment):
         selected = segment.setdefault("card_selection", {}).setdefault("characters", [])
         if canonical not in selected:
             selected.append(canonical)
+    canonical_cards = [
+        card for card in characters.values()
+        if aliases.get(card.get("name", "").strip().casefold()) is card
+    ]
+    for key in ("title", "story", "setting", "action", "ending", "image_prompt"):
+        original = segment.get(key, "")
+        repaired = canonicalise_character_mentions(original, production, canonical_cards)
+        if repaired != original:
+            segment[key] = repaired
+            changes.append(f"resolved {key} character labels")
     if changes:
         warning = "Single-clip identity repair: " + "; ".join(changes)
         segment["continuity_warnings"] = list(dict.fromkeys(
@@ -5045,17 +5141,24 @@ class ProductionManager:
             for card in production["cards"][kind]:
                 copied = copy.deepcopy(card)
                 merged[kind].append(copied)
-                by_name[copied["name"].strip().casefold()] = copied
+                key = (character_identity_key(copied["name"]) if kind == "characters"
+                       else copied["name"].strip().casefold())
+                previous = by_name.get(key)
+                if previous is None or (kind == "characters" and
+                                        _preferred_identity_card([previous, copied]) is copied):
+                    by_name[key] = copied
             for raw in collection["cards"][kind]:
                 card = copy.deepcopy(raw)
                 if kind in ("wardrobe", "props") and card.get("owner_card_id"):
                     card["owner_card_id"] = id_maps["characters"].get(card["owner_card_id"], card["owner_card_id"])
                 if kind == "voices" and card.get("character_card_id"):
                     card["character_card_id"] = id_maps["characters"].get(card["character_card_id"], card["character_card_id"])
-                existing = by_name.get(card["name"].strip().casefold())
+                key = (character_identity_key(card["name"]) if kind == "characters"
+                       else card["name"].strip().casefold())
+                existing = by_name.get(key)
                 if existing is None:
                     merged[kind].append(card)
-                    by_name[card["name"].strip().casefold()] = card
+                    by_name[key] = card
                     existing = card
                 else:
                     # Same-name placeholders in a new project should still
@@ -5064,6 +5167,10 @@ class ProductionManager:
                     for field in ("description", "image_analysis", "image_generation_prompt", "notes", "voice_id", "pace"):
                         if not existing.get(field) and card.get(field):
                             existing[field] = card[field]
+                    if kind == "characters" and card["name"].strip().casefold() != existing["name"].strip().casefold():
+                        existing.setdefault("aliases", [])
+                        existing["aliases"] = list(dict.fromkeys(
+                            [*existing["aliases"], card["name"], *card.get("aliases", [])]))
                 id_maps[kind][raw["id"]] = existing["id"]
 
         # Character links must be known before owner/voice cards are merged.
@@ -5100,8 +5207,18 @@ class ProductionManager:
             name = _text(raw.get("name") if isinstance(raw, dict) else None, "AI card name", 120)
             if not name:
                 return None
-            existing = next((card for card in production["cards"][kind]
-                             if card["name"].strip().casefold() == name.casefold()), None)
+            if kind == "characters":
+                matching = [
+                    card for card in production["cards"][kind]
+                    if character_identity_key(card.get("name")) == character_identity_key(name)
+                    or name.casefold() in {
+                        str(alias).strip().casefold() for alias in card.get("aliases", [])
+                    }
+                ]
+                existing = _preferred_identity_card(matching) if matching else None
+            else:
+                existing = next((card for card in production["cards"][kind]
+                                 if card["name"].strip().casefold() == name.casefold()), None)
             incoming = {
                 "name": name,
                 "description": _text(raw.get("description"), "AI card description", 3000),
@@ -5119,6 +5236,10 @@ class ProductionManager:
                 existing = normalise_card(incoming, kind, len(production["cards"][kind]))
                 production["cards"][kind].append(existing)
                 return existing
+            if kind == "characters" and name.casefold() != existing["name"].strip().casefold():
+                existing.setdefault("aliases", [])
+                if name not in existing["aliases"]:
+                    existing["aliases"].append(name)
             for key in ("description", "notes"):
                 if not existing.get(key) and incoming.get(key):
                     existing[key] = incoming[key]
@@ -5129,8 +5250,12 @@ class ProductionManager:
 
         for raw in planned["characters"]:
             merge("characters", raw)
-        character_by_name = {card["name"].strip().casefold(): card
-                             for card in production["cards"]["characters"]}
+        alias_sets = character_aliases(production)
+        character_by_name = {
+            alias: card
+            for card in production["cards"]["characters"]
+            for alias in alias_sets.get(card["id"], set())
+        }
         for kind in ("wardrobe", "props"):
             for raw in planned[kind]:
                 owner_name = _text(raw.get("owner_character") if isinstance(raw, dict) else None,

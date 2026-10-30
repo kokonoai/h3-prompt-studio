@@ -2367,6 +2367,72 @@ def test_ai_text_card_plan_fills_gaps_without_overwriting_manual_cards(tmp_path)
     assert result["card_plan_source_hash"] == card_plan_source_hash(result)
 
 
+def test_ai_card_plan_treats_final_and_version_labels_as_existing_character_aliases(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "Use KOKO_FINAL and Besi v2."})
+    koko_image = _image(store_asset, "Koko", "red")
+    koko = _card("Koko", [koko_image["id"]], description="USER KOKO IDENTITY")
+    besi = _card("Besi", description="USER BESI IDENTITY")
+    production["cards"]["characters"] = [koko, besi]
+    production = manager.save(production)
+    planned = {
+        "series_voice_style": "",
+        "characters": [
+            {"name": "KOKO_FINAL", "description": "AI duplicate", "notes": ""},
+            {"name": "Besi v2", "description": "AI duplicate", "notes": ""},
+        ],
+        "wardrobe": [], "props": [], "environments": [], "voices": [], "styles": [],
+    }
+
+    result = manager.apply_card_plan(production["id"], planned)
+
+    assert [card["name"] for card in result["cards"]["characters"]] == ["Koko", "Besi"]
+    assert result["cards"]["characters"][0]["asset_ids"] == [koko_image["id"]]
+    assert result["cards"]["characters"][0]["description"] == "USER KOKO IDENTITY"
+    assert result["cards"]["characters"][0]["aliases"] == ["KOKO_FINAL"]
+    assert result["cards"]["characters"][1]["aliases"] == ["Besi v2"]
+
+
+def test_legacy_final_character_card_reuses_base_identity_image_when_rebuilding_clip(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "KOKO_FINAL makes a decision."})
+    koko_image = _image(store_asset, "Koko", "red")
+    koko = _card("Koko", [koko_image["id"]], description="Koko stable identity")
+    legacy = _card("KOKO_FINAL", description="duplicate production label")
+    production["cards"]["characters"] = [koko, legacy]
+    production = manager.save(production)
+    timeline = {"visible_start": ["KOKO_FINAL"], "visible_end": ["KOKO_FINAL"],
+                "enters": [], "exits": [], "offscreen": [], "mentioned_only": []}
+    clip = _planned_clip("KOKO_FINAL makes a decision", ["KOKO_FINAL"], timeline)
+    production = manager.apply_plan(production["id"], [clip], "local_ai")
+    segment = production["segments"][0]
+    # Reproduce an already-saved legacy storyboard made before aliases were
+    # canonicalised. Materialisation must repair it without requiring the user
+    # to delete/recreate the project or upload the same identity image twice.
+    segment["card_selection"]["characters"] = ["KOKO_FINAL"]
+    segment["cast_timeline"]["visible_start"] = ["KOKO_FINAL"]
+    segment["cast_timeline"]["visible_end"] = ["KOKO_FINAL"]
+    segment["story"] = "KOKO_FINAL makes a decision."
+    segment["action"] = "KOKO_FINAL looks up."
+    production = manager.save(production)
+
+    alias_sets = character_aliases(production)
+    assert "koko_final" in alias_sets[koko["id"]]
+    assert alias_sets[legacy["id"]] == set()
+
+    result = manager.materialise(production["id"], segment["id"])
+    repaired = result["production"]["segments"][0]
+    strategy = result["project"]["production_link"]["reference_strategy"]
+
+    assert repaired["card_selection"]["characters"] == ["Koko"]
+    assert repaired["cast_timeline"]["visible_start"] == ["Koko"]
+    assert repaired["cast_timeline"]["visible_end"] == ["Koko"]
+    assert strategy["missing_visual_identity_names"] == []
+    assert strategy["image_asset_ids"] == [koko_image["id"]]
+    assert [subject["name"] for subject in result["project"]["subjects"]] == ["Koko"]
+    assert "KOKO_FINAL" not in result["project"]["story"]["text"]
+
+
 def test_card_planning_batches_and_payload_stay_bounded_for_small_local_models(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": ("A enters the observatory. " * 240)})
