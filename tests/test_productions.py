@@ -1557,6 +1557,47 @@ def test_named_card_collection_merges_without_overwriting_project_cards(tmp_path
     assert manager.get_card_collection(collection["id"])["cards"]["voices"][0]["language"] == "en"
 
 
+def test_card_collection_can_replace_or_clear_project_cards_without_deleting_shared_set(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    library_source = manager.create({"source_project": source, "brief": "Shared hero enters."})
+    shared_image = _image(store_asset, "shared-hero", "green")
+    shared_hero = _card("Shared hero", [shared_image["id"]])
+    library_source["cards"]["characters"] = [shared_hero]
+    library_source["series_voice_style"] = "Clean shared dialogue."
+    library_source = manager.save(library_source)
+    collection = manager.save_card_collection(library_source["id"], "Correct set")
+
+    target = manager.create({"source_project": source, "brief": "A target story."})
+    wrong_image = _image(store_asset, "wrong-overview", "red")
+    target["cards"]["characters"] = [_card("Wrong hero")]
+    target["cards"]["props"] = [_card("Wrong prop")]
+    target["overview_asset_ids"]["props"] = wrong_image["id"]
+    target["series_voice_style"] = "Wrong voice style."
+    target["segments"] = [_planned_clip(
+        "Existing clip", ["Wrong hero"],
+        {"visible_start": ["Wrong hero"], "visible_end": ["Wrong hero"],
+         "enters": [], "exits": [], "offscreen": [], "mentioned_only": []})]
+    target = manager.save(target)
+
+    replaced = manager.apply_card_collection(target["id"], collection["id"], replace=True)
+
+    assert [card["name"] for card in replaced["cards"]["characters"]] == ["Shared hero"]
+    assert replaced["cards"]["props"] == []
+    assert replaced["overview_asset_ids"]["props"] is None
+    assert replaced["series_voice_style"] == "Clean shared dialogue."
+    assert replaced["segments"][0]["title"] == "Existing clip"
+    assert manager.get_card_collection(collection["id"])["cards"]["characters"][0]["asset_ids"] == [shared_image["id"]]
+
+    cleared = manager.clear_card_library(target["id"])
+
+    assert cleared["cards"] == {kind: [] for kind in CARD_KINDS}
+    assert all(asset_id is None for asset_id in cleared["overview_asset_ids"].values())
+    assert cleared["series_voice_style"] == ""
+    assert cleared["card_collection_id"] is None
+    assert cleared["segments"][0]["title"] == "Existing clip"
+    assert manager.get_card_collection(collection["id"])["name"] == "Correct set"
+
+
 def test_shared_card_set_sync_preserves_other_parts_and_completes_placeholders(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     first = manager.create({"source_project": source, "brief": "Part one."})

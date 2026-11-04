@@ -5131,8 +5131,29 @@ class ProductionManager:
         return {"deleted": True, "id": ident, "name": collection["name"], "archived": True,
                 "project_cards_preserved": True, "assets_preserved": True}
 
-    def apply_card_collection(self, production_id, collection_id):
+    def clear_card_library(self, production_id):
+        """Detach and empty only one production's copied card library.
+
+        Shared card sets and stored media are deliberately untouched. Existing
+        clips and takes also remain available; validation marks prepared clips
+        stale because their reference context changed.
+        """
+        production = self.get(production_id)
+        production["cards"] = empty_card_library()
+        production["overview_asset_ids"] = empty_overview_assets()
+        production["series_voice_style"] = ""
+        production["generated_overviews"] = {}
+        production["card_collection_id"] = None
+        return self.save(production)
+
+    def apply_card_collection(self, production_id, collection_id, *, replace=False):
         production, collection = self.get(production_id), self.get_card_collection(collection_id)
+        if replace:
+            production["cards"] = empty_card_library()
+            production["overview_asset_ids"] = empty_overview_assets()
+            production["series_voice_style"] = ""
+            production["generated_overviews"] = {}
+            production["card_collection_id"] = None
         merged = empty_card_library()
         id_maps = {kind: {} for kind in CARD_KINDS}
 

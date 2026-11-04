@@ -1711,11 +1711,32 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       setNotice(t("已另存当前集卡组“"+result.name+"”，共 "+result.card_count+" 张。只包含当前集分镜实际引用的卡、本集角色及关联声线；原共享卡组和项目关联均未改变。","Saved current-episode set “"+result.name+"” with "+result.card_count+" cards. It contains only cards used by this episode, its cast and linked voices; the original shared set and project link were not changed.","現在話カードセット「"+result.name+"」を "+result.card_count+" 枚で保存しました。この話で使用するカード、登場人物、関連音声のみを含み、元の共有セットと作品の関連付けは変更していません。","已另存目前集卡組「"+result.name+"」，共 "+result.card_count+" 張。只包含目前集分鏡實際引用的卡、本集角色及關聯聲線；原共享卡組和專案關聯均未改變。"));
     });
   };
-  const applyCollection=()=>run(t("载入卡组","Load card set","カードセットを読込","載入卡組"),async()=>{
+  const applyCollection=(replace=false)=>{
     if(!production||!selectedCollection)return;
-    const next=await api("/productions/"+production.id+"/card-collection/"+selectedCollection+"/apply",{}) as Production;
-    setProduction(next);setDraft(next);setNotice(t("已按名称合并卡片；本项目原有卡片保留。","Cards were merged by name; this production's existing cards were kept.","名前でカードを統合し、現在のカードは保持しました。","已按名稱合併卡片；本專案原有卡片保留。"));
-  });
+    if(replace&&!window.confirm(t(
+      "用所选卡组替换本项目当前全部资产卡吗？共享卡组、素材文件、已有分镜和视频不会删除；已有提示词会标记为需要更新。",
+      "Replace all cards in this production with the selected set? Shared sets, media, storyboards and existing videos are kept; prepared prompts will be marked for update.",
+      "選択したセットでこの作品の素材カードをすべて置き換えますか？共有セット、素材、絵コンテ、既存映像は保持され、準備済みプロンプトは更新対象になります。",
+      "要用所選卡組取代本專案目前全部資產卡嗎？共享卡組、素材檔案、已有分鏡和影片不會刪除；已有提示詞會標記為需要更新。")))return;
+    void run(replace?t("替换项目卡组","Replace project cards","作品カードを置換","取代專案卡組"):t("载入卡组","Load card set","カードセットを読込","載入卡組"),async()=>{
+      const next=await api("/productions/"+production.id+"/card-collection/"+selectedCollection+"/apply",{replace}) as Production;
+      setProduction(next);setDraft(next);setSelectedCollection("");
+      setNotice(replace?t("已用所选卡组替换本项目资产卡；共享卡组、素材和已有视频均保留。","Project cards were replaced with the selected set; shared sets, media and existing videos were preserved.","選択したセットで作品カードを置換しました。共有セット、素材、既存映像は保持されています。","已用所選卡組取代本專案資產卡；共享卡組、素材和已有影片均保留。"):t("已按名称合并卡片；本项目原有卡片保留。","Cards were merged by name; this production's existing cards were kept.","名前でカードを統合し、現在のカードは保持しました。","已按名稱合併卡片；本專案原有卡片保留。"));
+    });
+  };
+  const clearProjectCards=()=>{
+    if(!production)return;
+    if(!window.confirm(t(
+      "清空本项目的全部资产卡和总图吗？共享卡组、素材文件、分镜和已有视频不会删除。",
+      "Clear all cards and overviews from this production? Shared sets, media, storyboards and existing videos will not be deleted.",
+      "この作品の素材カードと総覧画像をすべて空にしますか？共有セット、素材、絵コンテ、既存映像は削除されません。",
+      "要清空本專案的全部資產卡和總圖嗎？共享卡組、素材檔案、分鏡和已有影片不會刪除。")))return;
+    void run(t("清空项目资产卡","Clear project cards","作品カードを空にする","清空專案資產卡"),async()=>{
+      const next=await api("/productions/"+production.id+"/cards/clear",{}) as Production;
+      setProduction(next);setDraft(next);setSelectedCollection("");
+      setNotice(t("本项目资产卡已清空；现在可以选择正确卡组并载入。共享卡组和素材文件均保留。","This production's cards are clear. You can now choose and load the correct set. Shared sets and media were preserved.","作品カードを空にしました。正しいセットを選んで読み込めます。共有セットと素材は保持されています。","本專案資產卡已清空；現在可以選擇正確卡組並載入。共享卡組和素材檔案均保留。"));
+    });
+  };
   const toggleCardSetDetails=(item:CardCollection)=>{
     if(openCardSetId===item.id){setOpenCardSetId(null);return;}
     if(cardSetDetails[item.id]){setOpenCardSetId(item.id);return;}
@@ -1724,13 +1745,14 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       setCardSetDetails(current=>({...current,[item.id]:detail}));setOpenCardSetId(item.id);
     });
   };
-  const applyManagedCardSet=(item:CardCollection)=>{
+  const applyManagedCardSet=(item:CardCollection,replace=false)=>{
     if(!production){setNotice(t("请先在“剧集 / 片段”打开或创建一个片段，再套用资料库。","Open or create an episode/clip part before applying the library.","先に「エピソード／クリップ」でパートを開くか作成してから資料庫を適用してください。","請先在「劇集／片段」開啟或建立一個片段，再套用資料庫。"));return;}
-    void run(t("套用卡组","Apply card set","カードセットを適用","套用卡組"),async()=>{
+    if(replace&&!window.confirm(t("用“"+item.name+"”替换当前项目的全部资产卡吗？共享资料、素材、分镜和已有视频均保留。","Replace all current project cards with “"+item.name+"”? Shared records, media, storyboards and existing videos are preserved.","「"+item.name+"」で現在の作品カードをすべて置き換えますか？共有資料、素材、絵コンテ、既存映像は保持されます。","要用「"+item.name+"」取代目前專案的全部資產卡嗎？共享資料、素材、分鏡和已有影片均保留。")))return;
+    void run(replace?t("替换套用卡组","Replace with card set","カードセットで置換","取代套用卡組"):t("套用卡组","Apply card set","カードセットを適用","套用卡組"),async()=>{
       const saved=await save();
-      const next=await api("/productions/"+saved.id+"/card-collection/"+item.id+"/apply",{}) as Production;
-      setProduction(next);setDraft(next);setSelectedCollection(item.id);await refreshList();
-      setNotice(t("卡组已合并到当前项目。同名项目卡优先，角色关联已自动重绑，声线语言已跟随项目语言。","The set was merged into the current project. Existing same-name cards take priority, links were rebound, and voice language now follows the project.","カードセットを現在の作品に統合しました。同名カードを優先し、関連付けを再接続して、音声言語を作品言語に合わせました。","卡組已合併到目前專案。同名專案卡優先，角色關聯已自動重綁，聲線語言已跟隨專案語言。"));
+      const next=await api("/productions/"+saved.id+"/card-collection/"+item.id+"/apply",{replace}) as Production;
+      setProduction(next);setDraft(next);setSelectedCollection("");await refreshList();
+      setNotice(replace?t("已替换当前项目资产卡；旧项目卡不再叠加，共享资料和素材仍保留。","Current project cards were replaced instead of stacked; shared records and media remain available.","現在の作品カードを重ねずに置換しました。共有資料と素材は保持されています。","已取代目前專案資產卡；舊專案卡不再疊加，共享資料和素材仍保留。"):t("卡组已合并到当前项目。同名项目卡优先，角色关联已自动重绑，声线语言已跟随项目语言。","The set was merged into the current project. Existing same-name cards take priority, links were rebound, and voice language now follows the project.","カードセットを現在の作品に統合しました。同名カードを優先し、関連付けを再接続して、音声言語を作品言語に合わせました。","卡組已合併到目前專案。同名專案卡優先，角色關聯已自動重綁，聲線語言已跟隨專案語言。"));
     });
   };
   const renameManagedCardSet=(item:CardCollection)=>{
@@ -2463,7 +2485,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         <header><span className="production-cardset-icon"><BookOpen size={21}/></span><div><strong>{item.name}</strong><small>{item.card_count} {t("张卡","cards","枚のカード","張卡")} · {item.overview_count||0} {t("张总图","overviews","総覧画像","張總圖")} · {formatProjectDate(item.updated_at,uiLanguage)}</small></div><button className="icon" onClick={()=>toggleCardSetDetails(item)} title={t("查看内容","View contents","内容を見る","查看內容")}>{expanded?<ChevronUp size={18}/>:<ChevronDown size={18}/>}</button></header>
         <div className="production-cardset-counts">{CARD_KINDS.map(kind=><span key={kind}><b>{item.counts?.[kind]||0}</b>{cardMeta[kind].title}</span>)}{item.has_series_voice_style&&<span className="voice-style-ready"><Check size={13}/>{t("全剧声线","Series voice style","全編音声スタイル","全劇聲線")}</span>}</div>
         {expanded&&<div className="production-cardset-detail">{detail?CARD_KINDS.map(kind=><div key={kind}><strong>{cardMeta[kind].title}</strong><p>{detail.cards[kind].length?detail.cards[kind].map(card=>card.name).join(" · "):t("无","None","なし","無")}</p></div>):<span>{t("正在读取…","Loading…","読み込み中…","正在讀取…")}</span>}{detail?.series_voice_style&&<details><summary>{t("查看全剧声线设定","View series voice style","全編音声スタイルを見る","查看全劇聲線設定")}</summary><p>{detail.series_voice_style}</p></details>}</div>}
-        <footer><button className="primary" onClick={()=>applyManagedCardSet(item)}><Plus size={16}/>{production?t("套用到当前片段","Apply to current part","現在のパートに適用","套用到目前片段"):t("打开片段后套用","Open a part to apply","パートを開いて適用","開啟片段後套用")}</button><button onClick={()=>renameManagedCardSet(item)}>{t("重命名","Rename","名前変更","重新命名")}</button><button onClick={()=>duplicateManagedCardSet(item)}>{t("复制","Duplicate","複製","複製")}</button><button onClick={()=>exportManagedCardSet(item)}><Download size={16}/>{t("导出 JSON","Export JSON","JSON書き出し","匯出 JSON")}</button><button className="danger" onClick={()=>deleteManagedCardSet(item)}><Trash2 size={16}/>{t("归档","Archive","アーカイブ","封存")}</button></footer>
+        <footer><button className="primary" onClick={()=>applyManagedCardSet(item,false)}><Plus size={16}/>{production?t("合并到当前片段","Merge into current part","現在のパートに統合","合併到目前片段"):t("打开片段后套用","Open a part to apply","パートを開いて適用","開啟片段後套用")}</button>{production&&<button onClick={()=>applyManagedCardSet(item,true)}><RefreshCw size={16}/>{t("替换当前片段卡","Replace current cards","現在のカードを置換","取代目前片段卡")}</button>}<button onClick={()=>renameManagedCardSet(item)}>{t("重命名","Rename","名前変更","重新命名")}</button><button onClick={()=>duplicateManagedCardSet(item)}>{t("复制","Duplicate","複製","複製")}</button><button onClick={()=>exportManagedCardSet(item)}><Download size={16}/>{t("导出 JSON","Export JSON","JSON書き出し","匯出 JSON")}</button><button className="danger" onClick={()=>deleteManagedCardSet(item)}><Trash2 size={16}/>{t("归档","Archive","アーカイブ","封存")}</button></footer>
       </article>})}</div>
       {!filteredCollections.length&&<div className="production-project-empty"><BookOpen size={28}/><strong>{t("角色资料库还是空的","Character library is empty","キャラクター資料庫は空です","角色資料庫還是空的")}</strong><span>{t("在片段的“卡组与角色”页点击“保存为可复用卡组”，角色资料就会出现在这里。","In a part's Cards & cast page, choose Save reusable set to add records here.","パートの「カードと人物」で「再利用セットとして保存」を押すとここに表示されます。","在片段的「卡組與角色」頁點擊「儲存為可重用卡組」，角色資料就會出現在這裡。")}</span></div>}
     </section>}
@@ -2528,7 +2550,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           <button onClick={()=>void saveCollection()}><Save size={16}/>{production.card_collection_id?t("同步到共享卡组","Sync shared card set","共有カードを同期","同步到共享卡組"):t("保存为可复用卡组","Save reusable set","再利用セットとして保存","儲存為可重用卡組")}</button>
           <button className="current-episode-cardset" onClick={saveCurrentEpisodeCollection}><Plus size={16}/>{t("当前集另存卡组","Save current episode only","現在話だけ別名保存","目前集另存卡組")}</button>
           <label>{t("载入其他卡组","Load another set","別セットを読込","載入其他卡組")}<select value={selectedCollection} onChange={e=>setSelectedCollection(e.target.value)}><option value="">{t("请选择命名卡组","Choose a named set","名前付きセットを選択","請選擇命名卡組")}</option>{collections.map(x=><option key={x.id} value={x.id}>{x.name} · {x.card_count}{x.overview_count?" + "+x.overview_count+" "+t("张总图","overviews","総覧","張總圖"):""}</option>)}</select></label>
-          <button disabled={!selectedCollection} onClick={()=>void applyCollection()}>{t("合并载入","Merge into project","統合して読込","合併載入")}</button></div>
+          <div className="card-collection-load-actions"><button disabled={!selectedCollection} onClick={()=>setSelectedCollection("")}><X size={15}/>{t("清除选择","Clear selection","選択解除","清除選擇")}</button><button disabled={!selectedCollection} onClick={()=>applyCollection(false)}>{t("合并载入","Merge into project","統合して読込","合併載入")}</button><button className="primary" disabled={!selectedCollection} onClick={()=>applyCollection(true)}><RefreshCw size={15}/>{t("替换载入","Replace project cards","置換して読込","取代載入")}</button></div>
+          <button className="card-library-clear" disabled={!Object.values(production.cards).some(rows=>rows.length)&&!Object.values(production.overview_asset_ids).some(Boolean)&&!production.series_voice_style.trim()} onClick={clearProjectCards}><Trash2 size={15}/>{t("清空本项目卡","Clear project cards","作品カードを空にする","清空本專案卡")}</button></div>
         <p className="card-strategy">{t("项目卡与共享卡组是两份数据：“同步到共享卡组”会累积保留此前各集资料；“当前集另存卡组”会建立独立新卡组，只收录当前集实际引用的卡、本集角色和关联声线，不带旧集历史。系列页绑定卡组不会自动覆盖各项目。","Project cards and shared cards are separate. Sync shared card set cumulatively preserves earlier episodes. Save current episode only creates an independent set containing this episode's used cards, cast and linked voices without earlier history. Linking a set to a series never overwrites projects.","作品内カードと共有カードは別です。「共有カードを同期」は以前の話を累積保持します。「現在話だけ別名保存」は、この話で使うカード、登場人物、関連音声だけの独立セットを作成し、過去話の履歴を含めません。シリーズへの関連付けで作品は上書きされません。","專案卡與共享卡組是兩份資料：「同步到共享卡組」會累積保留此前各集資料；「目前集另存卡組」會建立獨立新卡組，只收錄目前集實際引用的卡、本集角色和關聯聲線，不帶舊集歷史。")}</p>
         {production.card_collection_id&&collections.find(item=>item.id===production.card_collection_id)&&<p className="production-card-sync-status"><BookOpen size={16}/>{t("本项目 "+Object.values(production.cards).reduce((sum,rows)=>sum+rows.length,0)+" 张卡 · 共享卡组 "+collections.find(item=>item.id===production.card_collection_id)!.card_count+" 张卡。数量不同可能正常；新增内容要点上方“同步到共享卡组”。","This project has "+Object.values(production.cards).reduce((sum,rows)=>sum+rows.length,0)+" cards; the shared set has "+collections.find(item=>item.id===production.card_collection_id)!.card_count+". Different counts can be normal; use Sync shared card set to share additions.","この作品のカード "+Object.values(production.cards).reduce((sum,rows)=>sum+rows.length,0)+" 枚・共有セット "+collections.find(item=>item.id===production.card_collection_id)!.card_count+" 枚。追加を共有するには上の同期ボタンを押してください。","本專案 "+Object.values(production.cards).reduce((sum,rows)=>sum+rows.length,0)+" 張卡 · 共享卡組 "+collections.find(item=>item.id===production.card_collection_id)!.card_count+" 張卡。新增內容請點上方同步。")}</p>}
         <div className="production-card-tabs">{CARD_KINDS.map(kind=><button key={kind} className={cardKind===kind?"active":""} onClick={()=>{setCardKind(kind);setOpenCardId(null)}}>

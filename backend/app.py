@@ -921,8 +921,18 @@ def card_collection_save_current_episode(production_id: str, body: dict):
     return production_manager().save_current_episode_card_collection(production_id, body.get('name'))
 
 @app.post('/api/productions/{production_id}/card-collection/{collection_id}/apply')
-def card_collection_apply(production_id: str, collection_id: str):
-    return production_manager().apply_card_collection(production_id, collection_id)
+def card_collection_apply(production_id: str, collection_id: str, body: dict | None = None):
+    body = body or {}
+    replace = body.get('replace', False)
+    if type(replace) is not bool:
+        raise ValueError('replace must be true or false.')
+    return production_manager().apply_card_collection(
+        production_id, collection_id, replace=replace)
+
+
+@app.post('/api/productions/{production_id}/cards/clear')
+def production_cards_clear(production_id: str):
+    return production_manager().clear_card_library(production_id)
 
 @app.patch('/api/productions/{production_id}')
 def production_update(production_id: str, body: dict):
