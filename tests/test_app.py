@@ -93,6 +93,32 @@ def auth(module):
     return {"X-H3-Token": module.TOKEN, "Origin": "http://127.0.0.1:8766"}
 
 
+def test_long_single_episode_uses_bounded_deterministic_episode_metadata(server, monkeypatch):
+    module, _client, _fake = server
+    source = new_project()
+    brief = "The courier crosses the station and checks the signal. " * 800
+    production = module.production_manager().create({
+        "source_project": source,
+        "brief": brief,
+        "episode_count": 1,
+        "episode_minutes": 20,
+    })
+    monkeypatch.setattr(
+        module, "_generate_production_text_cards",
+        lambda production_id, _force=False: module.production_manager().get(production_id))
+    monkeypatch.setattr(module.RESOURCES, "run_ai", lambda model, operation: operation(model))
+    monkeypatch.setattr(
+        module, "client",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("an oversized administrative episode request must not be sent")))
+
+    result = module.production_episode_plan(production["id"], {"use_ai": True})
+
+    assert len(result["episodes"]) == 1
+    assert len(result["episodes"][0]["story"]) > 30000
+    assert result["episodes"][0]["story"] == brief.strip()
+
+
 def test_only_the_known_windows_proactor_disconnect_is_suppressed(server):
     module, _client, _fake = server
 

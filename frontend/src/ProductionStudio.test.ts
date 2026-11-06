@@ -45,7 +45,7 @@ describe("episode batch production",()=>{
   });
 
   it("resumes a full run only after the timed-out preparation step was saved",()=>{
-    const empty:any={card_plan_source_hash:"",card_planner_warning:"",episodes:[],segments:[]};
+    const empty:any={card_plan_source_hash:"",card_planner_warning:"",planner_warning:"",episodes:[],segments:[]};
     expect(fullRunPreparationComplete("storyboard",null)).toBe(false);
     expect(fullRunPreparationComplete("cards",empty)).toBe(false);
     expect(fullRunPreparationComplete("cards",{...empty,card_plan_source_hash:"current-hash"})).toBe(true);
@@ -54,6 +54,9 @@ describe("episode batch production",()=>{
     expect(fullRunPreparationComplete("episodes",{...empty,episodes:[{id:"episode-1"}]})).toBe(true);
     expect(fullRunPreparationComplete("storyboard",empty)).toBe(false);
     expect(fullRunPreparationComplete("storyboard",{...empty,segments:[{id:"clip-1"}]})).toBe(true);
+    expect(fullRunPreparationComplete("storyboard",{
+      ...empty,segments:[{id:"clip-1"}],planner_warning:"Source coverage failed",
+    })).toBe(false);
   });
 
   it("targets only checked clips and keeps storyboard order",()=>{

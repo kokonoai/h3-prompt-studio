@@ -17,7 +17,8 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  continuity_visual_lock, device_screen_geometry_lock,
                                  dialogue_minimum_seconds,
                                  effective_temporal_cast_lock, inscribed_prop_continuity_lock,
-                                 episode_timing_targets, fallback_episodes, fallback_segments,
+                                 episode_planning_payload, episode_timing_targets,
+                                 fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
                                  normalise_segment, production_schema_for_story, render_character_identity,
@@ -25,7 +26,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  reconcile_transition_contract,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
-                                 split_truncated_card_chunk,
+                                 split_storyboard_source_chunk, split_truncated_card_chunk,
                                  storyboard_timed_batches, timed_batch_source_manifest,
                                  timed_batch_story,
                                  storyboard_output_token_budget, temporal_cast_lock,
@@ -2497,6 +2498,50 @@ def test_card_planning_batches_and_payload_stay_bounded_for_small_local_models(t
     assert len(payload) < 18000
 
 
+def test_long_source_brief_is_preserved_and_episode_requests_use_bounded_slices(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    brief = "A crosses the observatory and records the next star. " * 900
+    assert 30000 < len(brief) < 120000
+    production = manager.create({
+        "source_project": source, "brief": brief,
+        "episode_count": 3, "episode_minutes": 8,
+    })
+    production["style_bible"] = "S" * 12000
+    production["character_bible"] = "C" * 20000
+    production["continuity_notes"] = "N" * 12000
+    production["visual_style_custom"] = "V" * 6000
+    production["narrative_style_custom"] = "R" * 6000
+    production["narrative_notes"] = "D" * 6000
+    production = manager.save(production)
+
+    source_episodes = fallback_episodes(production)
+    payload = episode_planning_payload(
+        production, 0, 1, source_episodes=source_episodes[:1])
+    request = json.loads(payload)
+
+    assert production["brief"] == brief.strip()
+    assert len(source_episodes) == 3
+    assert "source_story_or_screenplay" not in request
+    assert request["source_episode_slices"][0]["episode"] == 1
+    assert request["source_episode_slices"][0]["source_story_or_screenplay"] == source_episodes[0]["story"]
+    assert len(payload) < 48000
+    assert "C" * 6001 not in payload
+
+
+def test_long_single_episode_can_store_its_authoritative_source_slice(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    brief = "The courier keeps walking through the long station. " * 800
+    production = manager.create({
+        "source_project": source, "brief": brief,
+        "episode_count": 1, "episode_minutes": 20,
+    })
+    production = manager.apply_episode_plan(
+        production["id"], fallback_episodes(production), "local_manual")
+
+    assert len(production["episodes"][0]["story"]) > 30000
+    assert current_episode_story(production) == brief.strip()
+
+
 def test_manual_card_content_prevents_implicit_ai_card_generation(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "brief": "A enters."})
@@ -3381,6 +3426,48 @@ def test_each_local_story_part_is_rejected_immediately_when_its_tail_is_missing(
     validated = validate_planned_chunk_source_contract(story, 1, [clip])
     assert validated[0]["story"] == clip["story"]
     assert validated[0]["source_refs"] == clip["source_refs"]
+
+
+def test_failed_story_part_can_split_without_renumbering_source_contract():
+    story = (
+        "Scene 3\n"
+        "A opens the door.\n"
+        "A crosses the room.\n"
+        "A lifts the card.\n"
+        "A closes the window."
+    )
+    original = production_source_manifest({
+        "brief": story, "episode_count": 1, "episode_minutes": .5,
+        "episodes": [], "current_episode": 1,
+    })["chunks"][0]
+    parts = split_storyboard_source_chunk(story, 1, original)
+
+    assert len(parts) == 2
+    assert all(part["chunk_index"] == 1 for part in parts)
+    expected_paragraphs = [row["id"] for row in original["paragraphs"]]
+    expected_events = [row["id"] for row in original["events"]]
+    assert [row["id"] for part in parts for row in part["manifest"]["paragraphs"]] == expected_paragraphs
+    assert [row["id"] for part in parts for row in part["manifest"]["events"]] == expected_events
+    assert all(row["id"].startswith("C01-") for part in parts
+               for row in part["manifest"]["paragraphs"])
+
+    validated = []
+    for part in parts:
+        manifest = part["manifest"]
+        clip = _planned_clip("Source-preserving subset", [], {
+            "visible_start": [], "visible_end": [], "enters": [], "exits": [],
+            "offscreen": [], "mentioned_only": [],
+        }, "hard_cut")
+        clip["source_refs"] = {
+            "scene_ids": list(dict.fromkeys(row["scene_id"] for row in manifest["paragraphs"])),
+            "paragraph_ids": [row["id"] for row in manifest["paragraphs"]],
+            "dialogue_ids": [row["id"] for row in manifest["dialogue"]],
+            "event_ids": [row["id"] for row in manifest["events"]],
+        }
+        validated.extend(validate_planned_chunk_source_contract(
+            part["story"], 1, [clip], source_manifest_override=manifest))
+
+    assert [identifier for clip in validated for identifier in clip["source_refs"]["paragraph_ids"]] == expected_paragraphs
 
 
 def test_source_coverage_and_adjacent_edit_contract_gate_video_prompt(tmp_path):

@@ -1064,6 +1064,7 @@ def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
+                              source_manifest_for_text, split_storyboard_source_chunk,
                               storyboard_timed_batches, timed_batch_source_manifest,
                               timed_batch_story,
                               storyboard_output_token_budget,
@@ -1191,52 +1192,90 @@ def production_plan(production_id: str, body: dict):
                         batch_index += 1
                     return segments
 
-                pieces = storyboard_planning_chunks(story)
-                for index, piece in enumerate(pieces):
-                    RESOURCES.stage = f'Planning story part {index + 1} of {len(pieces)}'
+                original_pieces = storyboard_planning_chunks(story)
+                pieces = [{
+                    'story': piece,
+                    'chunk_index': index + 1,
+                    'manifest': source_manifest_for_text(piece, index + 1),
+                    'split_depth': 0,
+                } for index, piece in enumerate(original_pieces)]
+                index = 0
+                while index < len(pieces):
+                    item = pieces[index]
+                    piece = item['story']
+                    chunk_index = item['chunk_index']
+                    manifest = item['manifest']
+                    RESOURCES.stage = (
+                        f'Planning story part {chunk_index} '
+                        f'({index + 1} of {len(pieces)} verified batches)')
                     payload = planning_payload(
-                        production, piece, index + 1, len(pieces),
-                        previous_ending, previous_contract)
-                    timing = episode_timing_targets(production, index + 1, len(pieces), piece)
+                        production, piece, chunk_index, len(original_pieces),
+                        previous_ending, previous_contract,
+                        source_manifest_override=manifest)
+                    timing = episode_timing_targets(
+                        production, chunk_index, len(original_pieces), piece)
                     feasible = timing.get('feasible_clip_count') or {}
                     clip_count = max(
                         1, int(timing.get('recommended_clip_count') or 1),
                         int(feasible.get('maximum') or 1))
                     output_budget = storyboard_output_token_budget(clip_count)
                     coverage_error = None
-                    for attempt in range(2):
-                        request = payload
-                        if attempt:
-                            retry = json.loads(payload)
-                            retry['validation_retry'] = (
-                                'The previous response violated the storyboard schema or source-coverage contract. '
-                                'Return a fresh complete plan. Assign every source_manifest paragraph, dialogue and '
-                                'event ID exactly once and in order. Do not shorten story coverage. Keep story to one '
-                                'or two concise sentences (at most 3000 characters), setting to one sentence, action '
-                                'to at most three sentences, and ending to one sentence. Exact authored dialogue stays '
-                                'only in the structured dialogue list; never paste the full screenplay into story. Diagnostic: ' +
-                                str(coverage_error)[:1200])
-                            request = json.dumps(retry, ensure_ascii=False, indent=2)
-                            RESOURCES.stage = f'Retrying source coverage for story part {index + 1} of {len(pieces)}'
-                        answer = client().complete_json(
-                            model, PLANNER_SYSTEM, request,
-                            production_schema_for_story(piece), max_tokens=output_budget,
-                            temperature=0.12 if attempt else 0.25)
-                        try:
-                            new_segments = validate_planned_chunk_source_contract(
-                                piece, index + 1, answer['segments'])
-                            break
-                        except ValueError as exc:
-                            coverage_error = exc
+                    try:
+                        for attempt in range(2):
+                            request = payload
                             if attempt:
-                                raise
+                                retry = json.loads(payload)
+                                retry['validation_retry'] = (
+                                    'The previous response violated the storyboard schema or source-coverage contract. '
+                                    'Return a fresh complete plan. Assign every source_manifest paragraph, dialogue and '
+                                    'event ID exactly once and in order. Do not shorten story coverage. Keep story to one '
+                                    'or two concise sentences (at most 3000 characters), setting to one sentence, action '
+                                    'to at most three sentences, and ending to one sentence. Exact authored dialogue stays '
+                                    'only in the structured dialogue list; never paste the full screenplay into story. Diagnostic: ' +
+                                    str(coverage_error)[:1200])
+                                request = json.dumps(retry, ensure_ascii=False, separators=(',', ':'))
+                                RESOURCES.stage = (
+                                    f'Retrying source coverage for story part {chunk_index} '
+                                    f'({index + 1} of {len(pieces)} verified batches)')
+                            answer = client().complete_json(
+                                model, PLANNER_SYSTEM, request,
+                                production_schema_for_story(piece), max_tokens=output_budget,
+                                temperature=0.12 if attempt else 0.25)
+                            try:
+                                new_segments = validate_planned_chunk_source_contract(
+                                    piece, chunk_index, answer['segments'],
+                                    source_manifest_override=manifest)
+                                break
+                            except ValueError as exc:
+                                coverage_error = exc
+                                if attempt:
+                                    raise
+                    except Exception as exc:
+                        split_worthy = (
+                            isinstance(exc, ValueError)
+                            or (isinstance(exc, LMStudioError) and exc.code in {
+                                'response_truncated', 'response_incomplete',
+                                'invalid_model_output', 'invalid_response'}))
+                        subdivisions = (split_storyboard_source_chunk(
+                            piece, chunk_index, manifest)
+                            if split_worthy and item.get('split_depth', 0) < 5 else [])
+                        if len(subdivisions) < 2:
+                            raise
+                        for subdivision in subdivisions:
+                            subdivision['split_depth'] = item.get('split_depth', 0) + 1
+                        pieces[index:index + 1] = subdivisions
+                        RESOURCES.stage = (
+                            f'Story part {chunk_index} omitted source coverage; '
+                            'retrying only that part as smaller verified batches')
+                        continue
                     for segment in new_segments:
-                        segment['_source_chunk'] = index + 1
+                        segment['_source_chunk'] = chunk_index
                     segments.extend(new_segments)
                     if len(segments) > 64:
                         raise ValueError(
                             'This story needs more than 64 H3 clips. Split it into episodes before planning.')
                     remember_handoff(new_segments)
+                    index += 1
                 target = episode_timing_targets(production, story=story)['episode_target_seconds']
                 return fit_planned_durations(segments, target, production['language'], story)
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)
@@ -1269,17 +1308,51 @@ def production_episode_plan(production_id: str, body: dict):
     if use_ai:
         try:
             def generate(model):
-                episodes, batch_size, previous_ending = [], 4, ''
+                # Partition once with deterministic source-order rules.  AI is
+                # responsible for episode metadata, not for copying or
+                # redistributing the screenplay itself.  This protects full
+                # source coverage and keeps each local-model request bounded.
+                source_episodes = fallback_episodes(production)
+                episodes, batch_size, source_budget, previous_ending = [], 4, 18000, ''
                 while len(episodes) < production['episode_count']:
-                    count = min(batch_size, production['episode_count'] - len(episodes))
-                    RESOURCES.stage = f"Planning episodes {len(episodes) + 1}-{len(episodes) + count}"
+                    start = len(episodes)
+                    count, source_chars = 0, 0
+                    while start + count < len(source_episodes) and count < batch_size:
+                        next_chars = len(source_episodes[start + count].get('story', ''))
+                        if count and source_chars + next_chars > source_budget:
+                            break
+                        count += 1
+                        source_chars += next_chars
+                        if source_chars > source_budget:
+                            break
+                    source_batch = source_episodes[start:start + count]
+                    RESOURCES.stage = f"Planning episodes {start + 1}-{start + count}"
+                    # One unusually long episode cannot fit safely beside the
+                    # schema and card context in a local-model request.  Its
+                    # exact source slice is already a complete valid episode;
+                    # use deterministic metadata and continue instead of
+                    # aborting the whole one-click workflow.
+                    if count == 1 and source_chars > source_budget:
+                        episodes.append(copy.deepcopy(source_batch[0]))
+                        previous_ending = source_batch[0].get('logline', '')
+                        continue
                     answer = client().complete_json(
                         model, EPISODE_PLANNER_SYSTEM,
-                        episode_planning_payload(production, len(episodes), count, previous_ending),
+                        episode_planning_payload(
+                            production, start, count, previous_ending,
+                            source_episodes=source_batch),
                         EPISODE_SCHEMA, max_tokens=4096, temperature=0.2)
                     batch = answer['episodes']
                     if len(batch) != count:
                         raise ValueError('The local model returned an incomplete episode batch.')
+                    for offset, item in enumerate(batch):
+                        # Preserve the verbatim source allocation regardless
+                        # of how concise the model made its synopsis.
+                        authoritative = source_batch[offset]
+                        item['story'] = authoritative.get('story', '')
+                        item['character_names'] = list(dict.fromkeys(
+                            list(item.get('character_names') or []) +
+                            list(authoritative.get('character_names') or [])))
                     episodes.extend(batch)
                     previous_ending = batch[-1].get('continuity_notes') or batch[-1].get('logline', '')
                 return episodes

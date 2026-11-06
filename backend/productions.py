@@ -17,6 +17,8 @@ from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
 
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
+MAX_PRODUCTION_BRIEF_CHARS = 120000
+MAX_EPISODE_STORY_CHARS = MAX_PRODUCTION_BRIEF_CHARS
 MAX_SEGMENT_KEYFRAMES = 12
 REFERENCE_STRATEGY_VERSION = 12
 CAST_TIMELINE_VERSION = 1
@@ -532,7 +534,11 @@ def normalise_episode(value, index, character_ids, seen_character_ids=None):
         "index": index + 1,
         "title": _text(value.get("title"), "episode title", 160, f"Episode {index + 1}") or f"Episode {index + 1}",
         "logline": _text(value.get("logline"), "episode logline", 1200),
-        "story": _text(value.get("story"), "episode story", 20000),
+        # The episode story is the exact source slice owned by this episode,
+        # not an AI synopsis.  Long single-episode screenplays therefore need
+        # the same storage allowance as the production source brief.  Model
+        # requests remain bounded separately by the planning payload builders.
+        "story": _text(value.get("story"), "episode story", MAX_EPISODE_STORY_CHARS),
         "character_card_ids": selected,
         "returning_character_card_ids": [card_id for card_id in selected if card_id in seen],
         "continuity_notes": _text(value.get("continuity_notes"), "episode continuity notes", 3000),
@@ -1242,7 +1248,11 @@ def fallback_episodes(production):
     if not story:
         raise ValueError("Write a source story or screenplay before planning episodes.")
     count = production["episode_count"]
-    units = [x.strip() for x in re.split(r"(?<=[。！？!?])\s*|\n{2,}", story) if x.strip()]
+    # A one-episode production owns the complete source verbatim.  Avoid
+    # rebuilding it sentence-by-sentence, which needlessly changes whitespace
+    # and makes the administrative episode record differ from the saved brief.
+    units = ([story] if count == 1 else
+             [x.strip() for x in re.split(r"(?<=[。！？!?])\s*|\n{2,}", story) if x.strip()])
     if len(units) < count:
         width = max(1, math.ceil(len(story) / count))
         units = [story[i:i + width].strip() for i in range(0, len(story), width) if story[i:i + width].strip()]
@@ -3787,7 +3797,8 @@ def bind_planned_source_contract(production, planned, planner):
     return manifest
 
 
-def validate_planned_chunk_source_contract(story, chunk_index, planned):
+def validate_planned_chunk_source_contract(story, chunk_index, planned,
+                                           source_manifest_override=None):
     """Reject a locally generated part before it can contaminate later parts.
 
     A response can be valid, schema-conforming JSON and still omit the tail of
@@ -3797,7 +3808,9 @@ def validate_planned_chunk_source_contract(story, chunk_index, planned):
     """
     if not isinstance(planned, list) or not planned:
         raise ValueError(f"Storyboard part {chunk_index} returned no clips.")
-    manifest = source_manifest_for_text(story, chunk_index)
+    manifest = (copy.deepcopy(source_manifest_override)
+                if isinstance(source_manifest_override, dict)
+                else source_manifest_for_text(story, chunk_index))
     expected = {
         "paragraph_ids": [row["id"] for row in manifest.get("paragraphs", [])],
         "dialogue_ids": [row["id"] for row in manifest.get("dialogue", [])],
@@ -3833,6 +3846,10 @@ def validate_planned_chunk_source_contract(story, chunk_index, planned):
             issues.append(f"reordered {key}")
     for segment in planned:
         refs = segment["source_refs"]
+        known_scenes = {row["id"] for row in manifest.get("scenes", [])}
+        unknown_scenes = [ident for ident in refs["scene_ids"] if ident not in known_scenes]
+        if unknown_scenes:
+            issues.append("unknown scene_ids: " + ", ".join(unknown_scenes[:20]))
         if not refs["scene_ids"] or not refs["paragraph_ids"]:
             issues.append("a clip is not bound to an original scene and paragraph")
         if not refs["dialogue_ids"] and not refs["event_ids"]:
@@ -4603,7 +4620,7 @@ class ProductionManager:
         result["prompt_version"] = _text(result.get("prompt_version"), "prompt version", 32, "classic") or "classic"
         if result["prompt_version"] not in PROMPT_VERSIONS:
             raise ValueError("Choose the original or director-continuity prompt version.")
-        for key, limit in (("brief", 30000), ("style_bible", 12000),
+        for key, limit in (("brief", MAX_PRODUCTION_BRIEF_CHARS), ("style_bible", 12000),
                            ("character_bible", 20000), ("continuity_notes", 12000),
                            ("series_voice_style", 20000)):
             result[key] = _text(result.get(key), key, limit)
@@ -4828,7 +4845,7 @@ class ProductionManager:
             "schema_version": 1, "id": str(uuid.uuid4()),
             "title": _text(body.get("title"), "production title", 160, source["title"]) or source["title"],
             "language": _text(body.get("language"), "production language", 12, "zh-CN") or "zh-CN",
-            "brief": _text(body.get("brief"), "brief", 30000, source["story"]["text"]),
+            "brief": _text(body.get("brief"), "brief", MAX_PRODUCTION_BRIEF_CHARS, source["story"]["text"]),
             "style_bible": _text(body.get("style_bible"), "style bible", 12000,
                 "；".join(x for x in source.get("style", {}).values() if x)),
             "character_bible": _text(body.get("character_bible"), "character bible", 20000,
@@ -7274,6 +7291,57 @@ def storyboard_planning_chunks(story):
     return planning_chunks(story, limit=2000)
 
 
+def split_storyboard_source_chunk(story, chunk_index, source_manifest=None):
+    """Split one failed untimed planner part without changing source IDs.
+
+    Re-running ``source_manifest_for_text`` on each half would renumber both
+    halves from ``P001`` and break the production-wide coverage contract.  This
+    helper instead partitions the already-numbered manifest, keeping every
+    original Cxx paragraph/dialogue/event ID stable.  A heading remains with a
+    neighbouring dramatic row because each returned half must own at least one
+    dialogue line or event.
+    """
+    manifest = copy.deepcopy(
+        source_manifest if isinstance(source_manifest, dict)
+        else source_manifest_for_text(story, chunk_index))
+    paragraphs = list(manifest.get("paragraphs") or [])
+    if len(paragraphs) < 2:
+        return []
+    active_paragraph_ids = {
+        row.get("paragraph_id")
+        for kind in ("dialogue", "events")
+        for row in manifest.get(kind, [])
+        if row.get("paragraph_id")
+    }
+    candidates = [
+        cut for cut in range(1, len(paragraphs))
+        if any(row["id"] in active_paragraph_ids for row in paragraphs[:cut])
+        and any(row["id"] in active_paragraph_ids for row in paragraphs[cut:])
+    ]
+    if not candidates:
+        return []
+    cut = min(candidates, key=lambda value: abs(value - len(paragraphs) / 2))
+
+    def build(rows):
+        paragraph_ids = {row["id"] for row in rows}
+        scene_ids = list(dict.fromkeys(row["scene_id"] for row in rows))
+        text = "\n".join(row.get("text", "") for row in rows).strip()
+        subset = {
+            "chunk": int(chunk_index),
+            "source_hash": _hash(text),
+            "scenes": [copy.deepcopy(row) for row in manifest.get("scenes", [])
+                       if row.get("id") in scene_ids],
+            "paragraphs": copy.deepcopy(rows),
+            "dialogue": [copy.deepcopy(row) for row in manifest.get("dialogue", [])
+                         if row.get("paragraph_id") in paragraph_ids],
+            "events": [copy.deepcopy(row) for row in manifest.get("events", [])
+                       if row.get("paragraph_id") in paragraph_ids],
+        }
+        return {"story": text, "manifest": subset, "chunk_index": int(chunk_index)}
+
+    return [build(paragraphs[:cut]), build(paragraphs[cut:])]
+
+
 def card_planning_chunks(story):
     """Use small card-planning parts and permit deterministic retry splits."""
     return planning_chunks(story, limit=2200)
@@ -7391,27 +7459,48 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
     return json.dumps(payload, ensure_ascii=False)
 
 
-def episode_planning_payload(production, start_index, count, previous_ending=""):
+def episode_planning_payload(production, start_index, count, previous_ending="",
+                             source_episodes=None):
+    """Build a bounded episode-metadata request from exact source slices.
+
+    Re-sending the complete production brief for every episode batch made a
+    long screenplay exceed the local client's request limit.  The deterministic
+    source partition remains editorial authority; the model only supplies
+    titles, loglines, cast and continuity metadata for the requested slices.
+    ``apply_episode_plan`` later stores those exact slices as episode stories.
+    """
+    if source_episodes is None:
+        source_episodes = fallback_episodes(production)[start_index:start_index + count]
+    slices = [{
+        "episode": start_index + offset + 1,
+        "source_story_or_screenplay": item.get("story", ""),
+    } for offset, item in enumerate(source_episodes)]
     return json.dumps({
         "title": production["title"],
-        "source_story_or_screenplay": production["brief"],
+        "source_episode_slices": slices,
         "project_output_language": PRODUCTION_LANGUAGES[production["language"]],
         "requested_episode_count": production["episode_count"],
         "target_minutes_per_episode": production["episode_minutes"],
         "requested_batch": {"start_episode": start_index + 1, "count": count,
                             "previous_batch_ending": previous_ending},
         "visual_style": {"preset": production.get("visual_style_preset", "cinematic_realism"),
-                         "custom": production.get("visual_style_custom", ""),
-                         "notes": production["style_bible"],
+                         "custom": production.get("visual_style_custom", "")[:2000],
+                         "notes": production["style_bible"][:3000],
                          "source_priority": "style-card image analysis > custom text > named preset"},
         "long_form_narrative_style": {"preset": production.get("narrative_style", "cinematic"),
-                                      "custom": production.get("narrative_style_custom", ""),
-                                      "notes": production.get("narrative_notes", "")},
+                                      "custom": production.get("narrative_style_custom", "")[:1200],
+                                      "notes": production.get("narrative_notes", "")[:1800]},
         "available_character_cards": [card["name"] for card in production["cards"]["characters"]],
-        "character_bible": production["character_bible"],
-        "film_wide_continuity_rules": production["continuity_notes"],
-        "request": f"Return exactly {count} consecutive episodes, numbered conceptually from {start_index + 1}. Include the complete cast for each episode.",
-    }, ensure_ascii=False, indent=2)
+        "character_bible": production["character_bible"][:6000],
+        "film_wide_continuity_rules": production["continuity_notes"][:3000],
+        "request": (
+            f"Return exactly {count} consecutive episode metadata records, numbered conceptually from "
+            f"{start_index + 1}. Each record corresponds one-to-one with the supplied source_episode_slices "
+            "in order. Do not move, omit or invent source events. Include the complete cast for each slice. "
+            "Keep the returned story field to a compact production synopsis; the application preserves the "
+            "exact source slice separately."
+        ),
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def card_planning_payload(production, story=None, chunk_index=1, chunk_total=1):
