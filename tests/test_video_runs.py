@@ -491,6 +491,23 @@ def test_explicit_check_releases_missing_run_without_interrupt_delete_or_resubmi
     assert manager.submit(uid(), project, 'A new explicit request.')['status'] == 'preparing'
 
 
+def test_new_admission_automatically_releases_a_verified_missing_old_request(rig):
+    manager, project, server, _, _ = rig
+    old = manager.submit(uid(), project, 'Exact private compiled prompt.')
+    manager.process(old['id'])
+    server.pending.clear()  # ComfyUI restarted and lost this queue entry.
+    manager._save(manager.records[old['id']], status='uncertain')
+    submitted_before = len(server.submitted)
+
+    new = manager.submit(uid(), project, 'A new request after the stale reservation.')
+
+    assert manager.get(old['id'])['status'] == 'failed'
+    assert manager.get(old['id'])['stage'] == 'Previous request released; no active Comfy job found'
+    assert new['status'] == 'preparing'
+    assert len(server.submitted) == submitted_before
+    assert not any(path in ('/interrupt', '/free') for _, path in server.calls)
+
+
 def test_explicit_check_recovers_an_actual_result_or_keeps_active_own_job(rig):
     manager, project, server, _, _ = rig
     job = manager.submit(uid(), project, 'Exact private compiled prompt.')

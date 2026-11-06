@@ -361,6 +361,42 @@ class VideoRunManager:
             self._save(record)
             return record, True
 
+    def _existing_request(self, request_id, request_digest):
+        """Return an idempotent request before inspecting other reservations."""
+        ident = _id(request_id)
+        with self.lock:
+            existing = self.records.get(ident)
+            if not existing:
+                return None
+            if existing.get('request_digest') != request_digest:
+                raise VideoRunError('This request identifier already belongs to a different video action.')
+            return self._public(existing)
+
+    def _reconcile_admission_blockers(self):
+        """Release only old reservations ComfyUI proves are no longer active.
+
+        Pausing an episode intentionally keeps its durable run cursor.  If
+        ComfyUI later restarts or drops that request, the saved ``uncertain``
+        record must not block every other project forever.  This bounded check
+        never interrupts, deletes or resubmits work: an unreachable server or
+        a genuinely queued/running request remains reserved and normal
+        single-admission protection still rejects the new request.
+        """
+        with self.lock:
+            blockers = [
+                record['id'] for record in self.records.values()
+                if record.get('status') in ('queued', 'running', 'uncertain')
+                and not record.get('processing') and not record.get('refreshing')
+            ]
+        for ident in blockers:
+            try:
+                self.resolve_missing(ident)
+            except VideoRunError:
+                # Verification failure grants no permission to release the
+                # reservation. _admit below will retain the existing safe
+                # "already active" result.
+                continue
+
     def submit(self, request_id, project, prompt, *, parent_run_id=None):
         if not isinstance(project, dict) or not isinstance(prompt, str) or not prompt.strip():
             raise VideoRunError('Write and review the current prompt before generating.')
@@ -371,6 +407,10 @@ class VideoRunManager:
         seed = _seed(render.get('seed', 9072026))
         parent = _id(parent_run_id) if parent_run_id is not None else None
         digest = _digest({'kind': 'continue' if parent else 'generate', 'project': snapshot, 'prompt': prompt, 'parent': parent})
+        existing = self._existing_request(request_id, digest)
+        if existing:
+            return existing
+        self._reconcile_admission_blockers()
         with self.lock:
             if parent:
                 source = self._record(parent)
@@ -386,6 +426,10 @@ class VideoRunManager:
     def reroll(self, request_id, source_run_id, seed=None):
         parent = _id(source_run_id)
         digest = _digest({'kind': 'reroll', 'parent': parent, 'requested_seed': seed})
+        existing = self._existing_request(request_id, digest)
+        if existing:
+            return existing
+        self._reconcile_admission_blockers()
         with self.lock:
             existing = self.records.get(_id(request_id))
             if existing:
@@ -435,6 +479,10 @@ class VideoRunManager:
     def combine(self, request_id, source_run_id):
         source_id = _id(source_run_id)
         digest = _digest({'kind': 'combine', 'source': source_id})
+        existing = self._existing_request(request_id, digest)
+        if existing:
+            return existing
+        self._reconcile_admission_blockers()
         with self.lock:
             existing = self.records.get(_id(request_id))
             if existing:
