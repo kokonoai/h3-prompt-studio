@@ -12,8 +12,10 @@ import time
 import uuid
 from pathlib import Path
 
+from .comfy_transfer import FL_LORA, REF_LORA
 from .projects import PROMPT_VERSIONS, atomic_json, check_project, safe_id, shot, uid
 from .video_workflows import REF8_WORKFLOW_ID, ref8_recipe_settings
+from .video_workflows import REF8_LORA
 
 MIN_SECONDS, PLANNED_MIN_SECONDS, DEFAULT_CLIP_SECONDS = 4, 5, 10
 MAX_SECONDS, MAX_SEGMENTS, MAX_EPISODES = 15, 64, 100
@@ -5684,6 +5686,55 @@ class ProductionManager:
         current["segments"], current["planner"], current["planner_warning"] = prepared, planner, warning
         return self.save(current)
 
+    def repair_video_mode_settings(self, production, project):
+        """Migrate a known H3 speed adapter when a clip changes input mode.
+
+        Production materialisation can legitimately downgrade a Ref2VA episode
+        clip to Text-only when that exact clip has no reference assets.  The
+        conditioning mode, workflow profile and speed LoRA are one recipe and
+        must move together.  Only the three app-certified adapters are touched;
+        user-added unverified style LoRAs remain unchanged.
+        """
+        mode = project.get("mode")
+        if mode not in ("ref2va", "i2va", "fl2va", "l2va", "t2va"):
+            return False
+        render = project.setdefault("comfy_render", {})
+        loras = render.get("loras")
+        if not isinstance(loras, list):
+            loras = []
+        known = {REF_LORA, REF8_LORA, FL_LORA}
+        active_names = {
+            row.get("name") for row in loras
+            if isinstance(row, dict) and row.get("enabled", True) is not False
+        }
+        incompatible = (
+            (mode == "ref2va" and FL_LORA in active_names)
+            or (mode != "ref2va" and bool(active_names & {REF_LORA, REF8_LORA}))
+            or (mode != "ref2va" and render.get("workflow_profile_id") == REF8_WORKFLOW_ID)
+        )
+        if not incompatible:
+            return False
+        use_ref8 = mode == "ref2va" and production.get("video_quality") == "lora8"
+        target = REF8_LORA if use_ref8 else REF_LORA if mode == "ref2va" else FL_LORA
+        target_strength = 0.5 if target == REF8_LORA else 1.0
+        extras = [
+            copy.deepcopy(row) for row in loras
+            if isinstance(row, dict) and row.get("name") not in known
+        ]
+        render["loras"] = [
+            {"name": target, "strength": target_strength, "enabled": True},
+            *extras,
+        ]
+        render["workflow_profile_id"] = REF8_WORKFLOW_ID if use_ref8 else "builtin"
+        if mode != "ref2va":
+            if render.get("quality") == "lora8" or production.get("video_quality") == "lora8":
+                render["quality"] = "fast"
+            # These measured shifts belong to the optional Ref2VA attachment
+            # recipe and must not leak into a frame/text-conditioned graph.
+            render.pop("shift_video", None)
+            render.pop("shift_audio", None)
+        return True
+
     def materialise(self, ident, segment_id, *, allow_render_advisories=False):
         started = time.monotonic()
         production = self.get(ident)
@@ -5775,19 +5826,7 @@ class ProductionManager:
                 card_selection["image_asset_ids"] or card_selection["audio_asset_ids"])
             base["mode"] = "ref2va" if has_reference_asset else "t2va"
             card_selection["effective_mode"] = base["mode"]
-            if base["mode"] == "t2va" and render.get("workflow_profile_id") == REF8_WORKFLOW_ID:
-                # The optional eight-step LoRA graph is Ref2VA-only. Fall back
-                # to the unchanged built-in workflow for this one text-only
-                # clip instead of failing the whole episode. Restore any
-                # source render values so the LoRA recipe cannot leak into it.
-                source_render = source.get("comfy_render", {})
-                for key in ("loras", "shift_video", "shift_audio"):
-                    if key in source_render:
-                        render[key] = copy.deepcopy(source_render[key])
-                    else:
-                        render.pop(key, None)
-                render["workflow_profile_id"] = "builtin"
-                render["quality"] = "fast" if production["video_quality"] == "lora8" else production["video_quality"]
+            self.repair_video_mode_settings(production, base)
         relevant_cards = self._relevant_cards(production, segment)
         def clip_text(value):
             return canonicalise_character_mentions(value, production, relevant_cards["characters"])

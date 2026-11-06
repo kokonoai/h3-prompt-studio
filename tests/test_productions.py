@@ -7,6 +7,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from backend.compiler import compile_project
+from backend.comfy_transfer import FL_LORA
 from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
                                  _segment_hash_with_empty_prop_state,
                                  audit_storyboard_contract,
@@ -34,7 +35,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  validate_planned_chunk_source_contract,
                                  validate_planned_timed_batch_source_contract)
 from backend.projects import merge_plan, new_project, shot
-from backend.video_workflows import VideoWorkflowManager
+from backend.video_workflows import REF8_LORA, VideoWorkflowManager
 
 
 def _id():
@@ -2295,6 +2296,11 @@ def test_text_only_clip_falls_back_from_ref2va_without_using_style_image_as_subj
     assert project["mode"] == "t2va"
     assert project["comfy_render"]["workflow_profile_id"] == "builtin"
     assert project["comfy_render"]["quality"] == "fast"
+    assert project["comfy_render"]["loras"] == [
+        {"name": FL_LORA, "strength": 1.0, "enabled": True}]
+    assert REF8_LORA not in {row["name"] for row in project["comfy_render"]["loras"]}
+    assert "shift_video" not in project["comfy_render"]
+    assert "shift_audio" not in project["comfy_render"]
     assert project["production_link"]["reference_strategy"]["effective_mode"] == "t2va"
     assert project["production_link"]["reference_strategy"]["missing_visual_identity_names"] == ["Hero"]
     assert "TEXT-ONLY VISIBLE IDENTITY WARNING" in project["production_planning_context"]
@@ -2302,6 +2308,35 @@ def test_text_only_clip_falls_back_from_ref2va_without_using_style_image_as_subj
     assert "Loose watercolor pigment on paper" in project["style"]["genre"]
     compiled = compile_project(project)
     assert compiled["valid"] is True, compiled["issues"]
+
+
+def test_legacy_text_only_clip_repairs_ref_only_lora_without_dropping_style_lora(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source, "brief": "An empty landscape.",
+        "source_mode": "ref2va", "video_quality": "lora8",
+    })
+    project = copy.deepcopy(source)
+    project["mode"] = "t2va"
+    project["comfy_render"] = {
+        "workflow_profile_id": "builtin", "quality": "fast",
+        "loras": [
+            {"name": REF8_LORA, "strength": 0.5, "enabled": True},
+            {"name": "author-style.safetensors", "strength": 0.3, "enabled": True},
+        ],
+        "shift_video": 12, "shift_audio": 6,
+    }
+
+    changed = manager.repair_video_mode_settings(production, project)
+
+    assert changed is True
+    assert project["comfy_render"]["workflow_profile_id"] == "builtin"
+    assert project["comfy_render"]["loras"] == [
+        {"name": FL_LORA, "strength": 1.0, "enabled": True},
+        {"name": "author-style.safetensors", "strength": 0.3, "enabled": True},
+    ]
+    assert "shift_video" not in project["comfy_render"]
+    assert "shift_audio" not in project["comfy_render"]
 
 
 def test_text_only_source_promotes_clip_to_ref2va_when_selected_card_has_an_image(tmp_path):

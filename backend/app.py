@@ -3354,6 +3354,12 @@ def production_segment_video(production_id: str, segment_id: str, body: dict):
     production_manager().assert_video_project_current(
         production, project,
         allow_render_advisories=body.get('_automation') is True)
+    # Older materialised clips could switch from Ref2VA to Text-only while
+    # retaining the Ref2VA-only acceleration LoRA.  This deterministic recipe
+    # migration changes no story, prompt, seed or references and is safe at the
+    # final submission boundary.
+    if production_manager().repair_video_mode_settings(production, project):
+        save_project(project)
     if production_manager().has_inherited_clip_directions(production, project):
         raise ValueError('This video prompt still contains directions inherited from an older clip. Regenerate this clip prompt before generating video.')
     profile = video_workflow_manager().get(project.get('comfy_render', {}).get('workflow_profile_id', 'builtin'))
