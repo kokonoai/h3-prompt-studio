@@ -676,6 +676,46 @@ def test_episode_automation_ignores_legacy_review_and_no_merge_switches(server, 
     assert starts == [(production_id, {'merge': True, 'review': False})]
 
 
+def test_pausing_a_production_immediately_freezes_its_background_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_STUDIO_DATA", str(tmp_path / "studio-data"))
+    sys.modules.pop("backend.app", None)
+    module = importlib.import_module("backend.app")
+    production_id = str(uuid.uuid4())
+    production = {
+        'id': production_id, 'task_state': 'active',
+        'automation': {
+            'status': 'running', 'stage': 'videos',
+            'run_id': 'run-in-flight', 'request_id': 'request-in-flight',
+        },
+    }
+    pauses = []
+
+    class Productions:
+        def get(self, ident):
+            assert ident == production_id
+            return copy.deepcopy(production)
+
+        def update(self, ident, changes):
+            assert ident == production_id
+            production.update(copy.deepcopy(changes))
+            return copy.deepcopy(production)
+
+    class Automation:
+        def pause(self, ident):
+            assert ident == production_id
+            pauses.append(ident)
+            production['automation'].update(status='paused', stage='paused')
+
+    monkeypatch.setattr(module, 'production_manager', lambda: Productions())
+    monkeypatch.setattr(module, 'production_automation_manager', lambda: Automation())
+
+    response = module.production_update(production_id, {'task_state': 'paused'})
+
+    assert response['task_state'] == 'paused'
+    assert response['automation']['status'] == 'paused'
+    assert pauses == [production_id]
+
+
 def test_concat_applies_one_final_loudness_master(server, monkeypatch, tmp_path):
     module, _client, _fake = server
     files = [tmp_path / 'one.mp4', tmp_path / 'two.mp4']

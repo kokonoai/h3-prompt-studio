@@ -3,6 +3,7 @@ import time
 
 from backend.production_automation import (
     ProductionAutomationManager,
+    ProductionPauseRequested,
     is_global_failure,
     is_missing_video_request,
     is_prompt_repairable,
@@ -21,9 +22,10 @@ def wait_for(predicate, timeout=2.0):
 
 def fake_manager(*, submit_failures=None, initial_status="idle", quality_result=None,
                  rejected_take=False, prompt_failures=None,
-                 fallback_prompt=False):
+                 fallback_prompt=False, auto_prompt_repair=False):
     state = {
         "id": "production-1", "task_state": "active",
+        "auto_prompt_repair": auto_prompt_repair,
         "segments": [{"id": "segment-1", "index": 1,
                       "status": "ready" if rejected_take else "stale",
                       "stale_reasons": [] if rejected_take else ["old prompt"],
@@ -103,6 +105,65 @@ def test_background_production_persists_cursor_and_completes_missing_work():
     assert state["automation"]["completed"] == 1
     assert state["automation"]["run_id"] is None
     assert state["automation"]["request_id"] is None
+
+
+def test_ensure_reconciles_a_persisted_running_queue_with_paused_task_state():
+    manager, state, _submitted_ids, _merged = fake_manager(initial_status="running")
+    state["task_state"] = "paused"
+    state["automation"].update({
+        "stage": "videos", "current_segment_id": "segment-1",
+        "current_index": 1, "run_id": "run-in-flight",
+        "request_id": "request-in-flight",
+    })
+
+    automation = manager.ensure(state["id"])
+
+    assert automation["status"] == "paused"
+    assert automation["stage"] == "paused"
+    assert automation["run_id"] == "run-in-flight"
+    assert automation["request_id"] == "request-in-flight"
+    assert "checked on resume" in automation["stage_detail"]
+    assert not manager._worker_alive(state["id"])
+
+
+def test_monitoring_rechecks_pause_after_a_blocking_comfyui_refresh():
+    state = {
+        "id": "production-1", "task_state": "active",
+        "segments": [{"id": "segment-1", "index": 1}],
+        "automation": {
+            "status": "running", "stage": "videos",
+            "current_segment_id": "segment-1", "current_index": 1,
+            "run_id": "run-in-flight", "request_id": "request-in-flight",
+        },
+    }
+
+    def get_run(_run_id):
+        # This models the user clicking Pause while refresh() is blocked on a
+        # reconnecting ComfyUI server.
+        state["task_state"] = "paused"
+        return {"id": "run-in-flight", "status": "running", "stage": "Reconnecting"}
+
+    manager = ProductionAutomationManager(
+        list_productions=lambda: [{"id": state["id"]}],
+        get_production=lambda _ident: copy.deepcopy(state),
+        update_automation=lambda _ident, changes: (
+            state["automation"].update(copy.deepcopy(changes)) or copy.deepcopy(state)),
+        outputs=lambda _ident: {"segments": []},
+        generate_prompt=lambda *_args: None, submit_video=lambda *_args: {},
+        get_run=get_run, resolve_run=get_run, build_film=lambda _ident: None,
+        poll_interval=0, retry_delays=(0, 0, 0),
+    )
+
+    try:
+        manager._monitor_run(state["id"], state["segments"][0], "run-in-flight")
+    except ProductionPauseRequested:
+        pass
+    else:
+        raise AssertionError("monitoring did not stop after the pause request")
+
+    assert state["automation"]["status"] == "paused"
+    assert state["automation"]["run_id"] == "run-in-flight"
+    assert state["automation"]["request_id"] == "request-in-flight"
 
 
 def test_transient_submission_reuses_idempotency_key_then_continues():
@@ -251,7 +312,7 @@ def test_unsafe_continuation_rebuilds_prompt_once_then_continues():
         "Clip 2 failed shot preflight. Fix or replan it before generating video: "
         "Continuous clip adds characters at its opening: Nox "
         "Continuous clip loses characters at its opening: Mr. Tsukiguma"
-    ])
+    ], auto_prompt_repair=True)
 
     manager.start(state["id"])
     wait_for(lambda: state["automation"]["status"] == "completed")
@@ -266,7 +327,7 @@ def test_stale_delivery_language_prompt_is_rebuilt_then_video_continues():
         "The scene changed after its English H3 prompt was created. "
         "Generate the prompt again.")
     manager, state, submitted_ids, merged = fake_manager(
-        submit_failures=[message])
+        submit_failures=[message], auto_prompt_repair=True)
 
     manager.start(state["id"])
     wait_for(lambda: state["automation"]["status"] == "completed")
@@ -279,7 +340,7 @@ def test_stale_delivery_language_prompt_is_rebuilt_then_video_continues():
 def test_failed_pre_render_prompt_gate_is_rebuilt_then_video_continues():
     manager, state, submitted_ids, merged = fake_manager(submit_failures=[
         "Clip 1 failed pre-render prompt quality. Regenerate this clip prompt before video."
-    ])
+    ], auto_prompt_repair=True)
 
     manager.start(state["id"])
     wait_for(lambda: state["automation"]["status"] == "completed")

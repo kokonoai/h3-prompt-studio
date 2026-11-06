@@ -936,11 +936,16 @@ def production_cards_clear(production_id: str):
 
 @app.patch('/api/productions/{production_id}')
 def production_update(production_id: str, body: dict):
-    current = production_manager().get(production_id)
+    manager = production_manager()
+    current = manager.get(production_id)
     if (current.get('automation', {}).get('status') in ('running', 'retrying')
             and set(body) - {'task_state'}):
         raise ValueError('Pause the background production before changing its script, cards, storyboard or render settings.')
-    return production_manager().update(production_id, body)
+    updated = manager.update(production_id, body)
+    if body.get('task_state') == 'paused':
+        production_automation_manager().pause(production_id)
+        return manager.get(production_id)
+    return updated
 
 
 @app.delete('/api/productions/{production_id}')

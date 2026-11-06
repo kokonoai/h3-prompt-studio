@@ -105,6 +105,15 @@ MISSING_VIDEO_REQUEST_MARKERS = (
 )
 
 
+class ProductionPauseRequested(BaseException):
+    """Internal control signal used to unwind a durable background worker.
+
+    A submitted ComfyUI request is intentionally not cancelled.  Its durable
+    cursor remains on the production so a later resume can reconcile the same
+    request instead of submitting a duplicate take.
+    """
+
+
 def is_prompt_repairable(message: str) -> bool:
     value = str(message).casefold()
     return any(marker in value for marker in PROMPT_REPAIR_MARKERS)
@@ -196,6 +205,10 @@ class ProductionAutomationManager:
         """Restart a persisted active job whose in-memory worker disappeared."""
         production = self.get_production(production_id)
         automation = production.get("automation", {})
+        if (production.get("task_state") == "paused"
+                and automation.get("status") in ACTIVE_STATUSES):
+            self.pause(production_id)
+            return self.get_production(production_id).get("automation", {})
         if (automation.get("status") in ACTIVE_STATUSES
                 and production.get("task_state") == "active"):
             with self.lock:
@@ -217,6 +230,28 @@ class ProductionAutomationManager:
 
     def shutdown(self):
         self.stopping.set()
+
+    def pause(self, production_id):
+        """Freeze the Studio queue without cancelling submitted ComfyUI work."""
+        production = self.get_production(production_id)
+        automation = production.get("automation", {})
+        if (automation.get("status") not in ACTIVE_STATUSES
+                and not self._worker_alive(production_id)):
+            return automation
+        has_durable_request = bool(
+            automation.get("run_id") or automation.get("request_id"))
+        changes = {
+            "status": "paused", "stage": "paused", "last_error": "",
+            "stage_detail": (
+                "Paused; the current ComfyUI request will be checked on resume"
+                if has_durable_request else "Paused before the next clip"
+            ),
+        }
+        if not has_durable_request:
+            changes.update(
+                current_segment_id=None, current_index=0, attempt=0)
+        self._update(production_id, **changes)
+        return self.get_production(production_id).get("automation", {})
 
     @staticmethod
     def _selected_segment_ids(overview):
@@ -319,8 +354,7 @@ class ProductionAutomationManager:
         production = self.get_production(production_id)
         if production.get("task_state") != "paused":
             return False
-        self._update(production_id, status="paused", stage="paused",
-                     last_error="", run_id=None, request_id=None)
+        self.pause(production_id)
         return True
 
     def _wait(self, seconds):
@@ -328,7 +362,14 @@ class ProductionAutomationManager:
 
     def _monitor_run(self, production_id, segment, run_id):
         while not self.stopping.is_set():
+            if self._pause_if_requested(production_id):
+                raise ProductionPauseRequested()
             job = self.get_run(run_id)
+            # The refresh above can wait on a reconnecting ComfyUI server.  A
+            # pause requested during that wait must win before any stale
+            # "running" state is written back to the production record.
+            if self._pause_if_requested(production_id):
+                raise ProductionPauseRequested()
             status = job.get("status")
             self._update(
                 production_id, status="running", stage="videos",
@@ -563,6 +604,8 @@ class ProductionAutomationManager:
                 production = self.get_production(production_id)
                 segments = sorted(production.get("segments", []), key=lambda item: item["index"])
                 overview = self.outputs(production_id)
+                if self._pause_if_requested(production_id):
+                    return
                 completed_ids = self._selected_segment_ids(overview)
                 automation = production.get("automation", {})
                 review_after_render = bool(automation.get("review", False))
@@ -707,12 +750,17 @@ class ProductionAutomationManager:
                               stage_detail=detail, last_error="",
                              finished_at=time.time())
                 return
+        except ProductionPauseRequested:
+            self.pause(production_id)
+            return
         except Exception as exc:
             message = str(exc)[:2000]
             # Shutdown is recoverable: leave the durable cursor active so the
             # next Studio process restarts it. All ordinary failures stop at a
             # visible attention state rather than looping destructively.
-            if self.stopping.is_set():
+            if self.get_production(production_id).get("task_state") == "paused":
+                self.pause(production_id)
+            elif self.stopping.is_set():
                 self._update(production_id, status="running", last_error=message,
                              stage_detail="Waiting for Studio restart")
             else:
