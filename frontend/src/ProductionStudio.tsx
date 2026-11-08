@@ -214,12 +214,15 @@ export const timeoutRecoveryKind=(
 };
 
 export type FullRunPreparationStep="cards"|"episodes"|"storyboard";
+const CONTINUITY_GUARD_ADVISORY="Continuity guard corrected temporal cast conflicts:";
 export const fullRunPreparationComplete=(step:FullRunPreparationStep,value:Pick<Production,
   "card_plan_source_hash"|"card_planner_warning"|"planner_warning"|"episodes"|"segments">|null|undefined)=>{
   if(!value)return false;
   if(step==="cards")return !!value.card_plan_source_hash||!!value.card_planner_warning;
   if(step==="episodes")return value.episodes.length>0;
-  return value.segments.length>0&&!value.planner_warning;
+  const warning=(value.planner_warning||"").trim();
+  const requiresReplan=!!warning&&!warning.startsWith(CONTINUITY_GUARD_ADVISORY);
+  return value.segments.length>0&&!requiresReplan;
 };
 
 const MAX_PRODUCTION_BRIEF_CHARACTERS=120000;

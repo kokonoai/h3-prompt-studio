@@ -57,6 +57,10 @@ describe("episode batch production",()=>{
     expect(fullRunPreparationComplete("storyboard",{
       ...empty,segments:[{id:"clip-1"}],planner_warning:"Source coverage failed",
     })).toBe(false);
+    expect(fullRunPreparationComplete("storyboard",{
+      ...empty,segments:[{id:"clip-1"}],
+      planner_warning:"Continuity guard corrected temporal cast conflicts: Clip 25 restored Nox.",
+    })).toBe(true);
   });
 
   it("targets only checked clips and keeps storyboard order",()=>{
