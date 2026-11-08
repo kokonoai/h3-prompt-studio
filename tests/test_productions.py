@@ -109,10 +109,29 @@ def test_new_production_starts_with_an_empty_independent_card_library(tmp_path):
     }
     assert production["auto_quality_review"] is False
     assert production["auto_prompt_repair"] is False
+    assert production["prompt_version"] == "continuity_director"
+    assert production["video_aspect_ratio"] == "16:9"
+    assert production["video_resolution"] == "1.0"
+    assert production["video_quality"] == "lora8"
+    assert production["video_steps"] == "auto"
     assert projects[source["id"]]["subjects"][0]["name"] == "Source-only hero"
 
     production = manager.update(production["id"], {"auto_prompt_repair": True})
     assert production["auto_prompt_repair"] is True
+
+
+def test_new_non_reference_production_uses_safe_default_video_recipe(tmp_path):
+    manager, source, projects, _assets, _store_asset = _rig(tmp_path)
+    source["mode"] = "t2va"
+    projects[source["id"]] = copy.deepcopy(source)
+
+    production = manager.create({"source_project": source, "brief": "A text-only scene."})
+
+    assert production["prompt_version"] == "continuity_director"
+    assert production["video_aspect_ratio"] == "16:9"
+    assert production["video_resolution"] == "1.0"
+    assert production["video_quality"] == "fast"
+    assert production["video_steps"] == "auto"
 
 
 def test_production_list_reads_lightweight_summaries_without_full_validation(tmp_path):
@@ -307,7 +326,8 @@ def test_materialise_separates_local_actor_phone_actor_and_mentioned_recipient(t
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     koko = _card("Koko", [_image(store_asset, "Koko", "pink")["id"]])
     besi = _card("Besi", [_image(store_asset, "Besi", "blue")["id"]])
-    production = manager.create({"source_project": source, "brief": "Koko calls Besi.", "language": "en"})
+    production = manager.create({"source_project": source, "brief": "Koko calls Besi.", "language": "en",
+                                 "prompt_version": "classic"})
     production["cards"]["characters"] = [koko, besi]
     manager.save(production)
     production = manager.apply_plan(production["id"], [{
@@ -862,7 +882,7 @@ def test_generated_card_image_is_project_scoped_and_newest_is_primary(tmp_path):
 def test_local_ai_selects_exact_project_cards_uses_dense_cast_overview_and_applies_language(tmp_path):
     manager, source, projects, assets, store_asset = _rig(tmp_path)
     production = manager.create({"source_project": source, "title": "Episode", "brief": source["story"]["text"],
-                                 "language": "ja"})
+                                 "language": "ja", "prompt_version": "classic"})
     characters = [_card(name, [_image(store_asset, name, color)["id"]]) for name, color in
                   (("A", "red"), ("B", "green"), ("C", "blue"), ("D", "yellow"))]
     environment = _card("Library", [_image(store_asset, "library", "gray")["id"]])
@@ -1763,6 +1783,7 @@ def test_text_only_voice_bible_uses_only_current_speakers(tmp_path):
         "source_project": source,
         "brief": "A greets B while B remains silent.",
         "language": "en",
+        "prompt_version": "classic",
         "series_voice_style": series_style,
     })
     a, b = _card("A"), _card("B")
@@ -1812,7 +1833,8 @@ def test_text_only_voice_bible_uses_only_current_speakers(tmp_path):
 def test_series_voice_roster_restores_only_the_current_speakers_rules(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     production = manager.create({
-        "source_project": source, "brief": "Pokke speaks while Nox listens.", "language": "en",
+            "source_project": source, "brief": "Pokke speaks while Nox listens.", "language": "en",
+            "prompt_version": "classic",
         "series_voice_style": (
             "Animated ensemble dialogue.\n"
             "- Pokke should remain fast and bouncy, never robotic.\n"
@@ -1942,7 +1964,8 @@ def test_bilingual_and_reflected_speakers_bind_existing_subjects_without_extra_b
 
 def test_render_voice_metadata_cannot_summon_a_human_body(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
-    production = manager.create({"source_project": source, "brief": "Bokka speaks.", "language": "en"})
+    production = manager.create({"source_project": source, "brief": "Bokka speaks.", "language": "en",
+                                 "prompt_version": "classic"})
     bokka = _card("Bokka")
     voice = _card("Bokka voice", character_card_id=bokka["id"],
                   description="A slightly husky, confident animated girl voice.", voice_id="BOKKA_V1")
@@ -2065,7 +2088,8 @@ def test_voice_id_speaker_resolves_to_owner_without_creating_visible_duplicate(t
 
 def test_materialise_compiles_all_as_visible_ensemble_not_extra_character(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
-    production = manager.create({"source_project": source, "brief": "A and B answer together.", "language": "en"})
+    production = manager.create({"source_project": source, "brief": "A and B answer together.", "language": "en",
+                                 "prompt_version": "classic"})
     a = _card("A", [_image(store_asset, "A", "red")["id"]])
     b = _card("B", [_image(store_asset, "B", "blue")["id"]])
     production["cards"]["characters"] = [a, b]
@@ -2595,7 +2619,8 @@ def test_reference_media_without_text_still_allows_ai_text_completion(tmp_path):
 
 def test_manual_overview_covers_cards_without_individual_images(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
-    production = manager.create({"source_project": source, "brief": "A, B, C and D stand together."})
+    production = manager.create({"source_project": source, "brief": "A, B, C and D stand together.",
+                                 "prompt_version": "classic"})
     production["cards"]["characters"] = [_card(name) for name in ("A", "B", "C", "D")]
     overview = _image(store_asset, "cast-overview", "navy")
     production["overview_asset_ids"]["characters"] = overview["id"]
@@ -3021,7 +3046,7 @@ def test_stale_long_running_save_cannot_clear_an_explicit_pause(tmp_path):
 
 def test_classic_voice_style_does_not_import_the_full_series_voice_roster(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
-    production = manager.create({"source_project": source, "language": "en",
+    production = manager.create({"source_project": source, "language": "en", "prompt_version": "classic",
         "series_voice_style": "Polished animated dialogue.\n#### The characters should have distinct voices:\nA: bright.\nNox: smoky."})
     actor = _card("A", [_image(store_asset, "actor-a", "blue")["id"]])
     voice = _card("A voice", character_card_id=actor["id"], description="Bright and clear.")

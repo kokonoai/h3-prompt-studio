@@ -231,15 +231,15 @@ const blank = (project:Project) => ({
   // imported below.
   title: "",
   language: (project.production_language||"zh-CN") as Production["language"],
-  prompt_version:"classic" as Production["prompt_version"],
+  prompt_version:"continuity_director" as Production["prompt_version"],
   brief: "",
   style_bible: "",
   character_bible: "",
   continuity_notes: "",series_voice_style:"",
   visual_style_preset:"cinematic_realism",visual_style_custom:"",narrative_style:"cinematic",narrative_style_custom:"",narrative_notes:"",
   episode_count:1,episode_minutes:8,card_collection_name:"",
-  video_aspect_ratio:project.aspect_ratio||"16:9",video_resolution:String(project.comfy_render?.resolution||"0.7"),
-  video_quality:project.comfy_render?.quality==="lora8"?"lora8":project.comfy_render?.quality==="detailed"?"detailed":"fast",video_steps:[4,8,16].includes(project.comfy_render?.steps)?project.comfy_render.steps:"auto",
+  video_aspect_ratio:"16:9",video_resolution:"1.0",
+  video_quality:project.mode==="ref2va"?"lora8":"fast",video_steps:"auto" as Production["video_steps"],
   overview_asset_ids:{characters:null,wardrobe:null,props:null,environments:null},
 });
 const sleep = (ms:number) => new Promise(resolve=>setTimeout(resolve,ms));
