@@ -87,6 +87,14 @@ export const videoPromptTargets=(segments:Segment[],force=false)=>
   force?segments:segments.filter(segmentNeedsVideoPrompt);
 export const videoRenderTargets=(segments:Segment[],outputs:ProductionOutputs|null|undefined,force=false)=>
   force?segments:segments.filter(segment=>!segmentHasCompletedVideo(segment,outputs));
+export const productionNeedsEpisodeContinuation=(
+  value:Pick<Production,"segments">|null|undefined,
+  outputs:ProductionOutputs|null|undefined,
+)=>{
+  const segments=value?.segments||[];
+  if(!segments.length)return false;
+  return videoPromptTargets(segments).length>0||videoRenderTargets(segments,outputs).length>0||!outputs?.final_ready;
+};
 export const selectedClipTargets=(segments:Segment[],selectedIds:Iterable<string>)=>{
   const selected=new Set(selectedIds);
   return segments.filter(segment=>selected.has(segment.id));
@@ -1219,6 +1227,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const autoMergeAttempt=useRef("");
   const automation=outputs?.automation;
   const automationActive=automation?.status==="running"||automation?.status==="retrying";
+  const needsEpisodeContinuation=useMemo(
+    ()=>productionNeedsEpisodeContinuation(production,outputs),
+    [production,outputs],
+  );
   const outputsNeedPolling=automationActive||(outputs?.active_jobs||0)>0||
     outputs?.quality_batch?.status==="running"||merging;
   const totalSeconds=useMemo(()=>production?.segments.reduce((n,s)=>n+s.duration,0)||0,[production?.segments]);
@@ -2245,7 +2257,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           setProduction(current);setDraft(current);setOpenEpisodeId(current.episodes[0]?.id||null);
           stopIfPauseRequested();
         }
-        if(!current.segments.length||!!current.planner_warning){
+        if(!fullRunPreparationComplete("storyboard",current)){
           setBusy(t("全流程 · 第 3/6 步：拆分当前集分镜","Full run · Step 3/6: plan current episode clips","全工程・ステップ3/6：現在話をクリップ化","全流程 · 第 3/6 步：拆分目前集分鏡"));
           current=await runFullPreparationStep("storyboard",current.id,()=>
             api("/productions/"+current.id+"/plan",{use_ai:true},undefined,"POST",{timeoutMs:480000}) as Promise<Production>);
@@ -2445,7 +2457,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <div className="production-full-runner-actions">
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
         <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
-          {bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:<Sparkles size={18}/>}<span>{automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
+          {bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
         </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
           {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存状态…","Saving state…","状態を保存中…","正在儲存狀態…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("暂停后台队列","Pause background queue","バックグラウンドキューを一時停止","暫停背景佇列"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
         </button></div>

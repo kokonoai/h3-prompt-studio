@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fullRunPreparationComplete, productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { fullRunPreparationComplete, productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionNeedsEpisodeContinuation, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -67,6 +67,16 @@ describe("episode batch production",()=>{
     const clips:any[]=[{id:"clip-1"},{id:"clip-2"},{id:"clip-3"}];
     expect(selectedClipTargets(clips,["clip-3","clip-1"]).map(item=>item.id)).toEqual(["clip-1","clip-3"]);
     expect(selectedClipTargets(clips,[])).toEqual([]);
+  });
+
+  it("shows the resume action while an existing episode still has missing work",()=>{
+    const clip:any={id:"clip-1",status:"ready",video_prompt:"prompt",project_id:"project-1",stale_reasons:[],prompt_updated_at:10};
+    const completed:any={segments:[{segment_id:"clip-1",selected:{created_at:11}}],final_ready:true};
+    expect(productionNeedsEpisodeContinuation(null,null)).toBe(false);
+    expect(productionNeedsEpisodeContinuation({segments:[]},null)).toBe(false);
+    expect(productionNeedsEpisodeContinuation({segments:[{...clip,video_prompt:""}] as any[]},null)).toBe(true);
+    expect(productionNeedsEpisodeContinuation({segments:[clip]}, {...completed,final_ready:false})).toBe(true);
+    expect(productionNeedsEpisodeContinuation({segments:[clip]}, completed)).toBe(false);
   });
 
   it("targets only explicit unaccepted QC rejections for batch release",()=>{
