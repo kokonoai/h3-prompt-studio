@@ -108,9 +108,10 @@ MISSING_VIDEO_REQUEST_MARKERS = (
 class ProductionPauseRequested(BaseException):
     """Internal control signal used to unwind a durable background worker.
 
-    A submitted ComfyUI request is intentionally not cancelled.  Its durable
-    cursor remains on the production so a later resume can reconcile the same
-    request instead of submitting a duplicate take.
+    The pause path first asks VideoRunManager to stop an owned ComfyUI request.
+    If that cancellation cannot be confirmed, its durable cursor remains on
+    the production so a later resume reconciles it instead of submitting a
+    duplicate take.
     """
 
 
@@ -149,6 +150,7 @@ class ProductionAutomationManager:
     def __init__(self, *, list_productions, get_production, update_automation,
                  outputs, generate_prompt, submit_video, get_run, resolve_run,
                  build_film, review_quality=None, generate_fallback_prompt=None,
+                 cancel_run=None,
                  poll_interval=5.0,
                  retry_delays=(5.0, 15.0, 30.0)):
         self.list_productions = list_productions
@@ -160,6 +162,7 @@ class ProductionAutomationManager:
         self.submit_video = submit_video
         self.get_run = get_run
         self.resolve_run = resolve_run
+        self.cancel_run = cancel_run
         self.review_quality = review_quality
         self.build_film = build_film
         self.poll_interval = poll_interval
@@ -232,18 +235,19 @@ class ProductionAutomationManager:
         self.stopping.set()
 
     def pause(self, production_id):
-        """Freeze the Studio queue without cancelling submitted ComfyUI work."""
+        """Freeze the queue and stop its currently owned ComfyUI request."""
         production = self.get_production(production_id)
         automation = production.get("automation", {})
         if (automation.get("status") not in ACTIVE_STATUSES
                 and not self._worker_alive(production_id)):
             return automation
+        run_id = automation.get("run_id")
         has_durable_request = bool(
-            automation.get("run_id") or automation.get("request_id"))
+            run_id or automation.get("request_id"))
         changes = {
             "status": "paused", "stage": "paused", "last_error": "",
             "stage_detail": (
-                "Paused; the current ComfyUI request will be checked on resume"
+                "Paused; stopping the current ComfyUI request"
                 if has_durable_request else "Paused before the next clip"
             ),
         }
@@ -251,6 +255,48 @@ class ProductionAutomationManager:
             changes.update(
                 current_segment_id=None, current_index=0, attempt=0)
         self._update(production_id, **changes)
+
+        if not run_id or self.cancel_run is None:
+            if has_durable_request:
+                self._update(
+                    production_id,
+                    stage_detail="Paused; the current ComfyUI request will be checked on resume",
+                )
+            return self.get_production(production_id).get("automation", {})
+
+        try:
+            stopped = self.cancel_run(run_id) or {}
+        except Exception:
+            # The task is still paused even if ComfyUI cannot confirm the
+            # cancellation. Keep the durable cursor so Resume never submits a
+            # duplicate request while the old one may still exist.
+            self._update(
+                production_id,
+                stage_detail=(
+                    "Paused; stopping the current ComfyUI request could not be confirmed. "
+                    "It will be checked on resume"
+                ),
+            )
+            return self.get_production(production_id).get("automation", {})
+
+        status = str(stopped.get("status") or "").casefold()
+        if status in RUNNING_VIDEO_STATUSES or status == "uncertain":
+            self._update(
+                production_id,
+                stage_detail="Paused; the current ComfyUI stop request is still being confirmed",
+            )
+            return self.get_production(production_id).get("automation", {})
+
+        cancelled = bool(stopped.get("cancelled")) or status in {"cancelled", "failed"}
+        self._update(
+            production_id,
+            current_segment_id=None, current_index=0,
+            run_id=None, request_id=None, attempt=0,
+            stage_detail=(
+                "Paused; the current video was stopped and will be regenerated on resume"
+                if cancelled else "Paused after the current video finished"
+            ),
+        )
         return self.get_production(production_id).get("automation", {})
 
     @staticmethod

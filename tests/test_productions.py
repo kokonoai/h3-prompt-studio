@@ -1662,6 +1662,97 @@ Pokke:
     assert repaired["segments"][1]["dialogue"][0]["text"] == "Keep your side clear."
 
 
+def test_markdown_voiceover_blocks_bind_to_unique_voice_owner_and_remain_audible(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    screenplay = """### Shot 1 | 00:00–00:10
+
+**Action:** Yuki watches rain on the window with her mouth closed.
+
+**Voice-over:**
+
+> It took me a while to understand…
+> The most beautiful kind of love—
+
+**Sound:** Soft rain against the glass.
+"""
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": .5, "language": "en",
+    })
+    yuki = _card("Yuki")
+    voice = _card("YUKI_V1", character_card_id=yuki["id"], voice_id="YUKI_V1")
+    production["cards"]["characters"] = [yuki]
+    production["cards"]["voices"] = [voice]
+    production = manager.save(production)
+
+    group = timed_clip_groups(screenplay)[0]
+    assert script_dialogue(group["text"], "Yuki") == [
+        {"speaker": "Yuki", "text": "It took me a while to understand…", "voiceover": True},
+        {"speaker": "Yuki", "text": "The most beautiful kind of love—", "voiceover": True},
+    ]
+    locked = locked_timed_dialogue(production)[0]
+    assert locked["dialogue_parse_failed"] is False
+    assert locked["source_dialogue"] == [
+        {"speaker": "Yuki", "text": "It took me a while to understand…",
+         "language": "English", "voiceover": True},
+        {"speaker": "Yuki", "text": "The most beautiful kind of love—",
+         "language": "English", "voiceover": True},
+    ]
+
+    manifest = production_source_manifest(production)["chunks"][0]
+    assert [row["text"] for row in manifest["dialogue"]] == [
+        "It took me a while to understand…", "The most beautiful kind of love—"]
+    assert all(row["voiceover"] is True for row in manifest["dialogue"])
+
+    clip = _planned_clip("Rain reflection", ["Yuki"], {
+        "visible_start": ["Yuki"], "visible_end": ["Yuki"],
+        "enters": [], "exits": [], "offscreen": [], "mentioned_only": [],
+    })
+    clip["duration"] = 10
+    clip["dialogue"] = []
+    clip["source_refs"] = {
+        "scene_ids": [row["id"] for row in manifest["scenes"]],
+        "paragraph_ids": [row["id"] for row in manifest["paragraphs"]],
+        "dialogue_ids": [row["id"] for row in manifest["dialogue"]],
+        "event_ids": [row["id"] for row in manifest["events"]],
+    }
+    production = manager.apply_plan(production["id"], [clip], "local_ai")
+
+    assert production["segments"][0]["dialogue"] == locked["source_dialogue"]
+    assert production["segments"][0]["card_selection"]["voices"] == ["YUKI_V1"]
+    project = manager.materialise(
+        production["id"], production["segments"][0]["id"])["project"]
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+    assert "Spoken-utterance count is exactly 2 utterances total" in compiled["prompt"]
+    assert "No scripted speech is assigned to this clip." not in compiled["prompt"]
+    assert "It took me a while to understand…" in compiled["prompt"]
+    assert "The most beautiful kind of love—" in compiled["prompt"]
+
+
+def test_ambiguous_generic_voiceover_is_rejected_instead_of_becoming_silent(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    screenplay = """0:00-0:10
+**Voice-over:**
+> I remember the station.
+"""
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": .5, "language": "en",
+    })
+    yuki, besi = _card("Yuki"), _card("Besi")
+    production["cards"]["characters"] = [yuki, besi]
+    production["cards"]["voices"] = [
+        _card("Yuki voice", character_card_id=yuki["id"], voice_id="YUKI"),
+        _card("Besi voice", character_card_id=besi["id"], voice_id="BESI"),
+    ]
+    production = manager.save(production)
+
+    locked = locked_timed_dialogue(production)[0]
+    assert locked["source_dialogue"] == []
+    assert locked["dialogue_parse_failed"] is True
+
+
 def test_markdown_speaker_cues_keep_exact_dialogue_and_strip_acting_notes(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     screenplay = """### 分镜66｜0:00—0:10

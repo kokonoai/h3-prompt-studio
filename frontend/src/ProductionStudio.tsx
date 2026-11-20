@@ -1952,10 +1952,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         t("下一段已改为普通硬切，不再错误续接上一段末帧。","The next clip now uses a normal hard cut and will not inherit the previous ending.","次クリップを通常のハードカットに変更し、前の終端を継承しません。","下一段已改為普通硬切，不再錯誤續接上一段末幀。"));
     });
   const queuePausedNotice=()=>t(
-    "本集已暂停。当前正在保存、分析或渲染的这一项会安全完成，后续片段不再提交；下次恢复后点“继续完成本集”即可从缺失处接着做。",
-    "This episode is paused. The item currently saving, analysing or rendering may finish safely, but no later clips will be submitted. Resume later and choose Resume episode to continue from missing work.",
-    "この話を一時停止しました。現在保存・分析・レンダー中の1件は安全に完了しますが、後続クリップは送信しません。後で再開し、「この話を続行」で不足分から続けられます。",
-    "本集已暫停。目前正在儲存、分析或渲染的這一項會安全完成，後續片段不再提交；下次恢復後點「繼續完成本集」即可從缺失處接著做。"
+    "本集已暂停，后续片段不再提交；若当前正在渲染，系统会立即停止属于本集的 ComfyUI 请求。下次恢复后会从缺失处重新生成。",
+    "This episode is paused and no later clips will be submitted. If a clip is rendering, Studio immediately stops the owned ComfyUI request. Resume later to regenerate only missing work.",
+    "この話を一時停止し、後続クリップは送信しません。レンダー中の場合、この話が所有する ComfyUI リクエストを直ちに停止します。再開時は不足分だけを再生成します。",
+    "本集已暫停，後續片段不再提交；若目前正在渲染，系統會立即停止屬於本集的 ComfyUI 請求。下次恢復後會從缺失處重新生成。"
   );
   const stopIfPauseRequested=()=>{if(pauseRequestedRef.current)throw new Error(QUEUE_PAUSE_SIGNAL);};
   const isPauseRequestError=(error:unknown)=>pauseRequestedRef.current||(error as Error).message===QUEUE_PAUSE_SIGNAL;
@@ -2457,9 +2457,9 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <div className="production-full-runner-actions">
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
         <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
-          {bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
+          {production.task_state==="paused"?<Pause size={18}/>:bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{production.task_state==="paused"?t("本集已暂停","Episode paused","この話は一時停止中","本集已暫停"):automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
         </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
-          {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在保存状态…","Saving state…","状態を保存中…","正在儲存狀態…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("暂停后台队列","Pause background queue","バックグラウンドキューを一時停止","暫停背景佇列"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
+          {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在停止任务…","Stopping task…","タスクを停止中…","正在停止任務…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("立即暂停任务","Pause task now","タスクを今すぐ一時停止","立即暫停任務"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
         </button></div>
       </div>
     </section>}

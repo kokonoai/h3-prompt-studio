@@ -759,6 +759,7 @@ def production_automation_manager():
                     {'request_id': request_id, 'new_seed': True, '_automation': True}),
                 get_run=lambda run_id: video_manager().refresh(run_id),
                 resolve_run=lambda run_id: video_manager().resolve_missing(run_id),
+                cancel_run=lambda run_id: video_manager().cancel(run_id),
                 review_quality=lambda production_id: review_production_quality(production_id),
                 build_film=lambda production_id: build_production_film(production_id),
             )
@@ -1067,6 +1068,7 @@ def production_cards_plan(production_id: str, body: dict):
 @app.post('/api/productions/{production_id}/plan')
 def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
+                              default_voiceover_speaker,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
                               source_manifest_for_text, split_storyboard_source_chunk,
@@ -1085,6 +1087,7 @@ def production_plan(production_id: str, body: dict):
     if use_ai:
         production = _generate_production_text_cards(production_id, False)
         story = current_episode_story(production)
+    voiceover_speaker = default_voiceover_speaker(production)
     planned, planner, warning = None, 'local_manual', None
     if use_ai:
         try:
@@ -1125,7 +1128,8 @@ def production_plan(production_id: str, body: dict):
                         RESOURCES.stage = (
                             f'Planning story groups {start_group}-{end_group} '
                             f'({batch_index + 1} of {len(batches)} batches)')
-                        manifest = timed_batch_source_manifest(batch_groups, start_group)
+                        manifest = timed_batch_source_manifest(
+                            batch_groups, start_group, voiceover_speaker)
                         payload = planning_payload(
                             production, piece, batch_index + 1, len(batches),
                             previous_ending, previous_contract,
@@ -1164,7 +1168,7 @@ def production_plan(production_id: str, body: dict):
                                 try:
                                     new_segments = validate_planned_timed_batch_source_contract(
                                         batch_groups, start_group, answer['segments'],
-                                        production['language'])
+                                        production['language'], voiceover_speaker)
                                     break
                                 except ValueError as exc:
                                     coverage_error = exc
@@ -1201,7 +1205,8 @@ def production_plan(production_id: str, body: dict):
                 pieces = [{
                     'story': piece,
                     'chunk_index': index + 1,
-                    'manifest': source_manifest_for_text(piece, index + 1),
+                    'manifest': source_manifest_for_text(
+                        piece, index + 1, voiceover_speaker),
                     'split_depth': 0,
                 } for index, piece in enumerate(original_pieces)]
                 index = 0
@@ -1295,7 +1300,8 @@ def production_plan(production_id: str, body: dict):
             raise ValueError(warning) from exc
     if not use_ai:
         target = episode_timing_targets(production, story=story)['episode_target_seconds']
-        planned = fallback_segments(story, target, production['language'])
+        planned = fallback_segments(
+            story, target, production['language'], voiceover_speaker)
     production_manager().apply_plan(production_id, planned, planner, warning)
     return production_manager().record_timing(production_id, 'storyboard_plan_seconds', time.monotonic() - started)
 

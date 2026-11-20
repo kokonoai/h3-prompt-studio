@@ -126,6 +126,50 @@ def test_ensure_reconciles_a_persisted_running_queue_with_paused_task_state():
     assert not manager._worker_alive(state["id"])
 
 
+def test_pause_stops_owned_inflight_video_and_releases_its_cursor():
+    manager, state, _submitted_ids, _merged = fake_manager(initial_status="running")
+    state["automation"].update({
+        "stage": "videos", "current_segment_id": "segment-1",
+        "current_index": 1, "run_id": "run-in-flight",
+        "request_id": "request-in-flight",
+    })
+    cancelled = []
+    manager.cancel_run = lambda run_id: (
+        cancelled.append(run_id) or
+        {"id": run_id, "status": "failed", "cancelled": True}
+    )
+
+    automation = manager.pause(state["id"])
+
+    assert cancelled == ["run-in-flight"]
+    assert automation["status"] == "paused"
+    assert automation["stage"] == "paused"
+    assert automation["run_id"] is None
+    assert automation["request_id"] is None
+    assert automation["current_segment_id"] is None
+    assert "stopped" in automation["stage_detail"]
+
+
+def test_pause_keeps_durable_cursor_when_comfyui_cancellation_is_uncertain():
+    manager, state, _submitted_ids, _merged = fake_manager(initial_status="running")
+    state["automation"].update({
+        "stage": "videos", "current_segment_id": "segment-1",
+        "current_index": 1, "run_id": "run-in-flight",
+        "request_id": "request-in-flight",
+    })
+
+    def cannot_confirm(_run_id):
+        raise RuntimeError("ComfyUI queue state could not be verified")
+
+    manager.cancel_run = cannot_confirm
+    automation = manager.pause(state["id"])
+
+    assert automation["status"] == "paused"
+    assert automation["run_id"] == "run-in-flight"
+    assert automation["request_id"] == "request-in-flight"
+    assert "could not be confirmed" in automation["stage_detail"]
+
+
 def test_monitoring_rechecks_pause_after_a_blocking_comfyui_refresh():
     state = {
         "id": "production-1", "task_state": "active",

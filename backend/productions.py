@@ -860,6 +860,11 @@ _EDITORIAL_SPEAKER_LABEL = re.compile(
     re.IGNORECASE,
 )
 
+_VOICEOVER_CUE = (
+    r"(?:voice[\s-]*over|v\.?\s*o\.?|narration|narrator|"
+    r"旁白|画外音|畫外音|ナレーション|ボイスオーバー)"
+)
+
 
 def editorial_speaker_label(value):
     """Return true for screenplay headings that cannot be dialogue owners.
@@ -873,18 +878,71 @@ def editorial_speaker_label(value):
     return bool(_EDITORIAL_SPEAKER_LABEL.fullmatch(value))
 
 
+def _voiceover_cue_speaker(value, default=None):
+    """Return whether a cue is narration and its explicit or safe owner."""
+    value = _strip_script_markdown(str(value or "")).strip("*_#- ")
+    if re.fullmatch(_VOICEOVER_CUE, value, re.IGNORECASE):
+        return True, default
+    prefixed = re.fullmatch(
+        rf"{_VOICEOVER_CUE}\s*(?:[-–—|｜/]\s*)?(?P<speaker>[^:：]{{1,100}})",
+        value, re.IGNORECASE)
+    if prefixed:
+        return True, prefixed.group("speaker").strip()
+    suffixed = re.fullmatch(
+        rf"(?P<speaker>[^:：]{{1,100}}?)\s*(?:[-–—|｜/]\s*)?{_VOICEOVER_CUE}",
+        value, re.IGNORECASE)
+    if suffixed:
+        return True, suffixed.group("speaker").strip()
+    return False, None
+
+
+def default_voiceover_speaker(production):
+    """Resolve narration only when one character is the unambiguous owner."""
+    cards = production.get("cards", {}) if isinstance(production, dict) else {}
+    characters = [card for card in cards.get("characters", []) if isinstance(card, dict)]
+    names_by_id = {card.get("id"): str(card.get("name", "")).strip()
+                   for card in characters if card.get("id") and str(card.get("name", "")).strip()}
+    voice_owners = {
+        names_by_id.get(voice.get("character_card_id"))
+        for voice in cards.get("voices", []) if isinstance(voice, dict)
+    }
+    voice_owners.discard(None)
+    voice_owners.discard("")
+    if len(voice_owners) == 1:
+        return next(iter(voice_owners))
+    character_names = {str(card.get("name", "")).strip() for card in characters
+                       if str(card.get("name", "")).strip()}
+    if not voice_owners and len(character_names) == 1:
+        return next(iter(character_names))
+    return None
+
+
 def _dialogue_signal_count(text):
     """Count strong cue+quote signals independently from the main parser."""
     rows = [raw.strip() for raw in str(text or "").splitlines() if raw.strip()]
-    count = 0
+    count, voiceover_pending = 0, False
     for index, raw in enumerate(rows):
         marker = _speaker_marker(raw)
         if not marker:
+            if voiceover_pending and raw.lstrip().startswith(">"):
+                candidate = _strip_script_markdown(raw)
+                if candidate:
+                    count += 1
+                continue
+            voiceover_pending = False
             continue
         speaker, inline = marker
         if editorial_speaker_label(speaker):
+            voiceover_pending = False
             continue
+        is_voiceover, _owner = _voiceover_cue_speaker(speaker)
         candidate = _strip_script_markdown(inline)
+        if is_voiceover:
+            voiceover_pending = True
+            if candidate:
+                count += 1
+            continue
+        voiceover_pending = False
         if candidate and candidate[0] in _DIALOGUE_OPENERS:
             count += 1
             continue
@@ -895,9 +953,9 @@ def _dialogue_signal_count(text):
     return count
 
 
-def script_dialogue(text):
+def script_dialogue(text, voiceover_speaker=None):
     """Extract quoted dialogue from plain text and common Markdown scripts."""
-    result, pending = [], None
+    result, pending, pending_voiceover = [], None, False
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line:
@@ -906,22 +964,31 @@ def script_dialogue(text):
         if marker:
             speaker, inline = marker
             if editorial_speaker_label(speaker):
-                pending = None
+                pending, pending_voiceover = None, False
                 continue
-            pending = speaker
+            is_voiceover, owner = _voiceover_cue_speaker(speaker, voiceover_speaker)
+            pending = owner if is_voiceover else speaker
+            pending_voiceover = is_voiceover
             inline = _strip_script_markdown(inline)
-            if inline and inline[0] in _DIALOGUE_OPENERS:
+            if pending and inline and (pending_voiceover or inline[0] in _DIALOGUE_OPENERS):
                 value = _clean_dialogue_value(inline)
                 if value:
-                    result.append({"speaker": speaker, "text": value})
+                    row = {"speaker": pending, "text": value}
+                    if pending_voiceover:
+                        row["voiceover"] = True
+                    result.append(row)
             continue
         candidate = _strip_script_markdown(line)
-        if pending and candidate and candidate[0] in _DIALOGUE_OPENERS:
+        quoted_voiceover = pending_voiceover and line.lstrip().startswith(">")
+        if pending and candidate and (quoted_voiceover or candidate[0] in _DIALOGUE_OPENERS):
             value = _clean_dialogue_value(candidate)
             if value:
-                result.append({"speaker": pending, "text": value})
+                row = {"speaker": pending, "text": value}
+                if pending_voiceover:
+                    row["voiceover"] = True
+                result.append(row)
         elif pending:
-            pending = None
+            pending, pending_voiceover = None, False
     return result
 
 
@@ -943,9 +1010,10 @@ def locked_timed_dialogue(production, story=None):
              for card in production.get("cards", {}).get("characters", [])}
     collective = {"en": "All", "ja": "みんな", "zh-CN": "所有人", "zh-TW": "所有人"}
     groups = []
+    voiceover_speaker = default_voiceover_speaker(production)
     for index, group in enumerate(timed_clip_groups(story), 1):
         lines, source_lines, requires_translation = [], [], False
-        parsed = script_dialogue(group["text"])
+        parsed = script_dialogue(group["text"], voiceover_speaker)
         for line in parsed:
             speaker = line["speaker"]
             if collective_speaker(speaker):
@@ -961,7 +1029,7 @@ def locked_timed_dialogue(production, story=None):
                         speaker = prefixed[0]
             row = {"speaker": speaker, "text": line["text"],
                    "language": PRODUCTION_LANGUAGES[production["language"]],
-                   "voiceover": False}
+                   "voiceover": bool(line.get("voiceover", False))}
             source_lines.append(copy.deepcopy(row))
             if _dialogue_already_matches_language(line["text"], production["language"]):
                 lines.append(copy.deepcopy(row))
@@ -971,7 +1039,7 @@ def locked_timed_dialogue(production, story=None):
                        "end_seconds": group["end"], "dialogue": lines,
                        "source_dialogue": source_lines,
                        "requires_translation": requires_translation,
-                       "dialogue_parse_failed": bool(_dialogue_signal_count(group["text"]) and not parsed)})
+                       "dialogue_parse_failed": _dialogue_signal_count(group["text"]) > len(parsed)})
     return groups
 
 
@@ -994,6 +1062,15 @@ def _source_blocks(text):
         marker = _speaker_marker(row)
         if marker and not editorial_speaker_label(marker[0]):
             inline = _strip_script_markdown(marker[1])
+            is_voiceover, _owner = _voiceover_cue_speaker(marker[0])
+            if is_voiceover and not inline:
+                end = index + 1
+                while end < len(rows) and rows[end].lstrip().startswith(">"):
+                    end += 1
+                if end > index + 1:
+                    blocks.append("\n".join(rows[index:end]))
+                    index = end
+                    continue
             if not inline and index + 1 < len(rows):
                 following = _strip_script_markdown(rows[index + 1])
                 if following and following[0] in _DIALOGUE_OPENERS:
@@ -1005,7 +1082,7 @@ def _source_blocks(text):
     return blocks
 
 
-def source_manifest_for_text(text, chunk_index=1):
+def source_manifest_for_text(text, chunk_index=1, voiceover_speaker=None):
     """Build stable source IDs used by planning, UI review and render admission."""
     prefix = f"C{int(chunk_index):02d}"
     scenes, paragraphs, dialogue, events = [], [], [], []
@@ -1024,14 +1101,15 @@ def source_manifest_for_text(text, chunk_index=1):
             else:
                 scenes[0]["title"] = clean[:240]
         paragraph_id = f"{prefix}-P{len(paragraphs) + 1:03d}"
-        parsed = script_dialogue(block)
+        parsed = script_dialogue(block, voiceover_speaker)
         paragraphs.append({"id": paragraph_id, "scene_id": current_scene,
                            "kind": "heading" if heading else "dialogue" if parsed else "action",
                            "text": block[:2000]})
         for line in parsed:
             dialogue.append({"id": f"{prefix}-D{len(dialogue) + 1:03d}",
                              "scene_id": current_scene, "paragraph_id": paragraph_id,
-                             "speaker": line["speaker"], "text": line["text"]})
+                             "speaker": line["speaker"], "text": line["text"],
+                             "voiceover": bool(line.get("voiceover", False))})
         if not heading and not parsed:
             events.append({"id": f"{prefix}-E{len(events) + 1:03d}",
                            "scene_id": current_scene, "paragraph_id": paragraph_id,
@@ -1046,15 +1124,17 @@ def production_source_manifest(production, story=None):
     timed = timed_clip_groups(story)
     pieces = ([timed_group_story(group) for group in timed]
               if timed else storyboard_planning_chunks(story))
-    chunks = [source_manifest_for_text(piece, index + 1) for index, piece in enumerate(pieces)]
+    voiceover_speaker = default_voiceover_speaker(production)
+    chunks = [source_manifest_for_text(piece, index + 1, voiceover_speaker)
+              for index, piece in enumerate(pieces)]
     return {"version": STORY_CONTRACT_VERSION, "story_hash": _hash(story), "chunks": chunks}
 
 
-def timed_batch_source_manifest(groups, start_index):
+def timed_batch_source_manifest(groups, start_index, voiceover_speaker=None):
     """Return one flattened prompt manifest with globally stable chunk IDs."""
     start = max(1, int(start_index))
     chunks = [
-        source_manifest_for_text(timed_group_story(group), start + offset)
+        source_manifest_for_text(timed_group_story(group), start + offset, voiceover_speaker)
         for offset, group in enumerate(groups)
     ]
     return {
@@ -3342,7 +3422,7 @@ def _compact_fallback_field(value, limit):
     return result[:limit]
 
 
-def fallback_segments(story, target_seconds=None, language="zh-CN"):
+def fallback_segments(story, target_seconds=None, language="zh-CN", voiceover_speaker=None):
     """Safe offline split when the selected local model is unavailable."""
     timed_groups = timed_clip_groups(story)
     if timed_groups:
@@ -3353,8 +3433,9 @@ def fallback_segments(story, target_seconds=None, language="zh-CN"):
             # authored dialogue. Preserve source words and let the warning/UI
             # make the unavailable translation explicit.
             dialogue = [{"speaker": line["speaker"], "text": line["text"],
-                          "language": language_name, "voiceover": False}
-                        for line in script_dialogue(group["text"])]
+                          "language": language_name,
+                          "voiceover": bool(line.get("voiceover", False))}
+                        for line in script_dialogue(group["text"], voiceover_speaker)]
             compact = _compact_fallback_field(group["text"], 3000)
             result.append({
                 "title": f"片段 {index + 1}", "story": compact, "setting": "",
@@ -3970,7 +4051,7 @@ def _repair_unambiguous_timed_source_refs(groups, manifest, expected, cleaned):
 
 
 def validate_planned_timed_batch_source_contract(groups, start_index, planned,
-                                                   language="en"):
+                                                   language="en", voiceover_speaker=None):
     """Validate and fit a multi-timecode response without weakening locks.
 
     Each returned clip must belong to exactly one authored timing group.  The
@@ -3985,7 +4066,7 @@ def validate_planned_timed_batch_source_contract(groups, start_index, planned,
     end = start + len(groups) - 1
     if not isinstance(planned, list) or not planned:
         raise ValueError(f"Storyboard timed batch {start}-{end} returned no clips.")
-    manifest = timed_batch_source_manifest(groups, start)
+    manifest = timed_batch_source_manifest(groups, start, voiceover_speaker)
     cleaned = []
     for index, segment in enumerate(planned):
         if not isinstance(segment, dict):
@@ -5612,7 +5693,8 @@ class ProductionManager:
                 if card and not reflected_speaker_label(speaker):
                     speaker = card["name"]
                 exact.append({"speaker": speaker, "text": row["text"],
-                              "language": PRODUCTION_LANGUAGES[current["language"]], "voiceover": False})
+                              "language": PRODUCTION_LANGUAGES[current["language"]],
+                              "voiceover": bool(row.get("voiceover", False))})
                 requires_translation = requires_translation or not _dialogue_already_matches_language(
                     row["text"], current["language"])
             if not requires_translation or planner != "local_ai":
