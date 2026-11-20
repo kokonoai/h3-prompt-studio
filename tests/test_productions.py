@@ -1330,6 +1330,119 @@ Her hand turns the plant toward the light.
         validate_planned_timed_batch_source_contract(groups, 2, [unknown], "en")
 
 
+def test_split_timed_group_repairs_only_ordered_suffix_truncation():
+    screenplay = """### S04｜00:21.250–00:32.500｜Reassurance and cup insert
+
+Yuki begins the reassurance.
+
+She completes the first sentence.
+
+Yuki continues with a second sentence.
+
+Her hand reaches the cup.
+
+She pushes the cup toward the listener.
+
+Her hand releases the cup.
+"""
+    groups = timed_clip_groups(screenplay)
+    assert len(groups) == 1
+    manifest = timed_batch_source_manifest(groups, 4)
+    expected_paragraphs = [row["id"] for row in manifest["paragraphs"]]
+    assert len(expected_paragraphs) >= 6
+
+    def child(title, paragraph_ids):
+        clip = _planned_clip(title, [], {
+            key: [] for key in
+            ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
+        })
+        clip["duration"] = 6
+        paragraph_set = set(paragraph_ids)
+        clip["source_refs"] = {
+            "scene_ids": [manifest["scenes"][0]["id"]],
+            "paragraph_ids": paragraph_ids,
+            "dialogue_ids": [row["id"] for row in manifest["dialogue"]
+                             if row.get("paragraph_id") in paragraph_set],
+            "event_ids": [row["id"] for row in manifest["events"]
+                          if row.get("paragraph_id") in paragraph_set],
+        }
+        return clip
+
+    cut = len(expected_paragraphs) // 2
+    first = child("Reassurance", expected_paragraphs[:cut])
+    second = child("Cup insert", expected_paragraphs[cut:-2])
+    repaired = validate_planned_timed_batch_source_contract(
+        groups, 4, [first, second], "en")
+
+    assert repaired[0]["source_refs"]["paragraph_ids"] == expected_paragraphs[:cut]
+    assert repaired[1]["source_refs"]["paragraph_ids"] == expected_paragraphs[cut:]
+    assert [ident for clip in repaired for ident in clip["source_refs"]["event_ids"]] == [
+        row["id"] for row in manifest["events"]]
+
+    internal_gap = copy.deepcopy(second)
+    internal_gap["source_refs"]["paragraph_ids"] = expected_paragraphs[cut:cut + 1] + expected_paragraphs[cut + 2:]
+    internal_set = set(internal_gap["source_refs"]["paragraph_ids"])
+    internal_gap["source_refs"]["event_ids"] = [
+        row["id"] for row in manifest["events"]
+        if row.get("paragraph_id") in internal_set]
+    with pytest.raises(ValueError, match="missing paragraph_ids"):
+        validate_planned_timed_batch_source_contract(
+            groups, 4, [copy.deepcopy(first), internal_gap], "en")
+
+
+def test_fractional_timed_group_subdivision_uses_renderable_integer_duration(tmp_path):
+    screenplay = """### S01｜00:00–00:11.250｜Reassurance and cup insert
+
+Yuki begins the reassurance.
+
+She completes the first sentence.
+
+Her hand reaches the cup.
+
+She pushes the cup toward the listener.
+"""
+    groups = timed_clip_groups(screenplay)
+    manifest = timed_batch_source_manifest(groups, 1)
+    paragraph_ids = [row["id"] for row in manifest["paragraphs"]]
+    cut = len(paragraph_ids) // 2
+
+    def child(title, owned_paragraphs):
+        clip = _planned_clip(title, [], {
+            key: [] for key in
+            ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
+        })
+        clip["duration"] = 6
+        paragraph_set = set(owned_paragraphs)
+        clip["source_refs"] = {
+            "scene_ids": [manifest["scenes"][0]["id"]],
+            "paragraph_ids": owned_paragraphs,
+            "dialogue_ids": [row["id"] for row in manifest["dialogue"]
+                             if row.get("paragraph_id") in paragraph_set],
+            "event_ids": [row["id"] for row in manifest["events"]
+                          if row.get("paragraph_id") in paragraph_set],
+        }
+        return clip
+
+    planned = validate_planned_timed_batch_source_contract(groups, 1, [
+        child("Reassurance", paragraph_ids[:cut]),
+        child("Cup insert", paragraph_ids[cut:]),
+    ], "en")
+    planned_durations = [clip["duration"] for clip in planned]
+    assert sum(planned_durations) == 11
+    assert all(5 <= duration <= 15 for duration in planned_durations)
+    assert [clip["_source_timed_group"] for clip in planned] == [1, 1]
+
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": .5, "language": "en",
+    })
+    production = manager.apply_plan(production["id"], planned, "local_ai")
+
+    assert [segment["duration"] for segment in production["segments"]] == planned_durations
+    assert sum(segment["duration"] for segment in production["segments"]) == 11
+
+
 def test_storyboard_output_budget_never_exceeds_local_client_limit():
     assert storyboard_output_token_budget(1) == 3100
     assert storyboard_output_token_budget(2) == 4096

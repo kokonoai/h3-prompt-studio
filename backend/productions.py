@@ -3898,6 +3898,77 @@ def validate_planned_chunk_source_contract(story, chunk_index, planned,
     return planned
 
 
+def _repair_unambiguous_timed_source_refs(groups, manifest, expected, cleaned):
+    """Repair only deterministic source-ID truncation inside one timing group.
+
+    Local structured-output models sometimes stop an otherwise ordered ID
+    array early. A one-group response has no cross-group ownership ambiguity.
+    For multiple child clips we still require an ordered paragraph anchor in
+    every child and repair only a missing prefix or suffix; an internal gap,
+    unknown ID, duplicate or reorder remains a hard coverage error.
+    """
+    if len(groups) != 1 or not cleaned:
+        return
+    known = {key: set(values) for key, values in expected.items()}
+    for segment in cleaned:
+        refs = segment["source_refs"]
+        if any(not set(refs[key]).issubset(known[key]) for key in SOURCE_REF_KEYS):
+            return
+    for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
+        actual = [ident for segment in cleaned for ident in segment["source_refs"][key]]
+        if len(actual) != len(set(actual)):
+            return
+
+    if len(cleaned) == 1:
+        cleaned[0]["source_refs"] = {
+            key: list(values) for key, values in expected.items()
+        }
+        return
+
+    paragraph_order = expected["paragraph_ids"]
+    paragraph_position = {ident: index for index, ident in enumerate(paragraph_order)}
+    anchored = [segment["source_refs"]["paragraph_ids"] for segment in cleaned]
+    if not paragraph_order or any(not values for values in anchored):
+        return
+    actual_positions = [paragraph_position[ident] for values in anchored for ident in values]
+    if actual_positions != sorted(actual_positions):
+        return
+    owners = {
+        paragraph_position[ident]: owner
+        for owner, values in enumerate(anchored)
+        for ident in values
+    }
+    known_positions = sorted(owners)
+    if not known_positions or owners[known_positions[0]] != 0 or owners[known_positions[-1]] != len(cleaned) - 1:
+        return
+    first, last = known_positions[0], known_positions[-1]
+    if any(position not in owners for position in range(first, last + 1)):
+        return
+    for position in range(0, first):
+        owners[position] = 0
+    for position in range(last + 1, len(paragraph_order)):
+        owners[position] = len(cleaned) - 1
+    if len(owners) != len(paragraph_order):
+        return
+
+    paragraph_rows = {row["id"]: row for row in manifest["paragraphs"]}
+    for owner, segment in enumerate(cleaned):
+        paragraph_ids = [ident for position, ident in enumerate(paragraph_order)
+                         if owners[position] == owner]
+        paragraph_set = set(paragraph_ids)
+        scene_ids = list(dict.fromkeys(
+            paragraph_rows[ident]["scene_id"] for ident in paragraph_ids
+            if ident in paragraph_rows and paragraph_rows[ident].get("scene_id")))
+        segment["source_refs"] = {
+            "scene_ids": scene_ids,
+            "paragraph_ids": paragraph_ids,
+            "dialogue_ids": [row["id"] for row in manifest["dialogue"]
+                             if row.get("paragraph_id") in paragraph_set],
+            "event_ids": [row["id"] for row in manifest["events"]
+                          if row.get("paragraph_id") in paragraph_set],
+        }
+
+
 def validate_planned_timed_batch_source_contract(groups, start_index, planned,
                                                    language="en"):
     """Validate and fit a multi-timecode response without weakening locks.
@@ -3934,19 +4005,7 @@ def validate_planned_timed_batch_source_contract(groups, start_index, planned,
                           ("dialogue_ids", "dialogue"),
                           ("event_ids", "events"))
     }
-    if len(groups) == 1 and len(cleaned) == 1:
-        # A single returned clip for one authored timing group has exactly one
-        # possible source owner. Small local models often copy the first few
-        # manifest IDs correctly and then truncate the remaining ID arrays,
-        # even though their story/action covers the complete group. Repair
-        # only this unambiguous metadata case. Any unknown ID still fails
-        # below, and multi-clip groups keep the strict ownership validator.
-        refs = cleaned[0]["source_refs"]
-        known = {key: set(values) for key, values in expected.items()}
-        if all(set(refs[key]).issubset(known[key]) for key in SOURCE_REF_KEYS):
-            cleaned[0]["source_refs"] = {
-                key: list(values) for key, values in expected.items()
-            }
+    _repair_unambiguous_timed_source_refs(groups, manifest, expected, cleaned)
     for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
         actual = [ident for segment in cleaned for ident in segment["source_refs"][key]]
         missing = [ident for ident in expected[key] if ident not in actual]
@@ -5426,6 +5485,16 @@ class ProductionManager:
 
         def planned_children_by_locked_group():
             """Map AI subdivisions back to each authored timing block."""
+            def generated_seconds(locked):
+                # H3 render durations are whole seconds. Fractional authored
+                # timecodes remain preserved as source metadata, while the
+                # per-group planner deliberately fits their child clips to the
+                # nearest renderable second. Compare against that same value
+                # here instead of rejecting 11 generated seconds for an
+                # authored 11.25-second block.
+                return int(round(
+                    locked["end_seconds"] - locked["start_seconds"]))
+
             if len(locked_groups) == len(planned):
                 return [[item] for item in planned]
             markers = [item.get("_source_timed_group") for item in planned]
@@ -5439,8 +5508,7 @@ class ProductionManager:
                     while cursor < len(planned) and markers[cursor] == group_index:
                         children.append(planned[cursor])
                         cursor += 1
-                    if not children or sum(item["duration"] for item in children) != (
-                            locked["end_seconds"] - locked["start_seconds"]):
+                    if not children or sum(item["duration"] for item in children) != generated_seconds(locked):
                         raise ValueError(
                             "A subdivided plan no longer covers its authored timing block exactly.")
                     grouped.append(children)
@@ -5453,7 +5521,7 @@ class ProductionManager:
             # ordered parent block without relying on model prose.
             grouped, cursor = [], 0
             for locked in locked_groups:
-                required = locked["end_seconds"] - locked["start_seconds"]
+                required = generated_seconds(locked)
                 children, covered = [], 0
                 while cursor < len(planned) and covered < required:
                     children.append(planned[cursor])
