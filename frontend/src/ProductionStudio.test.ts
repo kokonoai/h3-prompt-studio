@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fullRunPreparationComplete, productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionNeedsEpisodeContinuation, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
+import { fullRunPreparationComplete, productionAspectRatioDefault, productionAutomationDetailText, productionAutomationSnapshot, productionDialogueExport, productionKeyframeSize, productionNeedsEpisodeContinuation, productionOutputPreviewTake, productionStoryExport, qualityAcceptanceTargets, qualityReviewTargets, segmentHasCompletedVideo, segmentNeedsVideoPrompt, selectedClipTargets, timeoutRecoveryKind, videoPromptTargets, videoRenderTargets } from "./ProductionStudio";
 
 const production:any={
   title:"Library",language:"ja",brief:"Source story",character_bible:"A remains A.",
@@ -24,6 +24,13 @@ describe("production text exports",()=>{
     expect(text).toContain("プロジェクト言語：日本語");
     expect(text).toContain("[01.1] A：こんにちは。");
     expect(text).toContain("[01.2] B（画外音）：待って。");
+  });
+});
+
+describe("new production video shape",()=>{
+  it("uses the current valid project ratio and safely falls back for unknown values",()=>{
+    expect(productionAspectRatioDefault({aspect_ratio:"9:16"})).toBe("9:16");
+    expect(productionAspectRatioDefault({aspect_ratio:"cinemascope"})).toBe("16:9");
   });
 });
 

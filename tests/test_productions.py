@@ -134,6 +134,19 @@ def test_new_non_reference_production_uses_safe_default_video_recipe(tmp_path):
     assert production["video_steps"] == "auto"
 
 
+def test_new_production_preserves_the_selected_video_aspect_ratio(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+
+    production = manager.create({
+        "source_project": source,
+        "brief": "A vertical-format scene.",
+        "video_aspect_ratio": "9:16",
+    })
+
+    assert production["video_aspect_ratio"] == "9:16"
+    assert manager.get(production["id"])["video_aspect_ratio"] == "9:16"
+
+
 def test_production_list_reads_lightweight_summaries_without_full_validation(tmp_path):
     manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
     first = manager.create({"source_project": source, "title": "First", "brief": ""})
