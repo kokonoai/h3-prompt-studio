@@ -1291,6 +1291,45 @@ C closes the window."""
         validate_planned_timed_batch_source_contract(groups, 5, unbound, "en")
 
 
+def test_single_timed_clip_repairs_truncated_source_id_arrays_without_guessing():
+    screenplay = """### S02｜00:05.250–00:13.250｜Acceptance and plant insert
+
+Yuki continues her thought.
+
+She finishes the exact sentence.
+
+Her hand turns the plant toward the light.
+"""
+    groups = timed_clip_groups(screenplay)
+    assert len(groups) == 1
+    manifest = timed_batch_source_manifest(groups, 2)
+    expected = {
+        key: [row["id"] for row in manifest[kind]]
+        for key, kind in (("scene_ids", "scenes"),
+                          ("paragraph_ids", "paragraphs"),
+                          ("dialogue_ids", "dialogue"),
+                          ("event_ids", "events"))
+    }
+    clip = _planned_clip("Acceptance", [], {
+        key: [] for key in
+        ("visible_start", "visible_end", "enters", "exits", "offscreen", "mentioned_only")
+    })
+    clip["duration"] = 8
+    clip["source_refs"] = {
+        key: values[:1] for key, values in expected.items()
+    }
+
+    repaired = validate_planned_timed_batch_source_contract(groups, 2, [clip], "en")
+
+    assert repaired[0]["source_refs"] == expected
+    assert repaired[0]["_source_timed_group"] == 2
+
+    unknown = copy.deepcopy(clip)
+    unknown["source_refs"]["paragraph_ids"] = ["C99-P999"]
+    with pytest.raises(ValueError, match="unknown paragraph_ids"):
+        validate_planned_timed_batch_source_contract(groups, 2, [unknown], "en")
+
+
 def test_storyboard_output_budget_never_exceeds_local_client_limit():
     assert storyboard_output_token_budget(1) == 3100
     assert storyboard_output_token_budget(2) == 4096

@@ -3934,6 +3934,19 @@ def validate_planned_timed_batch_source_contract(groups, start_index, planned,
                           ("dialogue_ids", "dialogue"),
                           ("event_ids", "events"))
     }
+    if len(groups) == 1 and len(cleaned) == 1:
+        # A single returned clip for one authored timing group has exactly one
+        # possible source owner. Small local models often copy the first few
+        # manifest IDs correctly and then truncate the remaining ID arrays,
+        # even though their story/action covers the complete group. Repair
+        # only this unambiguous metadata case. Any unknown ID still fails
+        # below, and multi-clip groups keep the strict ownership validator.
+        refs = cleaned[0]["source_refs"]
+        known = {key: set(values) for key, values in expected.items()}
+        if all(set(refs[key]).issubset(known[key]) for key in SOURCE_REF_KEYS):
+            cleaned[0]["source_refs"] = {
+                key: list(values) for key, values in expected.items()
+            }
     for key in ("paragraph_ids", "dialogue_ids", "event_ids"):
         actual = [ident for segment in cleaned for ident in segment["source_refs"][key]]
         missing = [ident for ident in expected[key] if ident not in actual]
