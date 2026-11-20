@@ -969,6 +969,89 @@ B closes the gate while A waits.
     assert all("Production note" not in clip["story"] for clip in clips)
 
 
+def test_fractional_s_and_b_shot_timecodes_merge_short_inserts_and_extend_target(tmp_path):
+    screenplay = """# A Place to Grow
+
+### S01｜00:00–00:05.250｜Opening
+Yuki begins speaking.
+
+### S02｜00:05.250–00:11.750｜Acceptance
+Yuki continues her thought.
+
+### B1｜00:11.750–00:13.250｜Plant insert
+Yuki turns the plant without dialogue.
+
+### S03｜00:13.250–00:19.750｜Freedom
+Yuki resumes speaking.
+
+### B2｜00:19.750–00:21.250｜Window insert
+Yuki opens the window without dialogue.
+
+### S04｜00:21.250–00:25.750｜Reassurance
+Yuki reassures the listener.
+
+### S05｜00:25.750–00:30.750｜Worth
+Yuki continues speaking.
+
+### B3｜00:30.750–00:32.500｜Cup insert
+Yuki pushes the cup without dialogue.
+
+### S06｜00:32.500–00:37.500｜No transaction
+Yuki speaks calmly.
+
+### S07｜00:37.500–00:42.750｜Enjoying love
+Yuki smiles after speaking.
+
+### S08｜00:42.750–00:47.250｜Love inside
+Yuki continues.
+
+### S09｜00:47.250–00:52.500｜Room to grow
+Yuki looks toward the listener.
+
+### S10｜00:52.500–00:57.750｜Discovery
+Yuki names the feeling.
+
+### S11｜00:57.750–01:02.750｜Confirmation
+Yuki repeats the thought.
+
+### S12｜01:02.750–01:10.000｜Final line
+Yuki finishes and holds her gaze.
+"""
+    beats = timed_story_beats(screenplay)
+    groups = timed_clip_groups(screenplay)
+
+    assert len(beats) == 15
+    assert beats[0]["end"] == 5.25
+    assert beats[2]["duration"] == 1.5
+    assert len(groups) == 10
+    assert sum(group["duration"] for group in groups) == 70
+    assert all(5 <= group["duration"] <= 15 for group in groups)
+    assert timed_group_story(groups[1]).startswith("0:05.25-0:13.25\n")
+
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": 1.1, "language": "en",
+    })
+    timing = episode_timing_targets(production)
+    assert timing["episode_target_seconds"] == 70
+    assert timing["source_timed_beat_count"] == 15
+    assert timing["recommended_clip_count"] == 10
+    schema = production_schema_for_story(screenplay)["properties"]["segments"]
+    assert schema["minItems"] == 10
+    assert schema["maxItems"] == 11
+
+    planned = [{
+        "duration": 10, "action": f"Yuki completes grouped beat {index + 1}.",
+        "dialogue": [],
+    } for index in range(len(groups))]
+    fitted = fit_planned_durations(
+        planned, timing["episode_target_seconds"], "en", screenplay)
+    assert sum(item["duration"] for item in fitted) == 70
+    assert all(isinstance(item["duration"], int) for item in fitted)
+    assert all(5 <= item["duration"] <= 15 for item in fitted)
+
+
 def test_shot_timecode_body_excludes_next_part_metadata():
     screenplay = """## Part 2: Sent Across the Distance
 

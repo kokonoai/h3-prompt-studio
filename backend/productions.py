@@ -562,17 +562,21 @@ def current_episode_story(production):
 
 _TIMECODE_RANGE = re.compile(
     r"(?m)^[ \t]*(?P<start_min>\d{1,3}):(?P<start_sec>[0-5]\d)[ \t]*"
-    r"[-–—~～][ \t]*(?P<end_min>\d{1,3}):(?P<end_sec>[0-5]\d)[ \t]*$"
+    r"(?P<start_fraction>\.\d{1,3})?[ \t]*"
+    r"[-–—~～][ \t]*(?P<end_min>\d{1,3}):(?P<end_sec>[0-5]\d)"
+    r"(?P<end_fraction>\.\d{1,3})?[ \t]*$"
 )
 
 # Prefer time ranges attached to explicit shot headings when they exist. A
 # screenplay often also contains broader act/section ranges; treating those as
 # shots pulls the preamble, cast list and production notes into the first clip.
 _SHOT_TIMECODE_RANGE = re.compile(
-    r"(?im)^[ \t]*(?:[*#]+[ \t]*)?(?:分镜|分鏡|镜头|鏡頭|shot)[ \t]*"
-    r"[A-Za-z0-9一二三四五六七八九十._-]*[ \t]*(?:[|｜:：][ \t]*)?"
-    r"(?P<start_min>\d{1,3}):(?P<start_sec>[0-5]\d)[ \t]*"
-    r"[-–—~～][ \t]*(?P<end_min>\d{1,3}):(?P<end_sec>[0-5]\d)[^\r\n]*$"
+    r"(?im)^[ \t]*(?:[*#]+[ \t]*)?(?:(?:分镜|分鏡|镜头|鏡頭|shot|ショット)[ \t]*"
+    r"[A-Za-z0-9一二三四五六七八九十._-]*|(?:S|B)[ \t]*\d{1,3}[A-Za-z]?)[ \t]*"
+    r"(?:[|｜:：][ \t]*)?(?P<start_min>\d{1,3}):(?P<start_sec>[0-5]\d)"
+    r"(?P<start_fraction>\.\d{1,3})?[ \t]*"
+    r"[-–—~～][ \t]*(?P<end_min>\d{1,3}):(?P<end_sec>[0-5]\d)"
+    r"(?P<end_fraction>\.\d{1,3})?[^\r\n]*$"
 )
 
 
@@ -617,8 +621,12 @@ def timed_story_beats(story):
     beats = []
     previous_end = -1
     for index, match in enumerate(matches):
-        start = int(match.group("start_min")) * 60 + int(match.group("start_sec"))
-        end = int(match.group("end_min")) * 60 + int(match.group("end_sec"))
+        start = _timecode_seconds(
+            match.group("start_min"), match.group("start_sec"),
+            match.groupdict().get("start_fraction"))
+        end = _timecode_seconds(
+            match.group("end_min"), match.group("end_sec"),
+            match.groupdict().get("end_fraction"))
         if end <= start or start < previous_end:
             return []
         text_end = matches[index + 1].start() if index + 1 < len(matches) else len(story)
@@ -632,6 +640,25 @@ def timed_story_beats(story):
         beats.append({"start": start, "end": end, "duration": end - start, "text": body})
         previous_end = end
     return beats
+
+
+def _timecode_seconds(minutes, seconds, fraction=None):
+    """Return a stable numeric second value for integer or millisecond timecodes."""
+    value = int(minutes) * 60 + int(seconds) + float(fraction or 0)
+    value = round(value, 3)
+    return int(value) if value.is_integer() else value
+
+
+def _format_timecode(seconds):
+    """Keep authored fractional boundaries when rebuilding a planner source block."""
+    value = round(float(seconds), 3)
+    minutes = int(value // 60)
+    remainder = value - minutes * 60
+    if remainder.is_integer():
+        rendered = f"{int(remainder):02d}"
+    else:
+        rendered = f"{remainder:06.3f}".rstrip("0").rstrip(".")
+    return f"{minutes}:{rendered}"
 
 
 def timed_clip_groups(story):
@@ -676,9 +703,9 @@ def timed_group_story(group):
     a time.  Keeping the header is essential: it lets the per-call schema,
     timing payload and locked-dialogue roster describe the same source block.
     """
-    start = int(group["start"])
-    end = int(group["end"])
-    return (f"{start // 60}:{start % 60:02d}-{end // 60}:{end % 60:02d}\n"
+    start = _format_timecode(group["start"])
+    end = _format_timecode(group["end"])
+    return (f"{start}-{end}\n"
             f"{str(group['text']).strip()}")
 
 
@@ -1176,7 +1203,8 @@ def production_schema_for_story(story):
         items["minItems"] = count
         items["maxItems"] = min(
             MAX_SEGMENTS,
-            sum(max(1, group["duration"] // PLANNED_MIN_SECONDS) for group in groups),
+            sum(max(1, math.floor(group["duration"] / PLANNED_MIN_SECONDS))
+                for group in groups),
         )
     return schema
 
@@ -1223,8 +1251,13 @@ def episode_timing_targets(production, chunk_index=1, chunk_total=1, story=None)
     # 12-second authored block into an unrelated nominal 10-second request.
     if timed_groups:
         part = sum(group["duration"] for group in timed_groups)
+        if chunk_total == 1:
+            # Authored timecodes are editorial authority. Never force a
+            # shorter project setting to compress or reject their complete
+            # span; H3 still rounds the final generated clips to whole seconds.
+            whole = max(whole, math.ceil(part))
         minimum = max(1, math.ceil(part / MAX_SECONDS))
-        maximum = max(minimum, part // PLANNED_MIN_SECONDS)
+        maximum = max(minimum, math.floor(part / PLANNED_MIN_SECONDS))
     recommended = recommended_clip_count(part)
     if timed_groups and minimum <= len(timed_groups) <= min(maximum, MAX_SEGMENTS):
         recommended = len(timed_groups)
@@ -3180,7 +3213,8 @@ def fit_planned_durations(segments, target_seconds, language="en", source_story=
         minimum = len(timed_groups)
         maximum = min(
             MAX_SEGMENTS,
-            sum(max(1, group["duration"] // PLANNED_MIN_SECONDS) for group in timed_groups),
+            sum(max(1, math.floor(group["duration"] / PLANNED_MIN_SECONDS))
+                for group in timed_groups),
         )
         if not minimum <= count <= maximum:
             raise ValueError(
@@ -3188,11 +3222,13 @@ def fit_planned_durations(segments, target_seconds, language="en", source_story=
                 f"safe subdivision permits {minimum}-{maximum} clips.")
     if not count or target < count * PLANNED_MIN_SECONDS or target > count * MAX_SECONDS:
         raise ValueError(
-            f"The planned clip count cannot cover the {target}-second episode target with 5-15 second clips.")
+            f"The planner returned {count} clips, which cannot cover the {target}-second episode target "
+            "with 5-15 second clips.")
     original = [int(item["duration"]) for item in result]
     if timed_groups and len(timed_groups) == count:
         preferred = [group["duration"] for group in timed_groups]
-        durations = [min(MAX_SECONDS, max(PLANNED_MIN_SECONDS, value)) for value in preferred]
+        durations = [int(round(min(MAX_SECONDS, max(PLANNED_MIN_SECONDS, value))))
+                     for value in preferred]
     elif timed_groups:
         # A timed parent block may be split into several generation clips, but
         # its authored start/end remains exact.  Dialogue estimates help an
