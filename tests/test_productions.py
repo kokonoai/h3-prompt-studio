@@ -17,7 +17,8 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  character_presence_roles,
                                  continuity_visual_lock, device_screen_geometry_lock,
                                  dialogue_minimum_seconds,
-                                 effective_temporal_cast_lock, inscribed_prop_continuity_lock,
+                                 effective_cast_timeline, effective_temporal_cast_lock,
+                                 inscribed_prop_continuity_lock,
                                  episode_planning_payload, episode_timing_targets,
                                  fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
@@ -333,6 +334,68 @@ def test_local_ai_visible_action_recovers_omitted_character_but_keeps_voice_offs
     assert roles[cj["id"]] == "physical"
     assert roles[rick["id"]] == "offscreen"
     assert roles[creature["id"]] == "physical"
+
+
+@pytest.mark.parametrize("action", [
+    "Yuki gently rotates the potted plant toward the window.",
+    "Yuki uses both hands to calmly slide a steaming cup across the table.",
+    "Yuki is seen looking at the new leaf beside the window.",
+])
+def test_visual_prose_repairs_false_offscreen_performer(action):
+    yuki = _card("Yuki")
+    production = {
+        "brief": "Yuki learns to care for herself.",
+        "cards": {**{kind: [] for kind in CARD_KINDS}, "characters": [yuki]},
+    }
+    segment = {
+        "title": "A Place to Grow", "story": "Yuki accepts the moment.",
+        "setting": "Yuki's apartment beside a sunlit window.",
+        "action": action, "ending": "Yuki remains beside the plant.",
+        "image_prompt": "Yuki, with a peach-pink bob and mint sweatshirt, in the room.",
+        "dialogue": [{"speaker": "Yuki", "text": "I can let it grow.", "voiceover": True}],
+        "card_selection": {"characters": ["Yuki"]},
+        "cast_timeline": {"visible_start": [], "visible_end": [], "enters": [], "exits": [],
+                          "offscreen": ["Yuki"], "mentioned_only": []},
+    }
+
+    roles = character_presence_roles(production, segment)
+    timeline = effective_cast_timeline(production, segment, roles)
+
+    assert roles[yuki["id"]] == "physical"
+    assert timeline["visible_start"] == ["Yuki"]
+    assert timeline["visible_end"] == ["Yuki"]
+    assert timeline["offscreen"] == []
+
+
+def test_false_offscreen_performer_keeps_identity_image_when_materialised(tmp_path):
+    manager, source, _projects, _assets, store_asset = _rig(tmp_path)
+    identity = _image(store_asset, "Yuki", "pink")
+    yuki = _card("Yuki", [identity["id"]])
+    production = manager.create({
+        "source_project": source, "brief": "Yuki rotates a plant.", "language": "en"})
+    production["cards"]["characters"] = [yuki]
+    manager.save(production)
+    production = manager.apply_plan(production["id"], [{
+        "title": "Accepting Imperfection", "story": "Yuki accepts the imperfect leaf.",
+        "setting": "Yuki's apartment beside a sunlit window.",
+        "action": "Yuki gently rotates the potted plant toward the window.",
+        "ending": "Yuki remains beside the plant.", "duration": 5,
+        "duration_reason": "one visual action",
+        "image_prompt": "Yuki, peach-pink bob and mint sweatshirt, beside the plant.",
+        "dialogue": [{"speaker": "Yuki", "text": "It can still grow.",
+                      "language": "English", "voiceover": True}],
+        "card_selection": {"characters": ["Yuki"]},
+        "cast_timeline": {"visible_start": [], "visible_end": [], "enters": [], "exits": [],
+                          "offscreen": ["Yuki"], "mentioned_only": []},
+    }], "local_ai")
+
+    project = manager.materialise(production["id"], production["segments"][0]["id"])["project"]
+    subject = next(subject for subject in project["subjects"] if subject["name"] == "Yuki")
+    scene = project["shots"][0]
+
+    assert subject["asset_ids"]
+    assert subject["id"] in scene["visible_subject_ids"]
+    assert subject["id"] not in scene["offscreen_subject_ids"]
 
 
 def test_materialise_separates_local_actor_phone_actor_and_mentioned_recipient(tmp_path):

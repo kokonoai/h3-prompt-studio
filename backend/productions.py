@@ -1966,6 +1966,10 @@ _PHYSICAL_ACTIONS = (
     r"smiles?|laughs?|cries?|opens?|closes?|picks?|places?|touches?|leans?|steps?|moves?|"
     r"enters?|exits?|records?|speaks?|says?|nods?|shakes?|raises?|lowers?|carries?|presses?|"
     r"taps?|watches?|gazes?|hesitates?|exhales?|faces?|reaches?|stops?|starts?|answers?|"
+    r"rotates?|slides?|uses?|extends?|pushes?|pulls?|lifts?|sets?|tilts?|gestures?|adjusts?|"
+    r"arranges?|handles?|grips?|receives?|gives?|offers?|pours?|drinks?|eats?|kneels?|"
+    r"crouches?|bends?|points?|waves?|folds?|unfolds?|wipes?|brushes?|hugs?|follows?|"
+    r"crosses?|pauses?|waits?|blinks?|breathes?|"
     r"站|坐|走|跑|游|拿|握|写|寫|读|讀|看|转|轉|笑|哭|打开|打開|关闭|關閉|捡|撿|放|"
     r"触|觸|靠|进入|進入|离开|離開|说|說|点头|點頭|摇头|搖頭|举|舉|按|凝视|凝視|"
     r"立つ|座る|歩く|走る|泳ぐ|持つ|書く|読む|見る|振り向く|笑う|泣く|開く|閉じる|"
@@ -2088,11 +2092,22 @@ def _physically_staged(aliases, text):
             token = _alias_pattern(alias)
             if re.search(
                     rf"(?:\b(?:close-up|medium shot|wide shot|camera|focus)\b.{{0,32}}\b(?:on|of|follows?)\b\s*)?"
-                    rf"{token}\s+(?:is\s+|slowly\s+|quietly\s+|softly\s+|then\s+|immediately\s+)*"
+                    rf"{token}\s+(?:(?:is|was|are|were)\s+|"
+                    rf"(?:slowly|quietly|softly|gently|carefully|calmly|deliberately|"
+                    rf"casually|then|immediately)\s+|(?:[A-Za-z][A-Za-z-]*ly)\s+){{0,4}}"
                     rf"(?:{_PHYSICAL_ACTIONS})\b",
                     context, re.IGNORECASE):
                 return True
-            if re.search(rf"{token}\s+(?:is\s+)?(?:clearly\s+)?visible\b", context, re.IGNORECASE):
+            # Storyboards frequently use passive visual prose ("Yuki is seen
+            # looking..." or "Yuki is framed beside the plant").  Requiring a
+            # finite action verb after the name misclassified those performers
+            # as voice-only and stripped their identity reference. Display,
+            # memory and reflection contexts were excluded above, so this cue
+            # cannot materialise a remote or reflected identity in the room.
+            if re.search(
+                    rf"{token}\s+(?:(?:is|was)\s+)?(?:clearly\s+)?"
+                    rf"(?:visible|seen|shown|depicted|framed|pictured)\b",
+                    context, re.IGNORECASE):
                 return True
             if re.search(rf"\b(?:close-up|medium shot|wide shot|camera|focus)\b.{{0,40}}\b(?:on|of|follows?)\b\s*{token}",
                          context, re.IGNORECASE):
@@ -2384,6 +2399,28 @@ def effective_cast_timeline(production, segment, roles=None):
         segment.get("cast_timeline"), segment.get("card_selection", {}).get("characters", []))
     physical = {key: [name for name in source[key] if role_for(name) == "physical"]
                 for key in ("visible_start", "visible_end", "enters", "exits")}
+    # A planner can label a performer as off-screen even when deterministic
+    # visual prose places that identity in the set. Filtering the bad bucket is
+    # insufficient: without promotion the materialised shot has no visible
+    # subject and `_apply_cards` omits the identity image. Recover each physical
+    # identity that is missing from every physical bucket. Both boundaries are
+    # the conservative one-setup fallback; an explicitly authored entrance or
+    # exit remains untouched because it already occupies a physical bucket.
+    physical_labels = {
+        str(name).strip().casefold()
+        for key in ("visible_start", "visible_end", "enters", "exits")
+        for name in physical[key]
+    }
+    for card in cards:
+        aliases = aliases_by_card.get(card.get("id"), set())
+        if roles.get(card.get("id")) != "physical" or aliases & physical_labels:
+            continue
+        name = str(card.get("name", "")).strip()
+        if not name:
+            continue
+        physical["visible_start"].append(name)
+        physical["visible_end"].append(name)
+        physical_labels.update(aliases)
     physical["offscreen"] = list(dict.fromkeys(
         [name for name in source["offscreen"] if role_for(name) == "offscreen"] +
         [card["name"] for card in cards if roles.get(card.get("id")) == "offscreen"]))
