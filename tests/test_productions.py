@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 from backend.compiler import compile_project
 from backend.comfy_transfer import FL_LORA
 from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, ProductionManager, _primary_character_view,
+                                 allocate_storyboard_piece_seconds,
                                  _segment_hash_with_empty_prop_state,
                                  audit_storyboard_contract,
                                  authored_internal_timing,
@@ -29,6 +30,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
                                  split_storyboard_source_chunk, split_truncated_card_chunk,
+                                 storyboard_part_timing,
                                  storyboard_timed_batches, timed_batch_source_manifest,
                                  timed_batch_story,
                                  storyboard_output_token_budget, temporal_cast_lock,
@@ -1207,6 +1209,33 @@ def test_thirty_second_episode_targets_about_three_five_to_fifteen_second_clips(
     assert len(clips) == 3
     assert sum(clip["duration"] for clip in clips) == 30
     assert all(5 <= clip["duration"] <= 15 for clip in clips)
+
+
+def test_untimed_planning_pieces_share_one_bounded_episode_clip_budget():
+    production = {
+        "episode_minutes": 1.12, "current_episode": 1, "language": "en",
+        "brief": "A" * 2821, "episodes": [],
+    }
+    pieces = ["A" * 1995, "B" * 826]
+    budgets = allocate_storyboard_piece_seconds(pieces, 67)
+    timings = [storyboard_part_timing(production, piece, budget)
+               for piece, budget in zip(pieces, budgets)]
+    schemas = [production_schema_for_story(piece, timing)["properties"]["segments"]
+               for piece, timing in zip(pieces, timings)]
+
+    assert budgets == [45, 22]
+    assert sum(budgets) == 67
+    assert [timing["recommended_clip_count"] for timing in timings] == [5, 2]
+    assert sum(schema["maxItems"] for schema in schemas) == 13
+    assert all(schema["minItems"] == timing["feasible_clip_count"]["minimum"]
+               and schema["maxItems"] == timing["feasible_clip_count"]["maximum"]
+               for schema, timing in zip(schemas, timings))
+
+    # Coverage retries divide the same parent budget instead of multiplying it.
+    children = [{"story": "A" * 1200}, {"story": "A" * 795}]
+    child_budgets = allocate_storyboard_piece_seconds(children, budgets[0])
+    assert sum(child_budgets) == budgets[0]
+    assert all(value >= 5 for value in child_budgets)
 
 
 def test_duration_fitting_gives_dense_exact_dialogue_more_of_fixed_episode_budget():

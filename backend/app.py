@@ -1069,9 +1069,11 @@ def production_cards_plan(production_id: str, body: dict):
 def production_plan(production_id: str, body: dict):
     from .productions import (PLANNER_SYSTEM, current_episode_story,
                               default_voiceover_speaker,
+                              allocate_storyboard_piece_seconds,
                               episode_timing_targets, fallback_segments, fit_planned_durations,
                               planning_payload, production_schema_for_story, storyboard_planning_chunks,
                               source_manifest_for_text, split_storyboard_source_chunk,
+                              storyboard_part_timing,
                               storyboard_timed_batches, timed_batch_source_manifest,
                               timed_batch_story,
                               storyboard_output_token_budget,
@@ -1202,12 +1204,17 @@ def production_plan(production_id: str, body: dict):
                     return segments
 
                 original_pieces = storyboard_planning_chunks(story)
+                episode_target = episode_timing_targets(
+                    production, story=story)['episode_target_seconds']
+                piece_targets = allocate_storyboard_piece_seconds(
+                    original_pieces, episode_target)
                 pieces = [{
                     'story': piece,
                     'chunk_index': index + 1,
                     'manifest': source_manifest_for_text(
                         piece, index + 1, voiceover_speaker),
                     'split_depth': 0,
+                    'target_seconds': piece_targets[index],
                 } for index, piece in enumerate(original_pieces)]
                 index = 0
                 while index < len(pieces):
@@ -1218,12 +1225,13 @@ def production_plan(production_id: str, body: dict):
                     RESOURCES.stage = (
                         f'Planning story part {chunk_index} '
                         f'({index + 1} of {len(pieces)} verified batches)')
+                    timing = storyboard_part_timing(
+                        production, piece, item['target_seconds'])
                     payload = planning_payload(
                         production, piece, chunk_index, len(original_pieces),
                         previous_ending, previous_contract,
-                        source_manifest_override=manifest)
-                    timing = episode_timing_targets(
-                        production, chunk_index, len(original_pieces), piece)
+                        source_manifest_override=manifest,
+                        timing_override=timing)
                     feasible = timing.get('feasible_clip_count') or {}
                     clip_count = max(
                         1, int(timing.get('recommended_clip_count') or 1),
@@ -1249,7 +1257,7 @@ def production_plan(production_id: str, body: dict):
                                     f'({index + 1} of {len(pieces)} verified batches)')
                             answer = client().complete_json(
                                 model, PLANNER_SYSTEM, request,
-                                production_schema_for_story(piece), max_tokens=output_budget,
+                                production_schema_for_story(piece, timing), max_tokens=output_budget,
                                 temperature=0.12 if attempt else 0.25)
                             try:
                                 new_segments = validate_planned_chunk_source_contract(
@@ -1271,8 +1279,18 @@ def production_plan(production_id: str, body: dict):
                             if split_worthy and item.get('split_depth', 0) < 5 else [])
                         if len(subdivisions) < 2:
                             raise
+                        if item['target_seconds'] < len(subdivisions) * 5:
+                            # Another five-second render unit cannot fit inside
+                            # this source piece without silently extending the
+                            # episode. Surface the real coverage diagnostic
+                            # rather than multiplying the parent's budget.
+                            raise
+                        child_targets = allocate_storyboard_piece_seconds(
+                            subdivisions, item['target_seconds'])
                         for subdivision in subdivisions:
                             subdivision['split_depth'] = item.get('split_depth', 0) + 1
+                        for subdivision, child_target in zip(subdivisions, child_targets):
+                            subdivision['target_seconds'] = child_target
                         pieces[index:index + 1] = subdivisions
                         RESOURCES.stage = (
                             f'Story part {chunk_index} omitted source coverage; '
@@ -1286,7 +1304,7 @@ def production_plan(production_id: str, body: dict):
                             'This story needs more than 64 H3 clips. Split it into episodes before planning.')
                     remember_handoff(new_segments)
                     index += 1
-                target = episode_timing_targets(production, story=story)['episode_target_seconds']
+                target = max(episode_target, sum(piece_targets))
                 return fit_planned_durations(segments, target, production['language'], story)
             planned = RESOURCES.run_ai(SETTINGS['model'], generate)
             planner = 'local_ai'

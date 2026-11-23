@@ -1273,20 +1273,62 @@ def reconcile_transition_contract(transition_mode, relation_previous, index):
     return transition
 
 
-def production_schema_for_story(story):
+def production_schema_for_story(story, timing=None):
     """Preserve source groups while allowing dense groups to split safely."""
     schema = copy.deepcopy(PRODUCTION_SCHEMA)
     groups = timed_clip_groups(story)
     count = len(groups)
+    items = schema["properties"]["segments"]
     if count:
-        items = schema["properties"]["segments"]
         items["minItems"] = count
         items["maxItems"] = min(
             MAX_SEGMENTS,
             sum(max(1, math.floor(group["duration"] / PLANNED_MIN_SECONDS))
                 for group in groups),
         )
+    elif isinstance(timing, dict):
+        # Untimed planning previously advertised a per-part clip budget only
+        # in prose while leaving the structured response open to 64 clips.
+        # Local models could therefore return eight clips for a 34-second part;
+        # two valid source batches then produced sixteen 5-second clips for a
+        # 67-second episode and failed only after all expensive calls finished.
+        # Make the same deterministic timing budget authoritative in JSON.
+        feasible = timing.get("feasible_clip_count") or {}
+        minimum = max(1, int(feasible.get("minimum") or 1))
+        maximum = min(MAX_SEGMENTS, max(minimum, int(feasible.get("maximum") or minimum)))
+        items["minItems"] = minimum
+        items["maxItems"] = maximum
     return schema
+
+
+def allocate_storyboard_piece_seconds(pieces, target_seconds):
+    """Allocate one episode target across retryable untimed source pieces.
+
+    Each planning request must own at least one legal five-second clip. Source
+    length supplies only a proportional weight; the returned integer budgets
+    always sum exactly to the requested target (or the smallest renderable
+    total when the source already needs more independent planning pieces).
+    Reusing this allocator when a failed piece is subdivided prevents retries
+    from receiving a fresh copy of the parent budget and inflating clip count.
+    """
+    rows = list(pieces or [])
+    if not rows:
+        return []
+    target = max(int(round(target_seconds)), len(rows) * PLANNED_MIN_SECONDS)
+    weights = []
+    for row in rows:
+        text = row.get("story", "") if isinstance(row, dict) else row
+        weights.append(max(1, len(str(text or "").strip())))
+    remaining = target - len(rows) * PLANNED_MIN_SECONDS
+    total_weight = sum(weights)
+    exact = [remaining * weight / total_weight for weight in weights]
+    extras = [math.floor(value) for value in exact]
+    remainder = remaining - sum(extras)
+    order = sorted(range(len(rows)), key=lambda index: (exact[index] - extras[index], -index),
+                   reverse=True)
+    for index in order[:remainder]:
+        extras[index] += 1
+    return [PLANNED_MIN_SECONDS + extra for extra in extras]
 
 
 def recommended_clip_count(target_seconds):
@@ -1355,6 +1397,23 @@ def episode_timing_targets(production, chunk_index=1, chunk_total=1, story=None)
             for index, group in enumerate(timed_groups)
         ] if timed_groups else [],
     }
+
+
+def storyboard_part_timing(production, story, target_seconds):
+    """Return whole-episode timing plus one explicit untimed-piece budget."""
+    timing = episode_timing_targets(production, story=story)
+    if timing.get("timed_clip_groups"):
+        return timing
+    part = max(PLANNED_MIN_SECONDS, int(round(target_seconds)))
+    minimum = max(1, math.ceil(part / MAX_SECONDS))
+    maximum = max(minimum, part // PLANNED_MIN_SECONDS)
+    timing.update({
+        "part_target_seconds": part,
+        "recommended_clip_count": recommended_clip_count(part),
+        "feasible_clip_count": {"minimum": minimum,
+                                "maximum": min(maximum, MAX_SEGMENTS)},
+    })
+    return timing
 
 
 def fallback_episodes(production):
@@ -7657,9 +7716,11 @@ def planning_card_catalog(production):
 
 
 def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previous_ending="",
-                     previous_contract=None, source_manifest_override=None):
+                     previous_contract=None, source_manifest_override=None,
+                     timing_override=None):
     source_story = story or production["brief"]
-    timing = episode_timing_targets(production, chunk_index, chunk_total, source_story)
+    timing = (copy.deepcopy(timing_override) if isinstance(timing_override, dict)
+              else episode_timing_targets(production, chunk_index, chunk_total, source_story))
     locked_dialogue = locked_timed_dialogue(production, source_story)
     source_manifest = (copy.deepcopy(source_manifest_override)
                        if isinstance(source_manifest_override, dict)
