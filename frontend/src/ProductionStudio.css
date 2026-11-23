@@ -237,3 +237,9 @@
 @media(max-width:1100px){.production-output-rebuild-batch{grid-template-columns:1fr auto}.production-output-rebuild-actions{grid-column:1/-1;justify-content:flex-start}.production-output-row{grid-template-columns:62px minmax(240px,300px) minmax(0,1fr)}}
 @media(max-width:820px){.production-output-rebuild-batch{grid-template-columns:1fr}.production-output-rebuild-count{justify-self:start}.production-output-rebuild-actions{grid-column:auto}.production-output-row{grid-template-columns:58px minmax(0,1fr)}.production-output-media,.production-output-info{grid-column:2}}
 @media(max-width:620px){.production-output-rebuild-batch{padding:14px}.production-output-rebuild-actions{display:grid;grid-template-columns:1fr}.production-output-rebuild-actions>*{width:100%}.production-output-rebuild-actions>label{justify-content:center}.production-output-row{grid-template-columns:54px minmax(0,1fr)}.production-output-index{width:54px;height:auto;min-height:72px}}
+
+/* The saved project summary has four durable constraints; creation keeps its
+   compact three-field row while the opened project exposes the video shape. */
+.production-project-fields{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media(max-width:1100px){.production-project-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:900px){.production-project-fields{grid-template-columns:1fr}}
