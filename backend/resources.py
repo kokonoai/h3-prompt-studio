@@ -61,6 +61,40 @@ def gpu_snapshot():
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         return None
 
+
+def _large_gpu_release_limit(memory):
+    """Conservative first-handoff allowance for a GPU shared with Windows UI.
+
+    A fixed 8 GiB ceiling incorrectly rejects large Windows GPUs whose desktop,
+    browsers and creative apps legitimately hold more memory after ComfyUI has
+    unloaded.  Keep the allowance bounded so a warm H3 checkpoint still cannot
+    masquerade as an empty hand-off.
+    """
+    total = memory.get('total_mib') if isinstance(memory, dict) else None
+    if isinstance(total, bool) or not isinstance(total, (int, float)) or total <= 0:
+        return 8192
+    return max(8192, min(14336, int(total * .40)))
+
+
+def _comfy_release_verified(before, current, idle_baseline=None):
+    if not isinstance(current, dict) or not isinstance(current.get('used_mib'), (int, float)):
+        return False
+    used = current['used_mib']
+    if isinstance(idle_baseline, (int, float)) and not isinstance(idle_baseline, bool):
+        return used < idle_baseline + 1024
+    if used < _large_gpu_release_limit(current):
+        return True
+    if not isinstance(before, dict) or not isinstance(before.get('used_mib'), (int, float)):
+        return False
+    total = current.get('total_mib')
+    if isinstance(total, bool) or not isinstance(total, (int, float)) or total <= 0:
+        return False
+    # A large, completed drop plus a sub-half-full device is independent
+    # evidence that /free released the active checkpoint even when unrelated
+    # Windows processes keep global usage above the first-handoff allowance.
+    return (before['used_mib'] - used >= max(2048, int(total * .10))
+            and used < total * .50)
+
 class ResourceManager:
     def __init__(self, get_settings, get_client, *, state_path=None):
         self.get_settings, self.get_client = get_settings, get_client
@@ -72,6 +106,9 @@ class ResourceManager:
         self.exclusive_ownership = None
         self.ai_idle_memory_mib = None
         self.baseline_instance_id = None
+        # Learned only from a live, verified /free hand-off.  It is deliberately
+        # not persisted across Studio restarts because desktop GPU use changes.
+        self.comfy_idle_memory_mib = None
         self.last_error = None
         self.pending_load = None
         self.last_batch = None
@@ -354,6 +391,7 @@ class ResourceManager:
             needs_release = False
         if online and needs_release:
             self.stage = 'releasing H3 memory'
+            release_started = gpu_snapshot()
             for item in online:
                 response = httpx.post(item['url'] + '/free', json={'unload_models': True, 'free_memory': True}, timeout=60, trust_env=False)
                 response.raise_for_status()
@@ -365,12 +403,17 @@ class ResourceManager:
             # A resident owned 9B can itself exceed 8 GiB. Its fresh-load baseline
             # is fixed for this instance, never raised by subsequent inferences.
             # Permit 1 GiB for small runtime/display allocation fluctuations.
-            release_limit = self.ai_idle_memory_mib + 1024 if owned_baseline else 8192
             time.sleep(1.25)
             while True:
                 self.assert_idle()
                 memory = gpu_snapshot()
-                if memory and memory['used_mib'] < release_limit:
+                released = (memory and memory['used_mib'] < self.ai_idle_memory_mib + 1024
+                            if owned_baseline else
+                            _comfy_release_verified(
+                                release_started, memory, self.comfy_idle_memory_mib))
+                if released:
+                    if not owned_baseline:
+                        self.comfy_idle_memory_mib = memory['used_mib']
                     self._set_comfy_kind('empty')
                     break
                 if time.monotonic() > deadline:
@@ -396,7 +439,9 @@ class ResourceManager:
         else:
             self._forget_instance()
             memory = gpu_snapshot()
-            if memory and memory['used_mib'] >= 8192:
+            load_limit = (self.comfy_idle_memory_mib + 1024
+                          if self.comfy_idle_memory_mib is not None else 8192)
+            if memory and memory['used_mib'] >= load_limit:
                 raise ResourceError('GPU memory is occupied by another process. Release it before loading the selected AI model; no model was loaded.')
             owned_loader = getattr(client, 'load_owned_model', None)
             if callable(owned_loader):
@@ -602,6 +647,7 @@ class ResourceManager:
             self._set_comfy_kind('empty')
             return
         self.stage = 'releasing previous ComfyUI model'
+        release_started = gpu_snapshot()
         for item in online:
             # Recheck before every server mutation; never release during work.
             self.assert_idle()
@@ -616,7 +662,9 @@ class ResourceManager:
         while True:
             self.assert_idle()
             memory = gpu_snapshot()
-            if memory and memory['used_mib'] < 4096:
+            if _comfy_release_verified(
+                    release_started, memory, self.comfy_idle_memory_mib):
+                self.comfy_idle_memory_mib = memory['used_mib']
                 self._set_comfy_kind('empty')
                 return
             if time.monotonic() >= deadline:
@@ -659,6 +707,10 @@ class ResourceManager:
                 if time.monotonic() > deadline:
                     raise ResourceError('LM Studio reports unloaded, but GPU memory is still occupied. Check the Connections panel before queueing H3.')
                 time.sleep(.5)
+            if self.comfy_kind == 'empty':
+                idle = gpu_snapshot()
+                if idle is not None:
+                    self.comfy_idle_memory_mib = idle['used_mib']
             self.stage = 'H3 ready'
             self.last_error = None
             return {'ready': True, 'gpu': gpu_snapshot(), 'message': 'LM Studio is unloaded. You can run the H3 workflow.'}

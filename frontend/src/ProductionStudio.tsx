@@ -1413,6 +1413,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     try{
       const result=await request();
       if(step==="cards"&&!fullRunPreparationComplete(step,result)&&result.card_planner_warning){
+        // The endpoint intentionally returns the preserved project with a
+        // durable failure marker.  Publish that state before throwing so the
+        // button and alert immediately switch to retry mode without a reload.
+        setProduction(result);setDraft(result);
         throw new Error(result.card_planner_warning);
       }
       return result;

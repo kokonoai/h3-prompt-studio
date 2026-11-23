@@ -1714,14 +1714,31 @@ def test_deferred_comfy_free_waits_for_memory_then_loads(monkeypatch):
     result = rm.run_ai("vision")
     assert result["ready"] and lm.loads == [("vision", {"context_length": 8192})]
     assert freed == [("http://127.0.0.1:8010/free", {"unload_models": True, "free_memory": True})]
-    assert clock.now >= 3.25 and rm.stage == "AI ready"
+    assert clock.now >= 2.25 and rm.stage == "AI ready"
+
+
+def test_large_windows_gpu_desktop_baseline_allows_verified_comfy_release(monkeypatch):
+    rm, lm = manager(); clock = FakeClock(); freed = []
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: response(url, {"queue_running": [], "queue_pending": []}))
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: (freed.append(url) or response(url, {})))
+    monkeypatch.setattr(resources, "gpu_snapshot", lambda: {
+        "used_mib": 11300, "free_mib": 21307, "total_mib": 32607, "name": "RTX 5090"})
+    monkeypatch.setattr(resources.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(resources.time, "sleep", clock.sleep)
+
+    result = rm.run_ai("vision")
+
+    assert result["ready"] and lm.loads == [("vision", {"context_length": 8192})]
+    assert rm.comfy_kind == "empty" and rm.comfy_idle_memory_mib == 11300
+    assert freed == ["http://127.0.0.1:8010/free"]
 
 
 def test_unverified_deferred_free_times_out_without_loading(monkeypatch):
     rm, lm = manager(); clock = FakeClock()
     monkeypatch.setattr(httpx, "get", lambda url, **kw: response(url, {"queue_running": [], "queue_pending": []}))
     monkeypatch.setattr(httpx, "post", lambda url, **kw: response(url, {}))
-    monkeypatch.setattr(resources, "gpu_snapshot", lambda: {"used_mib": 23000})
+    monkeypatch.setattr(resources, "gpu_snapshot", lambda: {
+        "used_mib": 23000, "free_mib": 9000, "total_mib": 32000, "name": "GPU"})
     monkeypatch.setattr(resources.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(resources.time, "sleep", clock.sleep)
     with pytest.raises(resources.ResourceError, match="could not be verified"):
@@ -1736,6 +1753,7 @@ def test_new_comfy_job_during_release_prevents_lm_load(monkeypatch):
         return response(url, {"queue_running": [] if len(calls) == 1 else [1], "queue_pending": []})
     monkeypatch.setattr(httpx, "get", get)
     monkeypatch.setattr(httpx, "post", lambda url, **kw: response(url, {}))
+    monkeypatch.setattr(resources, "gpu_snapshot", lambda: {"used_mib": 23000})
     monkeypatch.setattr(resources.time, "sleep", lambda s: None)
     with pytest.raises(resources.ResourceError, match="running or queued"):
         rm.run_ai("vision")
