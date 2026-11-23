@@ -56,7 +56,10 @@ describe("episode batch production",()=>{
     expect(fullRunPreparationComplete("storyboard",null)).toBe(false);
     expect(fullRunPreparationComplete("cards",empty)).toBe(false);
     expect(fullRunPreparationComplete("cards",{...empty,card_plan_source_hash:"current-hash"})).toBe(true);
-    expect(fullRunPreparationComplete("cards",{...empty,card_planner_warning:"Cards preserved"})).toBe(true);
+    expect(fullRunPreparationComplete("cards",{...empty,card_planner_warning:"Cards preserved"})).toBe(false);
+    expect(fullRunPreparationComplete("cards",{
+      ...empty,card_plan_source_hash:"current-hash",card_planner_warning:"Forced refresh failed",
+    })).toBe(true);
     expect(fullRunPreparationComplete("episodes",empty)).toBe(false);
     expect(fullRunPreparationComplete("episodes",{...empty,episodes:[{id:"episode-1"}]})).toBe(true);
     expect(fullRunPreparationComplete("storyboard",empty)).toBe(false);

@@ -119,6 +119,33 @@ def test_long_single_episode_uses_bounded_deterministic_episode_metadata(server,
     assert result["episodes"][0]["story"] == brief.strip()
 
 
+def test_failed_text_card_plan_invalidates_stale_readiness_and_stops_episode_planning(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_STUDIO_DATA", str(tmp_path / "studio-data"))
+    sys.modules.pop("backend.app", None)
+    module = importlib.import_module("backend.app")
+    production = module.production_manager().create({
+        "source_project": new_project(),
+        "brief": "A changed source story that still needs current text cards.",
+        "episode_count": 1,
+        "episode_minutes": 1,
+    })
+    production["card_plan_source_hash"] = "stale-source-hash"
+    module.production_manager().save(production)
+    monkeypatch.setattr(
+        module.RESOURCES, "run_ai",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            resources.ResourceError("H3 memory release could not be verified")))
+
+    failed = module._generate_production_text_cards(production["id"], False)
+
+    assert failed["card_plan_source_hash"] == ""
+    assert "Existing cards were preserved" in failed["card_planner_warning"]
+    with pytest.raises(ValueError, match="memory release could not be verified"):
+        module.production_episode_plan(production["id"], {"use_ai": True})
+    with pytest.raises(ValueError, match="memory release could not be verified"):
+        module.production_plan(production["id"], {"use_ai": True})
+
+
 def test_only_the_known_windows_proactor_disconnect_is_suppressed(server):
     module, _client, _fake = server
 

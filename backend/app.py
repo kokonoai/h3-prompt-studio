@@ -994,7 +994,9 @@ def _generate_production_text_cards(production_id, force=False):
                               card_planning_chunks, split_truncated_card_chunk)
     manager = production_manager()
     production = manager.assert_active(production_id)
-    if not force and production.get('card_plan_source_hash') == card_plan_source_hash(production):
+    expected_source_hash = card_plan_source_hash(production)
+    had_current_plan = production.get('card_plan_source_hash') == expected_source_hash
+    if not force and had_current_plan:
         return production
     # AI completion is additive: apply_card_plan fills blanks and adds missing
     # text cards, but never rewrites a user's cards or removes their media. This
@@ -1053,9 +1055,24 @@ def _generate_production_text_cards(production_id, force=False):
     except Exception as exc:
         production = manager.get(production_id)
         production['card_planner_warning'] = (
-            'Local AI could not finish the text card library. Existing cards were preserved and planning can continue: '
+            'Local AI could not finish the text card library. Existing cards were preserved. '
+            'Resolve the local AI resource issue and retry this step: '
             + str(exc)[:360])
+        # A hash is a readiness marker for the exact current source, not merely
+        # evidence that some older card pass once succeeded.  Keep a genuinely
+        # current plan when a user explicitly asks for a forced refresh, but do
+        # not let a stale/absent plan plus a warning advance one-click planning.
+        if not had_current_plan:
+            production['card_plan_source_hash'] = ''
         return manager.save(production)
+
+
+def _require_current_production_card_plan(production):
+    """Stop dependent AI planning after a failed required card hand-off."""
+    warning = str(production.get('card_planner_warning') or '').strip()
+    if warning and not production.get('card_plan_source_hash'):
+        raise ValueError(warning)
+    return production
 
 
 @app.post('/api/productions/{production_id}/cards/plan')
@@ -1088,6 +1105,7 @@ def production_plan(production_id: str, body: dict):
         raise ValueError('use_ai must be true or false.')
     if use_ai:
         production = _generate_production_text_cards(production_id, False)
+        _require_current_production_card_plan(production)
         story = current_episode_story(production)
     voiceover_speaker = default_voiceover_speaker(production)
     planned, planner, warning = None, 'local_manual', None
@@ -1333,6 +1351,7 @@ def production_episode_plan(production_id: str, body: dict):
         raise ValueError('use_ai must be true or false.')
     if use_ai:
         production = _generate_production_text_cards(production_id, False)
+        _require_current_production_card_plan(production)
     planned, planner, warning = None, 'local_manual', None
     if use_ai:
         try:

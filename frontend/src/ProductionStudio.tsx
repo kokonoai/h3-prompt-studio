@@ -226,7 +226,10 @@ const CONTINUITY_GUARD_ADVISORY="Continuity guard corrected temporal cast confli
 export const fullRunPreparationComplete=(step:FullRunPreparationStep,value:Pick<Production,
   "card_plan_source_hash"|"card_planner_warning"|"planner_warning"|"episodes"|"segments">|null|undefined)=>{
   if(!value)return false;
-  if(step==="cards")return !!value.card_plan_source_hash||!!value.card_planner_warning;
+  // A warning records a preserved failure, not a completed preparation step.
+  // The backend clears a stale readiness hash when the current-source attempt
+  // fails, so only the durable hash may advance or recover a one-click run.
+  if(step==="cards")return !!value.card_plan_source_hash;
   if(step==="episodes")return value.episodes.length>0;
   const warning=(value.planner_warning||"").trim();
   const requiresReplan=!!warning&&!warning.startsWith(CONTINUITY_GUARD_ADVISORY);
@@ -1231,6 +1234,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const autoMergeAttempt=useRef("");
   const automation=outputs?.automation;
   const automationActive=automation?.status==="running"||automation?.status==="retrying";
+  const cardPlanningNeedsRetry=!!production?.card_planner_warning&&!production?.card_plan_source_hash;
   const needsEpisodeContinuation=useMemo(
     ()=>productionNeedsEpisodeContinuation(production,outputs),
     [production,outputs],
@@ -1406,7 +1410,13 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const runFullPreparationStep=async(
     step:FullRunPreparationStep,id:string,request:()=>Promise<Production>,
   )=>{
-    try{return await request();}
+    try{
+      const result=await request();
+      if(step==="cards"&&!fullRunPreparationComplete(step,result)&&result.card_planner_warning){
+        throw new Error(result.card_planner_warning);
+      }
+      return result;
+    }
     catch(error){
       if(!(error instanceof ApiTimeoutError))throw error;
       setBusy(t(
@@ -1440,6 +1450,9 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
           "逾時步驟已由伺服器完成，一鍵流程正在自動繼續。"
         ));
         return refreshed;
+      }
+      if(step==="cards"&&refreshed?.card_planner_warning){
+        throw new Error(refreshed.card_planner_warning);
       }
       throw new Error(timeoutMessage());
     }
@@ -2461,12 +2474,13 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <div className="production-full-runner-actions">
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
         <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
-          {production.task_state==="paused"?<Pause size={18}/>:bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{production.task_state==="paused"?t("本集已暂停","Episode paused","この話は一時停止中","本集已暫停"):automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
+          {production.task_state==="paused"?<Pause size={18}/>:bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:cardPlanningNeedsRetry?<RefreshCw size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{production.task_state==="paused"?t("本集已暂停","Episode paused","この話は一時停止中","本集已暫停"):automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):cardPlanningNeedsRetry?t("重试一键流程","Retry full pipeline","全工程を再試行","重試一鍵流程"):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
         </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
           {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在停止任务…","Stopping task…","タスクを停止中…","正在停止任務…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("立即暂停任务","Pause task now","タスクを今すぐ一時停止","立即暫停任務"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
         </button></div>
       </div>
     </section>}
+    {cardPlanningNeedsRetry&&!bulkAction&&!automationActive&&!error&&!notice&&<div className="production-alert error"><strong>{t("一键流程尚未启动：文字卡规划需要重试。","The full run has not started: text-card planning must be retried.","全工程はまだ開始されていません。文章カード計画を再試行してください。","一鍵流程尚未啟動：文字卡規劃需要重試。")}</strong> {production.card_planner_warning}</div>}
     {(error||(!automationActive&&notice))&&<div className={error?"production-alert error":"production-alert"}>{error||notice}</div>}
     {busy&&<div className="production-progress"><LoaderCircle className="spin" size={18}/><span>{busy}</span></div>}
     {automationActive&&automation&&automationSnapshot&&<section className={"production-automation-status stage-"+automation.stage}>
