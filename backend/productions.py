@@ -571,9 +571,15 @@ _TIMECODE_RANGE = re.compile(
 # screenplay often also contains broader act/section ranges; treating those as
 # shots pulls the preamble, cast list and production notes into the first clip.
 _SHOT_TIMECODE_RANGE = re.compile(
-    r"(?im)^[ \t]*(?:[*#]+[ \t]*)?(?:(?:分镜|分鏡|镜头|鏡頭|shot|ショット)[ \t]*"
+    r"(?im)^[ \t]*(?:"
+    r"(?:[*#]+[ \t]*)?(?:(?:分镜|分鏡|镜头|鏡頭|shot|ショット)[ \t]*"
     r"[A-Za-z0-9一二三四五六七八九十._-]*|(?:S|B)[ \t]*\d{1,3}[A-Za-z]?)[ \t]*"
-    r"(?:[|｜:：][ \t]*)?(?P<start_min>\d{1,3}):(?P<start_sec>[0-5]\d)"
+    r"(?:[|｜:：][ \t]*)?|"
+    # A bare numeric shot number is safe only with an explicit column divider.
+    # Without it, the first digit of ``02:00-03:00`` can be mistaken for a
+    # shot label and turn a broad section range into a fake shot.
+    r"(?:[*#]+[ \t]*)?\d{1,3}[A-Za-z]?[ \t]*[|｜][ \t]*"
+    r")(?P<start_min>\d{1,3}):(?P<start_sec>[0-5]\d)"
     r"(?P<start_fraction>\.\d{1,3})?[ \t]*"
     r"[-–—~～][ \t]*(?P<end_min>\d{1,3}):(?P<end_sec>[0-5]\d)"
     r"(?P<end_fraction>\.\d{1,3})?[^\r\n]*$"
@@ -838,10 +844,26 @@ def _clean_dialogue_value(value):
 
 def _speaker_marker(value):
     """Read plain or Markdown speaker cues and discard acting direction."""
-    value = _strip_script_markdown(value)
+    raw = str(value or "").strip()
+    value = _strip_script_markdown(raw)
     marker = re.match(
         r"^(?:\*\*|__|[*_])?(?P<label>[^:：\n]{1,120}?)[：:]"
         r"(?:\*\*|__|[*_])?\s*(?P<inline>.*)$", value, re.I)
+    if not marker:
+        # Common prose storyboards use a bold cue followed by an ideographic
+        # space instead of a colon: ``**旁白**　“Exact line.”``.  Keep this
+        # colon-less form deliberately restricted to explicit narration cues;
+        # ordinary bold section labels must not become invented speakers.
+        inline_voiceover = re.match(
+            r"^(?:>\s*)?(?:[-+]\s*)?(?P<token>\*\*|__)"
+            r"(?P<label>[^\r\n]{1,120}?)(?P=token)[ \t\u3000]+"
+            r"(?P<inline>.+)$", raw, re.I)
+        if inline_voiceover:
+            label = inline_voiceover.group("label").strip()
+            inline = _strip_script_markdown(inline_voiceover.group("inline"))
+            is_voiceover, _owner = _voiceover_cue_speaker(label)
+            if is_voiceover and inline and inline[0] in _DIALOGUE_OPENERS:
+                return label, inline_voiceover.group("inline").strip()
     if not marker:
         return None
     label = re.sub(r"(?:继续|continues?)\s*$", "", marker.group("label").strip(), flags=re.I).strip()
@@ -897,7 +919,7 @@ def _voiceover_cue_speaker(value, default=None):
 
 
 def default_voiceover_speaker(production):
-    """Resolve narration only when one character is the unambiguous owner."""
+    """Resolve an unambiguous character owner or an audio-only narrator."""
     cards = production.get("cards", {}) if isinstance(production, dict) else {}
     characters = [card for card in cards.get("characters", []) if isinstance(card, dict)]
     names_by_id = {card.get("id"): str(card.get("name", "")).strip()
@@ -914,6 +936,15 @@ def default_voiceover_speaker(production):
                        if str(card.get("name", "")).strip()}
     if not voice_owners and len(character_names) == 1:
         return next(iter(character_names))
+    if not voice_owners and not character_names and not cards.get("voices"):
+        # Object studies, product films and documentary montage can contain
+        # explicit narration without depicting a human character.  An
+        # off-screen narrator is unambiguous in that case and must not require
+        # a fake visible character card merely to preserve authored speech.
+        return {
+            "en": "Narrator", "ja": "ナレーター",
+            "zh-CN": "旁白", "zh-TW": "旁白",
+        }.get(str(production.get("language", "en")), "Narrator")
     return None
 
 
@@ -3142,9 +3173,13 @@ def acoustic_voice_text(value):
     return text[:1800]
 
 
-def voice_prompt_context(production, cards):
+def voice_prompt_context(production, cards, uncarded_speakers=None):
     """Build one non-rewritten block for the current clip's audible cast."""
-    if not cards:
+    cards = list(cards or [])
+    uncarded_speakers = list(dict.fromkeys(
+        str(value or "").strip() for value in (uncarded_speakers or [])
+        if str(value or "").strip()))
+    if not cards and not uncarded_speakers:
         return ""
     from .narrative_prompt import _brief_series_style
     character_names = {card["id"]: card["name"]
@@ -3193,6 +3228,14 @@ def voice_prompt_context(production, cards):
                         + ("\n" + metadata if metadata else "")
                         + ("\nSelected-speaker series rules: " + character_rules if character_rules else "")
                         + supplement)
+    for speaker in uncarded_speakers:
+        sections.append(
+            "Stable Off-screen Voice — " + speaker + ":\n"
+            "This is one recurring audio-only speaker with no visible body and no uploaded voice sample. "
+            "Use the same vocal identity throughout this production: consistent timbre, pitch range, "
+            "apparent age, accent, cadence and recording texture. Follow the series voice style and speak "
+            "only the exact structured dialogue assigned to this name; never improvise, repeat, paraphrase "
+            "or vocalise visual direction. Stable identity key: production narrator " + speaker + ".")
     return "\n\n".join(sections)
 
 
@@ -3205,7 +3248,17 @@ def render_visual_style(value):
     views of the same identity.  The saved card/style text remains untouched;
     only the clip-time rendering direction is cleaned here.
     """
-    text = " ".join(str(value or "").split())
+    # Audio direction has its own structured channel.  Letting a visual-style
+    # paragraph repeat phrases such as "English narration" or an example line
+    # makes H3 improvise speech even when the final audio contract says zero.
+    # Remove complete sound/voice bullet lines from the render-time visual copy
+    # while leaving the saved user text and series voice style untouched.
+    text = re.sub(
+        r"(?im)^[ \t]*(?:[-*+]\s*)?(?:(?:sound|audio|voice(?:[ -]?over)?|narration)"
+        r"[ \t]*[：:]|(?:声音|聲音|音频|音頻|音讯|音訊|旁白|声线|聲線)"
+        r"(?:[ \t]*[：:]|(?=[^\r\n])))[^\r\n]*(?:\r?\n|$)",
+        " ", str(value or ""))
+    text = " ".join(text.split())
     replacements = (
         (r"(?i)\bcharacter\s+(?:model\s+|reference\s+)?sheet\b", ""),
         (r"(?i)\bmodel\s+sheet\b", ""),
@@ -5978,6 +6031,16 @@ class ProductionManager:
             guard_note = ("Continuity guard corrected temporal cast conflicts: " +
                           " ".join(continuity_corrections[:6]))
             warning = (warning + " " + guard_note).strip() if warning else guard_note
+        authored_groups = timed_clip_groups(current_episode_story(current))
+        authored_seconds = sum(group["duration"] for group in authored_groups)
+        configured_seconds = float(current.get("episode_minutes", 8)) * 60
+        if authored_groups and authored_seconds > configured_seconds + .5:
+            # A value such as 1.12 means 67.2 decimal seconds, not 1:12.  When
+            # the screenplay explicitly authors a longer complete timecode
+            # sequence, keep that editorial authority visible in the saved
+            # project instead of planning 72 seconds while the UI still says
+            # 67 seconds.
+            current["episode_minutes"] = round(authored_seconds / 60, 4)
         current["segments"], current["planner"], current["planner_warning"] = prepared, planner, warning
         return self.save(current)
 
@@ -6148,6 +6211,7 @@ class ProductionManager:
         reflected = list(card_selection.get("reflected_subject_ids", []))
         offscreen = list(card_selection.get("offscreen_subject_ids", []))
         lines, visible_dialogue, selected_voices, selected_voice_ids = [], [], [], set()
+        voiced_speaker_keys = set()
         collective_subjects = []
         selected_names = {card["name"].strip().casefold() for card in relevant_cards["characters"]}
         explicitly_selected_voice_names = {
@@ -6204,6 +6268,8 @@ class ProductionManager:
             if voice and voice["id"] not in selected_voice_ids:
                 selected_voice_ids.add(voice["id"])
                 selected_voices.append(voice)
+            if voice:
+                voiced_speaker_keys.add(key)
             voice_delivery = "; ".join(x for x in [
                 "follow locked voice card " + voice["name"] if voice else "",
                 voice.get("pace", "") if voice else "",
@@ -6288,7 +6354,12 @@ class ProductionManager:
                                "display_subject_ids", "imagined_subject_ids", "reflected_subject_ids",
                                "offscreen_subject_ids"]})
         base["shots"] = [scene]
-        voice_context = voice_prompt_context(production, selected_voices)
+        uncarded_speakers = [
+            line["speaker"] for line in segment["dialogue"]
+            if line["speaker"].strip().casefold() not in voiced_speaker_keys
+        ]
+        voice_context = voice_prompt_context(
+            production, selected_voices, uncarded_speakers)
         custom_style = production.get('visual_style_custom', '')
         style_bible = production.get('style_bible', '')
         distinct_style_bible = style_bible if style_bible.strip().casefold() != custom_style.strip().casefold() else ""
@@ -6334,6 +6405,7 @@ class ProductionManager:
                                       for subject in base["subjects"]}
             base["narrative_voice"] = {
                 "series_style": production.get("series_voice_style", ""),
+                "uncarded_speakers": uncarded_speakers,
                 "cards": [{
                     "subject_id": local_subjects_by_name[
                         characters_by_id[card["character_card_id"]]["name"].strip().casefold()],

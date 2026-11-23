@@ -168,6 +168,10 @@ def _voice_and_dialogue(project, shots, names, speaker_ids, soundscape=""):
             if sid in names and sid not in audible:
                 audible.append(sid)
     cards = voice.get('cards', []) if isinstance(voice.get('cards'), list) else []
+    uncarded = {
+        _text(value).casefold() for value in voice.get('uncarded_speakers', [])
+        if _text(value)
+    } if isinstance(voice.get('uncarded_speakers'), list) else set()
     for sid in audible:
         card = next((item for item in cards if isinstance(item, dict) and item.get('subject_id') == sid), None)
         if card:
@@ -180,6 +184,12 @@ def _voice_and_dialogue(project, shots, names, speaker_ids, soundscape=""):
                          + (' Selected-speaker series rules: ' + _sentence(_text(card.get('series_rules')))
                             if _text(card.get('series_rules')) else '')
                          + (' Uploaded clean voice audio takes priority for audible identity.' if card.get('has_audio') else ''))
+        elif names[sid].casefold() in uncarded:
+            lines.append(
+                'Voice identity for ' + names[sid] + ': one recurring audio-only speaker with no visible body. '
+                'Keep the same timbre, pitch range, apparent age, accent, cadence and recording texture across clips. '
+                'Stable recurring voice identity key: production narrator ' + names[sid] + '. '
+                'Speak only the exact structured dialogue; never improvise, repeat or vocalise visual direction.')
     if audible:
         lines.append('Only ' + ', '.join(names[sid] for sid in audible) + ' speak' + ('s' if len(audible) == 1 else '')
                      + ' in this clip. Other visible characters do not speak or make speech-like lip movements.')

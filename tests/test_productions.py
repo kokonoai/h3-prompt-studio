@@ -17,6 +17,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  character_aliases, current_episode_story,
                                  character_presence_roles,
                                  continuity_visual_lock, device_screen_geometry_lock,
+                                 default_voiceover_speaker,
                                  dialogue_minimum_seconds,
                                  effective_cast_timeline, effective_temporal_cast_lock,
                                  inscribed_prop_continuity_lock,
@@ -269,7 +270,8 @@ def test_character_sheet_crop_keeps_one_primary_identity_view():
 def test_render_style_removes_reference_sheet_layout_but_keeps_art_direction():
     source = ("Stylized 3D animated character sheet, anthropomorphic animal design, "
               "front side back turnaround, expression sheet, clean white background, "
-              "detailed fur, cinematic lighting")
+              "detailed fur, cinematic lighting\n"
+              "- 声音：English narration softly repeats loving myself.")
     cleaned = render_visual_style(source)
 
     assert "character sheet" not in cleaned.casefold()
@@ -278,6 +280,8 @@ def test_render_style_removes_reference_sheet_layout_but_keeps_art_direction():
     assert "white background" not in cleaned.casefold()
     assert "detailed fur" in cleaned
     assert "cinematic lighting" in cleaned
+    assert "narration" not in cleaned.casefold()
+    assert "loving myself" not in cleaned.casefold()
 
     production = {"visual_style_custom": source, "visual_style_preset": "cinematic_realism",
                   "style_bible": ""}
@@ -1833,6 +1837,97 @@ def test_markdown_voiceover_blocks_bind_to_unique_voice_owner_and_remain_audible
     assert "No scripted speech is assigned to this clip." not in compiled["prompt"]
     assert "It took me a while to understand…" in compiled["prompt"]
     assert "The most beautiful kind of love—" in compiled["prompt"]
+
+
+def test_numeric_markdown_shots_keep_inline_narration_without_character_cards(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    screenplay = """# Paper study
+
+### 01｜00:00–00:07 · Left paper
+
+The fine fiber trembles once.
+
+**旁白**　“It took me a while to understand…”
+
+**声音**　A dry paper tick.
+
+### 02｜00:07–00:13 · Moving ridge
+
+The fold rises and settles.
+
+**旁白**　“The most beautiful kind of love isn’t about finding someone perfect.”
+
+**声音**　Soft paper rustle.
+"""
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": .5, "language": "en",
+    })
+
+    assert default_voiceover_speaker(production) == "Narrator"
+    groups = timed_clip_groups(screenplay)
+    assert [(group["start"], group["end"]) for group in groups] == [(0, 7), (7, 13)]
+    locked = locked_timed_dialogue(production)
+    assert [group["dialogue_parse_failed"] for group in locked] == [False, False]
+    assert [group["source_dialogue"][0]["text"] for group in locked] == [
+        "It took me a while to understand…",
+        "The most beautiful kind of love isn’t about finding someone perfect.",
+    ]
+    assert all(group["source_dialogue"][0] == {
+        "speaker": "Narrator", "text": group["source_dialogue"][0]["text"],
+        "language": "English", "voiceover": True,
+    } for group in locked)
+
+    planned = fallback_segments(
+        screenplay, target_seconds=13, language="en",
+        voiceover_speaker=default_voiceover_speaker(production))
+    production = manager.apply_plan(production["id"], planned, "fallback")
+    assert [segment["dialogue"][0]["text"] for segment in production["segments"]] == [
+        "It took me a while to understand…",
+        "The most beautiful kind of love isn’t about finding someone perfect.",
+    ]
+    project = manager.materialise(
+        production["id"], production["segments"][0]["id"])["project"]
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+    assert "Spoken-utterance count is exactly 1 utterance total" in compiled["prompt"]
+    assert "It took me a while to understand…" in compiled["prompt"]
+    assert "No scripted speech is assigned to this clip." not in compiled["prompt"]
+    assert "Stable recurring voice identity key: production narrator Narrator" in compiled["prompt"]
+
+
+def test_numeric_authored_shot_ranges_override_decimal_minute_target(tmp_path):
+    boundaries = [(0, 7), (7, 13), (13, 19), (19, 23), (23, 28), (28, 33),
+                  (33, 38), (38, 43), (43, 48), (48, 54), (54, 59), (59, 72)]
+
+    def stamp(seconds):
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    story = "\n\n".join(
+        f"### {index:02d}｜{stamp(start)}–{stamp(end)} · Paper\n\n"
+        f"The paper completes authored action {index}."
+        for index, (start, end) in enumerate(boundaries, 1))
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({
+        "source_project": source, "episode_minutes": 1.12,
+        "language": "en", "brief": story,
+    })
+
+    beats = timed_story_beats(story)
+    groups = timed_clip_groups(story)
+    timing = episode_timing_targets(production, story=story)
+    assert len(beats) == 12
+    # The authored four-second beat joins its adjacent five-second beat because
+    # one H3 render must last at least five seconds; both source beats remain.
+    assert len(groups) == 11
+    assert sum(group["duration"] for group in groups) == 72
+    assert timing["episode_target_seconds"] == 72
+    assert timing["recommended_clip_count"] == 11
+    planned = fallback_segments(
+        story, target_seconds=72, language="en",
+        voiceover_speaker=default_voiceover_speaker(production))
+    saved = manager.apply_plan(production["id"], planned, "fallback")
+    assert saved["episode_minutes"] == 1.2
 
 
 def test_ambiguous_generic_voiceover_is_rejected_instead_of_becoming_silent(tmp_path):
