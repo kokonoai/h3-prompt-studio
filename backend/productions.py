@@ -281,7 +281,7 @@ You are now the series editor planning episodes before shot generation. Return s
 - Each episode needs a distinct dramatic engine: primary purpose, opening state, active desire or pressure, causal progression, meaningful turn, changed exit state, and a locally satisfying payoff. Use a hook only when the story earns one.
 - Respect target_minutes_per_episode as an editorial target, not a reason to pad the story.
 - visual_style and long_form_narrative_style shape presentation but never override story facts.
-- If visual_style reports style-card image analysis, treat it as highest visual authority; custom text is secondary and the named preset is fallback.
+- Treat approved style-card image analysis as highest visual authority, followed by a selected written style card, then custom text and finally the named preset.
 - character_names must contain every character who appears, speaks, is heard, or materially affects that episode.
 - Copy character names exactly from available_character_cards when a matching card exists. Never invent a card name.
 - continuity_notes must call out returning-character state, relationship changes, wardrobe, props, location, injuries, knowledge, setups awaiting payoff and unresolved actions that the next episode must preserve.
@@ -305,7 +305,9 @@ TIMING
 
 CONTENT
 - Preserve story order, facts, characters, relationships, knowledge, props, wardrobe, location, performance language and visual style.
-- For visual treatment, obey this priority: analysed style-card image > custom visual style > style bible > named preset. Never copy depicted content from a style image.
+- For visual treatment, obey this priority: analysed style-card image > selected written style card > custom visual style > style bible > named preset. Never copy depicted content or location from style material.
+- Production-wide authored directives such as Project Style, Setting and Screen Direction, Voice Rule, wardrobe, persistent posture and prop-placement rules remain active across every affected clip. Assign their source IDs once for traceability, but do not consume or forget the constraints after the first clip.
+- A hard cut changes the camera setup, not the story world. Within the same scene preserve location, time of day, screen side, seated/standing posture, furniture contact, wardrobe and prop state unless the authored current action explicitly changes them.
 - Write every returned text field, including dialogue, in project_output_language. The input may be in any language.
 - Translate dialogue faithfully into project_output_language while preserving meaning, speaker and intent; after translation it becomes exact locked dialogue.
 - Do not invent plot events or dialogue. Heard but unseen speech uses voiceover=true.
@@ -851,20 +853,27 @@ def _speaker_marker(value):
         r"(?:\*\*|__|[*_])?\s*(?P<inline>.*)$", value, re.I)
     if not marker:
         # Common prose storyboards use a bold cue followed by an ideographic
-        # space instead of a colon: ``**旁白**　“Exact line.”`` or
-        # ``**旁白**　*Exact line.*``.  Keep this colon-less form deliberately
-        # restricted to explicit narration cues; the cue itself is sufficient
-        # evidence, so quoted, italic and plain narration are all preserved.
-        inline_voiceover = re.match(
+        # space instead of a colon: ``**MOKO** “Hi-yah!”`` or
+        # ``**旁白**　*Exact line.*``. A quoted inline value is strong dialogue
+        # evidence for any bold speaker label. Explicit narration cues also
+        # accept italic or plain prose because the cue itself is unambiguous.
+        inline_bold_cue = re.match(
             r"^(?:>\s*)?(?:[-+]\s*)?(?P<token>\*\*|__)"
             r"(?P<label>[^\r\n]{1,120}?)(?P=token)[ \t\u3000]+"
             r"(?P<inline>.+)$", raw, re.I)
-        if inline_voiceover:
-            label = inline_voiceover.group("label").strip()
-            inline = _strip_script_markdown(inline_voiceover.group("inline"))
+        if inline_bold_cue:
+            label = inline_bold_cue.group("label").strip()
+            inline = _strip_script_markdown(inline_bold_cue.group("inline"))
             is_voiceover, _owner = _voiceover_cue_speaker(label)
-            if is_voiceover and inline:
-                return label, inline_voiceover.group("inline").strip()
+            if inline and (is_voiceover or inline[0] in _DIALOGUE_OPENERS):
+                label = re.sub(
+                    r"(?:继续|continues?)\s*$", "", label, flags=re.I).strip()
+                speaker = re.split(r"[|｜]", label, maxsplit=1)[0].strip()
+                speaker = re.sub(
+                    r"\s*(?:\([^()]{1,100}\)|（[^（）]{1,100}）|\[[^\[\]]{1,100}\]|【[^【】]{1,100}】)\s*$",
+                    "", speaker).strip().strip("*_#- ")
+                if speaker:
+                    return speaker, inline_bold_cue.group("inline").strip()
     if not marker:
         return None
     label = re.sub(r"(?:继续|continues?)\s*$", "", marker.group("label").strip(), flags=re.I).strip()
@@ -2682,6 +2691,31 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
         ("yes" if segment.get("mmh3_allowed") else "no") +
         ". Do not repeat the preceding action, swap a prop holder, reverse established screen direction, "
         "or import an off-screen/display/memory identity into the physical set.")
+    environment_cards = relevant_cards.get("environments", []) if relevant_cards else []
+    environment_authority = "; ".join(
+        card.get("name", "") + ": " + " ".join(
+            part for part in (card.get("description", ""), card.get("notes", "")) if part)
+        for card in environment_cards if card.get("name"))[:2400]
+    setting_text = current_visual_text(
+        segment.get("setting", ""), "the current clip's authored setting")[:1200]
+    action_text = current_visual_text(
+        segment.get("action") or segment.get("story", ""),
+        "perform only the current clip's authored action")[:2200]
+    ending_text = current_visual_text(
+        segment.get("ending", ""), "end on the current clip's authored state")[:1200]
+    environment_guard = (
+        "LOCATION AND SET LOCK: the physical location is exactly " + setting_text + ". " +
+        (("Selected environment-card authority: " + environment_authority + ". ")
+         if environment_authority else "") +
+        "Visual-style wording controls rendering treatment only. Never import a different location, architecture, "
+        "street, skyline, signage, clock, furniture layout, time of day or background subject from a style card, "
+        "style reference or inherited custom style. Do not render readable signs or decorative text unless the "
+        "current story explicitly requires them.")
+    action_guard = (
+        "CURRENT CLIP PHYSICAL-ACTION LOCK: " + action_text + " Ending state: " + ending_text + ". "
+        "A camera cut, reframe or closer shot never changes a performer's seated/standing posture, furniture "
+        "contact, wardrobe or prop state. Preserve those established facts unless this exact current action "
+        "explicitly changes them.")
     shot_contract = normalise_shot_contract(segment.get("shot_contract"), segment)
     timeline = effective_cast_timeline(production, segment, roles)
     dense_roster = list(dict.fromkeys(
@@ -2705,6 +2739,17 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
     previous = next((row for row in production.get("segments", [])
                      if row.get("index") == segment.get("index", 0) - 1), None)
     transition_mode = segment.get("transition_mode", "hard_cut")
+    previous_environments = {
+        str(name).strip().casefold()
+        for name in (previous or {}).get("card_selection", {}).get("environments", [])
+        if str(name).strip()}
+    current_environments = {
+        str(name).strip().casefold()
+        for name in segment.get("card_selection", {}).get("environments", [])
+        if str(name).strip()}
+    same_environment_cut = bool(
+        previous and transition_mode == "hard_cut" and
+        previous_environments & current_environments)
     previous_snapshot = ""
     if previous and transition_mode in ("continuous", "matched_cut"):
         prior_state = normalise_continuity_state(previous.get("continuity_state"), previous)
@@ -2736,10 +2781,18 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
                        + (f" ({row['state']})" if row.get("state") else "")
                        for row in shared_props) or "none") +
             ". Preserve only this filtered shared state; never carry a previous-only identity into the current clip. ")
+    elif same_environment_cut:
+        previous_snapshot = (
+            "SAME-SCENE HARD CUT: this is a new camera setup inside the same established physical environment, "
+            "not a scene reset. Preserve the room, time of day, lighting logic, furniture layout, selected wardrobe, "
+            "performer posture and furniture contact, and the current clip's opening prop state unless the authored "
+            "current action explicitly changes one of them. Never carry a previous-only identity into the new frame. ")
     elif previous:
         previous_snapshot = (
             "FRESH EDITORIAL SETUP: this boundary does not inherit the preceding frame. "
-            "Do not carry any person, creature, reflection, portrait, costume, pose, prop holder or background extra from the preceding clip. ")
+            "Use only the current clip's cast, location and prop holders; never carry a previous-only person, "
+            "creature, reflection, portrait or background extra. Preserve any current selected wardrobe and "
+            "identity design unless the authored story explicitly changes them. ")
     else:
         previous_snapshot = "OPENING CLIP: there is no preceding visual state to inherit. "
     opening_composition = current_visual_text(
@@ -2780,6 +2833,8 @@ def production_render_override(production, segment, relevant_cards=None, roles=N
         dense_cast_guard,
         source_guard,
         continuity_guard,
+        environment_guard,
+        action_guard,
         edit_guard,
         prop_guard,
     ] if part)
@@ -3413,13 +3468,17 @@ def continuity_visual_lock(production, selected_cards):
                      + analysed["image_analysis"])
         if secondary:
             direction += " Compatible written style notes only: " + secondary
-    elif production.get("visual_style_custom", "").strip():
-        direction = production["visual_style_custom"]
     else:
+        # A style card selected for this exact clip is an explicit production
+        # decision. It must outrank stale project-level custom text inherited
+        # from another scene or episode. Image analysis remains strongest.
         written_card = next((card for card in styles if card.get("description", "").strip()
                              or card.get("notes", "").strip()), None)
         if written_card:
-            direction = " ".join(x for x in (written_card.get("description", ""), written_card.get("notes", "")) if x)
+            direction = " ".join(x for x in (
+                written_card.get("description", ""), written_card.get("notes", "")) if x)
+        elif production.get("visual_style_custom", "").strip():
+            direction = production["visual_style_custom"]
         elif production.get("style_bible", "").strip():
             direction = production["style_bible"]
         else:
@@ -6405,7 +6464,7 @@ class ProductionManager:
             f"Visual style preset: {production.get('visual_style_preset', 'cinematic_realism')}.",
             f"Custom visual style: {custom_style}" if custom_style else "",
             f"Visual style bible: {distinct_style_bible}" if distinct_style_bible else "",
-            "STYLE PRIORITY: analysed style-card images override custom style text; custom style text overrides the named preset. Transfer visual treatment only, never depicted subjects or scene content.",
+            "STYLE PRIORITY: analysed style-card images override selected written style cards; selected written style cards override custom style text, which overrides the named preset. Transfer visual treatment only, never depicted subjects, locations or scene content.",
             ("TEXT-ONLY VISIBLE IDENTITY WARNING: these selected characters have no dedicated image or approved character overview binding: "
              + ", ".join(card_selection.get("missing_visual_identity_names", []))
              + ". Their written cards remain authoritative, but stable appearance across separately rendered clips is not guaranteed; add a character image or approved overview before final rendering."
@@ -7856,7 +7915,7 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
         "visual_style_preset": production.get("visual_style_preset", "cinematic_realism"),
         "custom_visual_style": production.get("visual_style_custom", ""),
         "visual_style_bible": production["style_bible"],
-        "style_source_priority": "style-card image analysis > custom visual style > visual style bible > named preset",
+        "style_source_priority": "style-card image analysis > selected written style card > custom visual style > visual style bible > named preset",
         "long_form_narrative_style": production.get("narrative_style", "cinematic"),
         "custom_narrative_style": production.get("narrative_style_custom", ""),
         "narrative_notes": production.get("narrative_notes", ""),
@@ -7885,7 +7944,12 @@ def planning_payload(production, story=None, chunk_index=1, chunk_total=1, previ
                     "Fill shot_contract with editorial role, shot size, opening/ending composition, axis, edit motivation and explicit "
                     "preserve/change instructions. Set transition_mode to continuous "
                     "only for truly unbroken time/place/action; use "
-                    "hard_cut, matched_cut, time_jump, state_change or insert for discontinuities. Make card_selection.characters "
+                    "hard_cut, matched_cut, time_jump, state_change or insert for discontinuities. "
+                    "An ordinary hard_cut changes camera setup only: when adjacent clips remain in the same scene, preserve "
+                    "the authored screen sides, performer posture and furniture contact, wardrobe, environment, lighting and "
+                    "prop state unless the source explicitly changes them. Production-wide style, screen-direction, voice and "
+                    "prop-placement directives remain active in every affected clip even though their source IDs are bound once. "
+                    "Make card_selection.characters "
                     "the exact union of visible_start, visible_end, enters and exits. In each locked_source_dialogue group, source_dialogue is the "
                     "complete authored line roster. When requires_translation is false, copy dialogue verbatim. When it is true, translate each "
                     "source_dialogue text once into project_output_language while preserving speaker, count and order; never consolidate, omit, "
@@ -7929,7 +7993,7 @@ def episode_planning_payload(production, start_index, count, previous_ending="",
         "visual_style": {"preset": production.get("visual_style_preset", "cinematic_realism"),
                          "custom": production.get("visual_style_custom", "")[:2000],
                          "notes": production["style_bible"][:3000],
-                         "source_priority": "style-card image analysis > custom text > named preset"},
+                         "source_priority": "style-card image analysis > selected written style card > custom text > named preset"},
         "long_form_narrative_style": {"preset": production.get("narrative_style", "cinematic"),
                                       "custom": production.get("narrative_style_custom", "")[:1200],
                                       "notes": production.get("narrative_notes", "")[:1800]},

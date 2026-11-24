@@ -290,6 +290,21 @@ def test_render_style_removes_reference_sheet_layout_but_keeps_art_direction():
     assert "exactly one spatial instance of each named subject" in lock
 
 
+def test_selected_written_style_card_outranks_stale_custom_scene_text():
+    production = {
+        "visual_style_custom": "Neon clock street with brass towers and blue signs",
+        "visual_style_preset": "custom", "style_bible": "",
+    }
+    selected = {"styles": [_card(
+        "Hand-drawn paper",
+        description="Soft hand-drawn 2D animation with warm linework and light paper texture.")]}
+
+    lock = continuity_visual_lock(production, selected)
+
+    assert "Soft hand-drawn 2D animation" in lock
+    assert "Neon clock street" not in lock
+
+
 def test_individual_character_reference_uses_cached_single_view_derivative(tmp_path):
     manager, source, _projects, assets, store_asset = _rig(tmp_path)
     sheet = Image.new("RGB", (960, 540), "white")
@@ -746,7 +761,7 @@ def test_visual_cast_lock_does_not_name_non_visual_identities():
     assert "VISUAL IDENTITY WHITELIST" in lock
 
 
-def _boundary_guard(transition_mode):
+def _boundary_guard(transition_mode, shared_environment=False):
     local = _card("CurrentHero")
     prior_only = _card("PriorOnlySentinel")
     production = {
@@ -768,13 +783,19 @@ def _boundary_guard(transition_mode):
             "prop_holders_end": [],
         },
         "shot_contract": {"shot_size": "wide", "relation_previous": "hard_cut"},
+        "card_selection": {
+            "environments": ["Shared Room"] if shared_environment else [],
+        },
     }
     current = {
         "id": _id(), "index": 2, "title": "Current", "story": "CurrentHero acts alone.",
         "setting": "A new room", "action": "CurrentHero raises one hand.",
         "ending": "CurrentHero holds still.", "image_prompt": "CurrentHero alone",
         "transition_mode": transition_mode,
-        "card_selection": {"characters": ["CurrentHero"], "props": []},
+        "card_selection": {
+            "characters": ["CurrentHero"], "props": [],
+            "environments": ["Shared Room"] if shared_environment else [],
+        },
         "cast_timeline": {"visible_start": ["CurrentHero"], "visible_end": ["CurrentHero"],
                           "enters": [], "exits": [], "offscreen": [], "mentioned_only": []},
         "source_refs": {"scene_ids": [], "paragraph_ids": [], "dialogue_ids": [], "event_ids": []},
@@ -807,6 +828,15 @@ def test_hard_cut_never_serialises_previous_cast_into_current_prompt():
     assert "PREVIOUS END SNAPSHOT" not in guard
 
 
+def test_same_environment_hard_cut_changes_camera_without_resetting_the_room():
+    guard = _boundary_guard("hard_cut", shared_environment=True)
+
+    assert "SAME-SCENE HARD CUT" in guard
+    assert "not a scene reset" in guard
+    assert "performer posture and furniture contact" in guard
+    assert "PriorOnlySentinel" not in guard
+
+
 def test_continuous_boundary_keeps_only_shared_current_identities():
     guard = _boundary_guard("continuous")
 
@@ -837,13 +867,22 @@ def test_render_override_restages_internal_camera_edits_as_one_master():
     }
     production["segments"] = [segment]
 
-    guard = production_render_override(production, segment, roles={local["id"]: "physical"})
+    living_room = _card(
+        "Quiet Living Room", description="Warm window light and one stable couch layout.")
+    guard = production_render_override(
+        production, segment,
+        relevant_cards={"props": [], "environments": [living_room]},
+        roles={local["id"]: "physical"})
 
     assert "opening composition=one stable close-up master composition" in guard
     assert "ending composition=hold the same close-up master composition" in guard
     assert "axis=fixed; allow axis crossing=False" in guard
     assert "SINGLE-TAKE CAMERA LOCK" in guard
     assert "Rapid cuts between" not in guard
+    assert "LOCATION AND SET LOCK" in guard
+    assert "Quiet Living Room: Warm window light and one stable couch layout." in guard
+    assert "CURRENT CLIP PHYSICAL-ACTION LOCK" in guard
+    assert "camera cut, reframe or closer shot never changes" in guard
 
 
 def test_dense_cast_render_override_serialises_entrances_without_preplacing_them():
@@ -1906,6 +1945,14 @@ def test_colonless_explicit_voiceover_accepts_quoted_italic_and_plain_text(cue, 
     assert script_dialogue(cue, "Narrator") == [{
         "speaker": "Narrator", "text": expected, "voiceover": True,
     }]
+
+
+def test_colonless_bold_character_cue_preserves_quoted_dialogue_only():
+    assert script_dialogue('**MOKO** “Hi-yah!”\n\n**YUKI** “What are you doing?”') == [
+        {"speaker": "MOKO", "text": "Hi-yah!"},
+        {"speaker": "YUKI", "text": "What are you doing?"},
+    ]
+    assert script_dialogue("**Sound** A short airy whoosh.") == []
 
 
 def test_saved_silent_storyboard_is_replanned_after_voiceover_parser_upgrade(tmp_path):
@@ -3549,9 +3596,10 @@ def test_style_image_analysis_outranks_custom_text_and_preset(tmp_path):
                                                      image_analysis="low contrast violet palette; fine paper grain")]
     production = manager.save(production)
     payload = planning_payload(production)
-    assert '"style_source_priority": "style-card image analysis > custom visual style > visual style bible > named preset"' in payload
+    assert '"style_source_priority": "style-card image analysis > selected written style card > custom visual style > visual style bible > named preset"' in payload
     assert '"custom_visual_style": "soft pencil motion"' in payload
     assert '"image_analysis": "low contrast violet palette; fine paper grain"' in payload
+    assert "An ordinary hard_cut changes camera setup only" in payload
     planned = [{"title": "Crossing", "story": "A person crosses a quiet room.", "setting": "quiet room",
                 "action": "The person crosses the room.", "ending": "The person reaches the door.",
                 "duration": 6, "duration_reason": "walking pace", "dialogue": [],
