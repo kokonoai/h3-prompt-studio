@@ -70,7 +70,7 @@ type QualityReview = {status:"legacy"|"unreviewed"|"pending"|"reviewing"|"passed
 type BoundaryReview = {previous_segment_id:string;segment_id:string;previous_last_url:string;next_first_url:string;previous_middle_url:string;next_middle_url:string;frames_ready:boolean;planned_cast:{previous_end:string[];next_start:string[]};metrics:{brightness_delta?:number|null;temperature_delta?:number|null;histogram_delta?:number|null};issues:ContractIssue[];status:"ok"|"warning"|"error"};
 type ProductionVideoJob = { id:string; status:string; stage?:string; error?:string|null; operation?:string; seed?:number|null; duration?:number|null; new_seconds?:number|null; created_at?:number; elapsed_seconds?:number|null;server_execution_seconds?:number|null;output_folder?:string|null;width?:number; height?:number; video_url?:string|null; scene_video_url?:string|null;review_frames?:ReviewFrames;quality_review?:QualityReview;can_continue?:boolean;continuation_source?:string|null };
 type AutomationBlockedSegment = {segment_id:string;index:number;title:string;stage:"prompts"|"videos";reason:string;blocked_at?:number|null};
-type ProductionAutomation = {status:"idle"|"running"|"retrying"|"paused"|"needs_attention"|"completed";stage:string;stage_detail?:string;merge:boolean;review?:boolean;current_segment_id?:string|null;current_index:number;completed:number;total:number;attempt:number;run_id?:string|null;last_error?:string;blocked_segments?:AutomationBlockedSegment[];started_at?:number|null;updated_at?:number|null;finished_at?:number|null};
+type ProductionAutomation = {status:"idle"|"running"|"retrying"|"paused"|"needs_attention"|"completed";stage:string;stage_detail?:string;merge:boolean;review?:boolean;regenerate_all?:boolean;regenerate_prompt_ids?:string[];current_segment_id?:string|null;current_index:number;completed:number;total:number;attempt:number;run_id?:string|null;last_error?:string;blocked_segments?:AutomationBlockedSegment[];started_at?:number|null;updated_at?:number|null;finished_at?:number|null};
 type ProductionQualityBatch = {status:"running"|"completed"|"failed";legacy_only:boolean;target_count?:number|null;reviewed_count:number;failed_count:number;started_at?:number|null;finished_at?:number|null;error?:string|null};
 type ProductionOutputRow = { segment_id:string; index:number; title:string; project_id?:string|null; project_status:string; candidates:ProductionVideoJob[]; selected?:ProductionVideoJob|null; selection:"manual"|"latest";boundary?:BoundaryReview|null;legacy_upgrade?:boolean };
 type ProductionOutputs = { production_id:string; auto_merge:boolean; automation?:ProductionAutomation;quality_batch?:ProductionQualityBatch|null; segments:ProductionOutputRow[]; selected_run_ids:string[]; all_ready:boolean; quality_ready:boolean; quality_pending_count:number;manual_quality_pending_count:number;legacy_upgrade_count:number;legacy_unreviewed_count:number;blocking_stale_count:number; ready_count:number; segment_count:number; signature?:string|null; estimated_seconds:number; active_jobs:number; uncertain_jobs:number; timings:{episode_plan_seconds?:number|null;storyboard_plan_seconds?:number|null;prompt_generation_seconds?:number|null;video_generation_seconds?:number|null;video_wall_seconds?:number|null;merge_seconds?:number|null};final_ready:boolean; final_url?:string|null; download_url?:string|null; file_path?:string|null; folder_path?:string|null };
@@ -181,18 +181,22 @@ export const productionAutomationSnapshot=(
 ):ProductionAutomationSnapshot|null=>{
   if(!automation)return null;
   const total=Math.max(automation.total||0,segments?.length||0,outputs?.segment_count||0);
-  const promptReady=(segments||[]).filter(segment=>
-    (segment.status==="ready"&&!!segment.video_prompt?.trim()&&!segment.stale_reasons?.length&&
-      (!requirePromptReview||segment.prompt_quality?.status==="passed"))||segmentHasCompletedVideo(segment,outputs)).length;
-  const renderedRows=(outputs?.segments||[]).filter(row=>row.candidates.some(job=>
-    job.status==="succeeded"&&!!job.video_url));
+  const regenerationPending=new Set(automation.regenerate_prompt_ids||[]);
+  const promptReady=automation.regenerate_all
+    ?Math.max(0,total-regenerationPending.size)
+    :(segments||[]).filter(segment=>
+      (segment.status==="ready"&&!!segment.video_prompt?.trim()&&!segment.stale_reasons?.length&&
+        (!requirePromptReview||segment.prompt_quality?.status==="passed"))||segmentHasCompletedVideo(segment,outputs)).length;
+  const renderedRows=(outputs?.segments||[]).filter(row=>automation.regenerate_all
+    ?!regenerationPending.has(row.segment_id)&&row.selected?.status==="succeeded"&&!!row.selected.video_url
+    :row.candidates.some(job=>job.status==="succeeded"&&!!job.video_url));
   const reviewingRow=(outputs?.segments||[]).find(row=>row.candidates.some(job=>
     ["pending","reviewing"].includes(job.quality_review?.status||"")));
   const pendingReview=(outputs?.segments||[]).filter(row=>row.candidates.some(job=>
     ["pending","reviewing"].includes(job.quality_review?.status||""))).length;
   const rejected=(outputs?.segments||[]).filter(row=>row.candidates.some(job=>
     job.status==="succeeded"&&job.quality_review?.status==="failed"&&!job.quality_review.accepted)).length;
-  const accepted=Math.max(automation.completed||0,outputs?.ready_count||0);
+  const accepted=automation.regenerate_all?renderedRows.length:Math.max(automation.completed||0,outputs?.ready_count||0);
   const reviewEnabled=automation.review===true;
   const manualPending=outputs?.manual_quality_pending_count||0;
   const blocked=automation.blocked_segments?.length||0;
@@ -1230,7 +1234,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const [outputs,setOutputs]=useState<ProductionOutputs|null>(null);
   const [outputsLoading,setOutputsLoading]=useState(false);
   const [merging,setMerging]=useState(false);
-  const [bulkAction,setBulkAction]=useState<""|"prompts"|"redo-prompts"|"videos"|"redo-videos"|"selected"|"all"|"full">("");
+  const [bulkAction,setBulkAction]=useState<""|"prompts"|"redo-prompts"|"videos"|"redo-videos"|"selected"|"all"|"full"|"regenerate-all">("");
   const autoMergeAttempt=useRef("");
   const automation=outputs?.automation;
   const automationActive=automation?.status==="running"||automation?.status==="retrying";
@@ -2250,13 +2254,20 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     }catch(e){if(isPauseRequestError(e))setNotice(queuePausedNotice());else setError((e as Error).message);}
     finally{busyRef.current=false;setBulkAction("");setBusy("");await refreshOutputs(production.id,true);}
   };
-  const generateEpisodeFilm=async(options:{full?:boolean}={})=>{
-    const full=!!options.full;
+  const generateEpisodeFilm=async(options:{full?:boolean;regenerateAll?:boolean}={})=>{
+    const regenerateAll=!!options.regenerateAll;
+    const full=!!options.full||regenerateAll;
     if(busyRef.current||!production||(!full&&!production.segments.length))return;
     if(full&&!production.brief.trim()){setError(t("请先填写并保存故事原文 / 剧本。","Add and save the source story or screenplay first.","先に原作ストーリー／脚本を入力して保存してください。","請先填寫並儲存故事原文／劇本。"));return;}
-    if(full&&!window.confirm(production.auto_prompt_repair?t("将为当前集依次补全文字卡、规划缺失分镜、检查并生成准确提示词，然后连续生成全部缺失视频并自动合并初版。看完初版后，你再按需启动单个或批量 AI 质检并决定是否修复；已有成果不会重复覆盖。继续吗？","Complete text cards and missing storyboard shots, verify and build accurate prompts, then continuously render every missing video and assemble the initial cut automatically. After watching that cut, optionally start AI QC for individual or multiple takes and decide whether to repair them. Existing work is preserved. Continue?","文章カードと不足分の絵コンテを補完し、正確なプロンプトを検査・生成してから不足映像を連続生成し、初版を自動結合します。初版確認後、必要なテイクだけ個別または一括でAI検査し、修正するか決められます。既存成果は保持されます。続けますか？","將為目前集依序補全文字卡、規劃缺失分鏡、檢查並生成準確提示詞，然後連續生成全部缺失影片並自動合併初版。看完初版後，再按需啟動單個或批量 AI 質檢並決定是否修復；已有成果不會重複覆蓋。繼續嗎？"):t("当前已启用提示词快速模式：补齐文字卡与分镜后，每段提示词只生成一次，不做自动检查和修复，随后直接连续生成视频并合并初版。继续吗？","Prompt fast mode is enabled. After completing cards and storyboards, each prompt is generated once without automatic review or repair, then videos render continuously and the initial cut is assembled. Continue?","プロンプト高速モードが有効です。カードと絵コンテを補完後、各プロンプトを1回だけ生成し、自動検査・修正を省略して映像を連続生成し、初版を結合します。続けますか？","目前已啟用提示詞快速模式：補齊文字卡與分鏡後，每段提示詞只生成一次，不做自動檢查和修復，隨後直接連續生成影片並合併初版。繼續嗎？")))return;
+    const confirmation=regenerateAll?t(
+      "将按当前保存的剧本、分镜、角色卡和设置，重新生成本集全部提示词与全部视频，并自动合并新版成片。旧提示词、旧视频和旧成片都会保留；已手工编辑的分镜不会无故重规划。继续吗？",
+      "Regenerate every prompt and video in this episode from the currently saved script, storyboard, cards and settings, then assemble a new cut automatically. Earlier prompts, takes and films remain available; manually edited storyboard clips are not replanned without cause. Continue?",
+      "現在保存されている脚本・絵コンテ・人物カード・設定から、この話の全プロンプトと全映像を再生成し、新版を自動結合します。以前のプロンプト・映像・完成版は保持され、手動編集した絵コンテは理由なく再計画されません。続けますか？",
+      "將依目前儲存的劇本、分鏡、角色卡和設定，重新生成本集全部提示詞與全部影片，並自動合併新版成片。舊提示詞、舊影片和舊成片都會保留；已手動編輯的分鏡不會無故重新規劃。繼續嗎？"
+    ):production.auto_prompt_repair?t("将为当前集依次补全文字卡、规划缺失分镜、检查并生成准确提示词，然后连续生成全部缺失视频并自动合并初版。看完初版后，你再按需启动单个或批量 AI 质检并决定是否修复；已有成果不会重复覆盖。继续吗？","Complete text cards and missing storyboard shots, verify and build accurate prompts, then continuously render every missing video and assemble the initial cut automatically. After watching that cut, optionally start AI QC for individual or multiple takes and decide whether to repair them. Existing work is preserved. Continue?","文章カードと不足分の絵コンテを補完し、正確なプロンプトを検査・生成してから不足映像を連続生成し、初版を自動結合します。初版確認後、必要なテイクだけ個別または一括でAI検査し、修正するか決められます。既存成果は保持されます。続けますか？","將為目前集依序補全文字卡、規劃缺失分鏡、檢查並生成準確提示詞，然後連續生成全部缺失影片並自動合併初版。看完初版後，再按需啟動單個或批量 AI 質檢並決定是否修復；已有成果不會重複覆蓋。繼續嗎？"):t("当前已启用提示词快速模式：补齐文字卡与分镜后，每段提示词只生成一次，不做自动检查和修复，随后直接连续生成视频并合并初版。继续吗？","Prompt fast mode is enabled. After completing cards and storyboards, each prompt is generated once without automatic review or repair, then videos render continuously and the initial cut is assembled. Continue?","プロンプト高速モードが有効です。カードと絵コンテを補完後、各プロンプトを1回だけ生成し、自動検査・修正を省略して映像を連続生成し、初版を結合します。続けますか？","目前已啟用提示詞快速模式：補齊文字卡與分鏡後，每段提示詞只生成一次，不做自動檢查和修復，隨後直接連續生成影片並合併初版。繼續嗎？");
+    if(full&&!window.confirm(confirmation))return;
     pauseRequestedRef.current=false;
-    busyRef.current=true;setBulkAction(full?"full":"all");setError("");setNotice("");
+    busyRef.current=true;setBulkAction(regenerateAll?"regenerate-all":full?"full":"all");setError("");setNotice("");
     let currentId=production.id;
     try{
       if(full)setBusy(t("全流程 · 第 1/6 步：保存并检查项目","Full run · Step 1/6: save and check project","全工程・ステップ1/6：保存と確認","全流程 · 第 1/6 步：儲存並檢查專案"));
@@ -2331,11 +2342,16 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       }
 
       stopIfPauseRequested();
-      setBusy(full?t("全流程 · 已交给后台持续制作","Full run · handing off to the durable background queue","全工程・バックグラウンドキューへ引き継ぎ","全流程 · 已交給背景持續製作"):t("正在启动可恢复的一键任务","Starting the resumable episode queue","再開可能な一括タスクを開始中","正在啟動可恢復的一鍵任務"));
-      const queued=await api("/productions/"+current.id+"/automation/start",{merge:true,review:false},undefined,"POST",{timeoutMs:30000}) as {automation:ProductionAutomation;production:Production;outputs:ProductionOutputs};
+      setBusy(regenerateAll?t("正在启动整集重新生成","Starting full-episode regeneration","全編再生成を開始中","正在啟動整集重新生成"):full?t("全流程 · 已交给后台持续制作","Full run · handing off to the durable background queue","全工程・バックグラウンドキューへ引き継ぎ","全流程 · 已交給背景持續製作"):t("正在启动可恢复的一键任务","Starting the resumable episode queue","再開可能な一括タスクを開始中","正在啟動可恢復的一鍵任務"));
+      const queued=await api("/productions/"+current.id+"/automation/start",{merge:true,review:false,regenerate_all:regenerateAll},undefined,"POST",{timeoutMs:30000}) as {automation:ProductionAutomation;production:Production;outputs:ProductionOutputs};
       current=queued.production;overview=queued.outputs;
       setProduction(current);setDraft(current);setOutputs(overview);setProductionPage("output");await refreshList();
-      setNotice(current.auto_prompt_repair?t(
+      setNotice(regenerateAll?t(
+        "整集重新生成已在后台启动。系统会依次更新全部提示词、生成全部新版视频并自动合并；旧提示词、旧视频和旧成片仍可追溯。",
+        "Full-episode regeneration has started in the background. Every prompt and video will be replaced in sequence and a new cut assembled automatically; earlier prompts, takes and films remain available.",
+        "全編再生成をバックグラウンドで開始しました。全プロンプトと映像を順に更新して新版を自動結合し、以前のプロンプト・映像・完成版も保持します。",
+        "整集重新生成已在背景啟動。系統會依序更新全部提示詞、生成全部新版影片並自動合併；舊提示詞、舊影片和舊成片仍可追溯。"
+      ):current.auto_prompt_repair?t(
         "后台任务已启动。所有提示词先通过生成前检查，再连续渲染缺失视频并在后台自动合并初版；不会逐段运行生成后质检。看完初版后，再到“视频与成片”按需启动单个或批量 AI 质检和修复。",
         "The durable background run has started. All prompts pass pre-render checks first, then missing videos render continuously and the initial cut is assembled in the background. Post-render QC does not interrupt generation. After watching the cut, optionally start AI QC and repairs in Videos & Film.",
         "バックグラウンド処理を開始しました。全プロンプトを生成前検査した後、不足映像を連続生成して初版を自動結合します。生成後検査で途中停止しません。初版確認後、映像と完成版で必要なテイクだけAI検査・修正できます。",
@@ -2392,7 +2408,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     await refreshOutputs(production?.id,true);
     setNotice(t("当前视频任务已停止。ComfyUI 视频无法从中点恢复；可回到该片段重新生成。","The current video task was stopped. ComfyUI cannot resume mid-render; regenerate that clip when ready.","現在の映像タスクを停止しました。途中再開はできないため、必要ならクリップを再生成してください。","目前影片任務已停止。ComfyUI 無法從中點恢復；可回到該片段重新生成。"));
     };
-    if(bulkAction==="videos"||bulkAction==="redo-videos"||bulkAction==="selected"||bulkAction==="all"||bulkAction==="full"){
+    if(bulkAction==="videos"||bulkAction==="redo-videos"||bulkAction==="selected"||bulkAction==="all"||bulkAction==="full"||bulkAction==="regenerate-all"){
       try{await action();}catch(e){setError((e as Error).message);}
       return;
     }
@@ -2479,7 +2495,9 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         <small>{t("仅处理当前集；自动环境关键帧遵循“设置”中的开关。","Current episode only; automatic environment keyframes follow the Settings toggle.","現在話のみ。背景キーフレームの自動生成は設定の切替に従います。","只處理目前集；自動環境關鍵影格依照「設定」中的開關。")}</small>
         <div className="production-full-runner-buttons"><button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true})}>
           {production.task_state==="paused"?<Pause size={18}/>:bulkAction==="full"||automationActive?<LoaderCircle className="spin" size={18}/>:cardPlanningNeedsRetry?<RefreshCw size={18}/>:needsEpisodeContinuation?<Play size={18}/>:<Sparkles size={18}/>}<span>{production.task_state==="paused"?t("本集已暂停","Episode paused","この話は一時停止中","本集已暫停"):automationActive?t("后台制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"Background production "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"バックグラウンド制作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length),"背景製作 "+(automation?.completed||0)+"/"+(automation?.total||production.segments.length)):bulkAction==="full"?(needsEpisodeContinuation?t("正在继续本集…","Resuming episode…","この話を再開中…","正在繼續本集…"):t("正在启动全流程…","Starting full run…","全工程を開始中…","正在啟動全流程…")):cardPlanningNeedsRetry?t("重试一键流程","Retry full pipeline","全工程を再試行","重試一鍵流程"):needsEpisodeContinuation?t("继续完成本集","Resume episode","この話を続行","繼續完成本集"):t("一键跑完全流程","Run full pipeline","全工程を一括実行","一鍵跑完全流程")}</span>
-        </button><button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
+        </button>{!!production.segments.length&&<button className="regenerate-all" disabled={production.task_state==="paused"||!!busy||automationActive||(outputs?.active_jobs||0)>0} onClick={()=>void generateEpisodeFilm({full:true,regenerateAll:true})}>
+          {bulkAction==="regenerate-all"?<LoaderCircle className="spin" size={17}/>:<RefreshCw size={17}/>}<span>{bulkAction==="regenerate-all"?t("正在重新生成整集…","Regenerating episode…","全編を再生成中…","正在重新生成整集…"):t("重新一键生成","Regenerate all","全編を再生成","重新一鍵生成")}</span>
+        </button>}<button className={production.task_state==="paused"?"task-toggle resume":"task-toggle pause"} disabled={taskStateBusy} onClick={()=>void setTaskState(production.task_state==="paused"?"active":"paused")}>
           {production.task_state==="paused"?<Play size={17}/>:<Pause size={17}/>}<span>{taskStateBusy?t("正在停止任务…","Stopping task…","タスクを停止中…","正在停止任務…"):production.task_state==="paused"?t("恢复并继续","Resume and continue","再開して続行","恢復並繼續"):busy||automationActive?t("立即暂停任务","Pause task now","タスクを今すぐ一時停止","立即暫停任務"):t("暂停本集","Pause episode","この話を一時停止","暫停本集")}</span>
         </button></div>
       </div>

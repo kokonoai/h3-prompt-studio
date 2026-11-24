@@ -25,7 +25,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  fallback_episodes, fallback_segments,
                                  fit_planned_durations, has_substantive_card_library,
                                  locked_timed_dialogue, planning_payload, storyboard_planning_chunks,
-                                 normalise_segment, production_schema_for_story, render_character_identity,
+                                 normalise_automation, normalise_segment, production_schema_for_story, render_character_identity,
                                  production_render_override, production_source_manifest,
                                  reconcile_transition_contract,
                                  render_visual_style,
@@ -44,6 +44,18 @@ from backend.video_workflows import REF8_LORA, VideoWorkflowManager
 
 def _id():
     return str(uuid.uuid4())
+
+
+def test_automation_normalisation_preserves_full_regeneration_cursor():
+    pending = [_id(), _id()]
+
+    automation = normalise_automation({
+        "status": "running", "stage": "prompts",
+        "regenerate_all": True, "regenerate_prompt_ids": pending,
+    })
+
+    assert automation["regenerate_all"] is True
+    assert automation["regenerate_prompt_ids"] == pending
 
 
 def _rig(tmp_path):

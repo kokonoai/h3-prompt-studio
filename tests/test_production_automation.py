@@ -510,6 +510,141 @@ def test_full_run_prepares_every_prompt_before_starting_continuous_rendering():
     ]
 
 
+def test_full_regeneration_rebuilds_every_completed_clip_and_keeps_a_durable_cursor():
+    state = {
+        "id": "production-1", "task_state": "active",
+        "segments": [
+            {"id": "segment-1", "index": 1, "status": "ready",
+             "stale_reasons": [], "video_prompt": "old prompt", "prompt_generation": 0},
+            {"id": "segment-2", "index": 2, "status": "ready",
+             "stale_reasons": [], "video_prompt": "old prompt", "prompt_generation": 0},
+        ],
+        "automation": {"status": "completed", "stage": "completed", "merge": True,
+                       "review": False, "completed": 2, "total": 2,
+                       "current_index": 0, "attempt": 0, "last_error": ""},
+    }
+    events, rendered, run_segments, merged, automation_updates = [], set(), {}, [], []
+
+    def outputs(_ident):
+        rows = []
+        for segment in state["segments"]:
+            replacement = segment["id"] in rendered
+            old_compatible = segment["prompt_generation"] == 0
+            selected = ({"id": "new-" + segment["id"], "status": "succeeded"}
+                        if replacement else
+                        ({"id": "old-" + segment["id"], "status": "succeeded"}
+                         if old_compatible else None))
+            rows.append({"segment_id": segment["id"], "selected": selected,
+                         "candidates": ([{"id": "old-" + segment["id"],
+                                           "status": "succeeded"}]
+                                        if old_compatible else [])})
+        return {"segments": rows, "quality_pending_count": 0}
+
+    def generate_prompt(_production_id, segment_id):
+        events.append("prompt:" + segment_id)
+        segment = next(item for item in state["segments"] if item["id"] == segment_id)
+        segment.update(video_prompt="replacement prompt", prompt_generation=1)
+
+    def submit_video(_production_id, segment_id, _request_id):
+        events.append("video:" + segment_id)
+        run_id = "new-" + segment_id
+        run_segments[run_id] = segment_id
+        return {"run": {"id": run_id, "status": "queued", "stage": "Queued"}}
+
+    def get_run(run_id):
+        rendered.add(run_segments[run_id])
+        return {"id": run_id, "status": "succeeded", "stage": "Video ready"}
+
+    def update_automation(_ident, changes):
+        automation_updates.append(copy.deepcopy(changes))
+        state["automation"].update(copy.deepcopy(changes))
+        return copy.deepcopy(state)
+
+    manager = ProductionAutomationManager(
+        list_productions=lambda: [{"id": state["id"]}],
+        get_production=lambda _ident: copy.deepcopy(state),
+        update_automation=update_automation,
+        outputs=outputs, generate_prompt=generate_prompt, submit_video=submit_video,
+        get_run=get_run, resolve_run=get_run,
+        build_film=lambda ident: merged.append(ident),
+        poll_interval=0, retry_delays=(0, 0, 0),
+    )
+
+    manager.start(state["id"], regenerate_all=True)
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    start_update = next(row for row in automation_updates
+                        if row.get("stage_detail") == "Preparing every clip for regeneration")
+    assert start_update["regenerate_all"] is True
+    assert start_update["regenerate_prompt_ids"] == ["segment-1", "segment-2"]
+    assert events == [
+        "prompt:segment-1", "prompt:segment-2",
+        "video:segment-1", "video:segment-2",
+    ]
+    assert merged == [state["id"]]
+    assert state["automation"]["regenerate_all"] is False
+    assert state["automation"]["regenerate_prompt_ids"] == []
+
+
+def test_resuming_full_regeneration_keeps_only_the_remaining_prompt_cursor():
+    state = {
+        "id": "production-1", "task_state": "active",
+        "segments": [
+            {"id": "segment-1", "index": 1, "status": "ready",
+             "stale_reasons": [], "video_prompt": "replacement prompt"},
+            {"id": "segment-2", "index": 2, "status": "ready",
+             "stale_reasons": [], "video_prompt": "old prompt"},
+        ],
+        "automation": {
+            "status": "needs_attention", "stage": "prompts", "merge": True,
+            "review": False, "regenerate_all": True,
+            "regenerate_prompt_ids": ["segment-2"],
+            "completed": 1, "total": 2, "current_index": 2,
+            "attempt": 0, "last_error": "temporary clip failure",
+        },
+    }
+    events, rendered, run_segments = [], {"segment-1"}, {}
+
+    def outputs(_ident):
+        return {"segments": [
+            {"segment_id": segment["id"],
+             "selected": ({"id": "run-" + segment["id"], "status": "succeeded"}
+                          if segment["id"] in rendered else None),
+             "candidates": []}
+            for segment in state["segments"]
+        ], "quality_pending_count": 0}
+
+    def generate_prompt(_production_id, segment_id):
+        events.append("prompt:" + segment_id)
+        segment = next(item for item in state["segments"] if item["id"] == segment_id)
+        segment["video_prompt"] = "replacement prompt"
+
+    def submit_video(_production_id, segment_id, _request_id):
+        events.append("video:" + segment_id)
+        run_id = "run-" + segment_id
+        run_segments[run_id] = segment_id
+        return {"run": {"id": run_id, "status": "queued", "stage": "Queued"}}
+
+    def get_run(run_id):
+        rendered.add(run_segments[run_id])
+        return {"id": run_id, "status": "succeeded", "stage": "Video ready"}
+
+    manager = ProductionAutomationManager(
+        list_productions=lambda: [{"id": state["id"]}],
+        get_production=lambda _ident: copy.deepcopy(state),
+        update_automation=lambda _ident, changes: (
+            state["automation"].update(copy.deepcopy(changes)) or copy.deepcopy(state)),
+        outputs=outputs, generate_prompt=generate_prompt, submit_video=submit_video,
+        get_run=get_run, resolve_run=get_run, build_film=lambda _ident: None,
+        poll_interval=0, retry_delays=(0, 0, 0),
+    )
+
+    manager.start(state["id"])
+    wait_for(lambda: state["automation"]["status"] == "completed")
+
+    assert events == ["prompt:segment-2", "video:segment-2"]
+
+
 def test_clip_local_prompt_failure_is_isolated_while_other_clips_finish():
     state = {
         "id": "production-1", "task_state": "active",

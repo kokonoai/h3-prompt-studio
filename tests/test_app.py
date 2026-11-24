@@ -702,6 +702,14 @@ def test_episode_automation_ignores_legacy_review_and_no_merge_switches(server, 
     assert response.status_code == 200
     assert starts == [(production_id, {'merge': True, 'review': False})]
 
+    response = client.post(
+        f'/api/productions/{production_id}/automation/start', headers=auth(module),
+        json={'regenerate_all': True})
+
+    assert response.status_code == 200
+    assert starts[-1] == (production_id, {
+        'merge': True, 'review': False, 'regenerate_all': True})
+
 
 def test_pausing_a_production_immediately_freezes_its_background_queue(tmp_path, monkeypatch):
     monkeypatch.setenv("H3_STUDIO_DATA", str(tmp_path / "studio-data"))

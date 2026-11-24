@@ -2166,18 +2166,21 @@ def production_automation_get(production_id: str):
 @app.post('/api/productions/{production_id}/automation/start')
 def production_automation_start(production_id: str, body: dict):
     production_id = safe_id(production_id)
-    if not isinstance(body, dict) or set(body) - {'merge', 'review'}:
-        raise ValueError('Automation start accepts only merge and review options.')
+    if not isinstance(body, dict) or set(body) - {'merge', 'review', 'regenerate_all'}:
+        raise ValueError('Automation start accepts only merge, review and regenerate_all options.')
     merge = body.get('merge', True)
     review = body.get('review', False)
-    if type(merge) is not bool or type(review) is not bool:
-        raise ValueError('Automation merge and review options must be true or false.')
+    regenerate_all = body.get('regenerate_all', False)
+    if type(merge) is not bool or type(review) is not bool or type(regenerate_all) is not bool:
+        raise ValueError('Automation merge, review and regenerate_all options must be true or false.')
     # Legacy clients may still send the old switches.  Full-episode automation
     # now has one invariant path: prompt preflight, continuous rendering and a
     # durable initial assembly.  Video QC is started only through its explicit
     # single/batch endpoints after the user watches that cut.
-    automation = production_automation_manager().start(
-        production_id, merge=True, review=False)
+    options = {'merge': True, 'review': False}
+    if regenerate_all:
+        options['regenerate_all'] = True
+    automation = production_automation_manager().start(production_id, **options)
     return {'automation': automation, 'production': production_manager().get(production_id),
             'outputs': production_outputs(production_id)}
 

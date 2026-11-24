@@ -3803,6 +3803,9 @@ def normalise_automation(value):
         raise ValueError("Automation merge must be true or false.")
     if type(legacy_review) is not bool:
         raise ValueError("Automation post-render review must be true or false.")
+    regenerate_all = value.get("regenerate_all", False)
+    if type(regenerate_all) is not bool:
+        raise ValueError("Automation regenerate_all must be true or false.")
     status = _text(value.get("status"), "automation status", 32, "idle") or "idle"
     stage = _text(value.get("stage"), "automation stage", 32, "idle") or "idle"
     if status not in AUTOMATION_STATUSES:
@@ -3839,6 +3842,18 @@ def normalise_automation(value):
     # One durable row per clip. Preserve the most recent row when a defensive
     # retry reports the same clip twice.
     blocked_segments = list({row["segment_id"]: row for row in blocked_segments}.values())[:MAX_SEGMENTS]
+    regenerate_prompt_ids = []
+    raw_regenerate_prompt_ids = value.get("regenerate_prompt_ids", [])
+    if isinstance(raw_regenerate_prompt_ids, list):
+        for segment_id in raw_regenerate_prompt_ids:
+            try:
+                segment_id = safe_id(segment_id)
+            except (TypeError, ValueError):
+                continue
+            if segment_id not in regenerate_prompt_ids:
+                regenerate_prompt_ids.append(segment_id)
+            if len(regenerate_prompt_ids) >= MAX_SEGMENTS:
+                break
     result = {
         "status": status,
         "stage": stage,
@@ -3849,6 +3864,11 @@ def normalise_automation(value):
         # the same prompt-check -> render -> initial-cut workflow.
         "merge": True,
         "review": False,
+        # A full regeneration is durable: this pending list is reduced only
+        # after each replacement prompt is saved.  Old prompts, takes and
+        # assembled films remain in their normal history stores.
+        "regenerate_all": regenerate_all,
+        "regenerate_prompt_ids": regenerate_prompt_ids,
         "requested_by": _text(value.get("requested_by"), "automation requester", 32, "user") or "user",
         "current_segment_id": value.get("current_segment_id") or None,
         "current_index": value.get("current_index", 0),

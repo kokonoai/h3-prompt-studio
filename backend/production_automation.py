@@ -179,7 +179,8 @@ class ProductionAutomationManager:
         worker = self.workers.get(production_id)
         return bool(worker and worker.is_alive())
 
-    def start(self, production_id, *, merge=True, review=False, requested_by="user"):
+    def start(self, production_id, *, merge=True, review=False, regenerate_all=False,
+              requested_by="user"):
         production = self.get_production(production_id)
         if production.get("task_state") == "paused":
             raise ValueError("This production is paused. Resume it before starting the background run.")
@@ -189,12 +190,27 @@ class ProductionAutomationManager:
             if self._worker_alive(production_id):
                 return self.get_production(production_id).get("automation", {})
             current = production.get("automation", {})
-            started_at = current.get("started_at") or time.time()
+            if type(regenerate_all) is not bool:
+                raise ValueError("Automation regenerate_all must be true or false.")
+            resuming_regeneration = bool(current.get("regenerate_all")) and current.get(
+                "status") in {"running", "retrying", "paused", "needs_attention"}
+            effective_regeneration = regenerate_all or resuming_regeneration
+            if regenerate_all:
+                regenerate_prompt_ids = [row["id"] for row in production.get("segments", [])]
+            elif resuming_regeneration:
+                regenerate_prompt_ids = list(current.get("regenerate_prompt_ids", []))
+            else:
+                regenerate_prompt_ids = []
+            started_at = ((current.get("started_at") or time.time())
+                          if resuming_regeneration else time.time())
             self._update(
                 production_id, status="running", stage="scan",
                 merge=bool(merge), review=bool(review), requested_by=requested_by, started_at=started_at,
                 finished_at=None, last_error="", blocked_segments=[],
-                stage_detail="Checking missing work",
+                regenerate_all=effective_regeneration,
+                regenerate_prompt_ids=regenerate_prompt_ids,
+                stage_detail=("Preparing every clip for regeneration"
+                              if effective_regeneration else "Checking missing work"),
             )
             worker = threading.Thread(
                 target=self._run, args=(production_id,), daemon=True,
@@ -484,7 +500,7 @@ class ProductionAutomationManager:
         max_attempts = len(self.retry_delays) + 1
         for attempt in range(max_attempts):
             if self._pause_if_requested(production_id):
-                return
+                raise ProductionPauseRequested()
             self._update(
                 production_id, status="running", stage="prompts",
                 current_segment_id=segment_id, current_index=index,
@@ -655,6 +671,8 @@ class ProductionAutomationManager:
                 completed_ids = self._selected_segment_ids(overview)
                 automation = production.get("automation", {})
                 review_after_render = bool(automation.get("review", False))
+                regenerate_all = bool(automation.get("regenerate_all", False))
+                regenerate_prompt_ids = set(automation.get("regenerate_prompt_ids", []))
                 blocked_rows = list(automation.get("blocked_segments", []))
                 blocked_ids = {row.get("segment_id") for row in blocked_rows}
                 self._update(production_id, status="running", total=len(segments),
@@ -674,19 +692,25 @@ class ProductionAutomationManager:
                                 production_id, active_segment, "videos", str(exc))
                         continue
 
-                quality_blocked = self._quality_blocked_rows(overview, segments)
+                # Explicit full regeneration replaces even a previously
+                # rejected take.  That old take remains visible as evidence,
+                # but it must not quarantine the replacement run.
+                quality_blocked = ([] if regenerate_all else
+                                   self._quality_blocked_rows(overview, segments))
                 quality_blocked_ids = {row.get("segment_id") for row in quality_blocked}
 
                 # Phase 1: prepare and preflight every missing prompt.  No new
                 # video is submitted until this pass is complete.
                 prompt_candidates = [
                     segment for segment in segments
-                    if segment.get("id") not in quality_blocked_ids
+                    if (segment.get("id") in regenerate_prompt_ids
+                        or segment.get("id") not in quality_blocked_ids)
                     and segment.get("id") not in blocked_ids
-                    and (segment.get("id") not in completed_ids
-                         or segment.get("status") != "ready"
-                         or bool(segment.get("stale_reasons")))
-                    and self._prompt_needs_build(segment)
+                    and (segment.get("id") in regenerate_prompt_ids
+                         or ((segment.get("id") not in completed_ids
+                              or segment.get("status") != "ready"
+                              or bool(segment.get("stale_reasons")))
+                             and self._prompt_needs_build(segment)))
                 ]
                 prompt_target = next((segment for segment in prompt_candidates
                                       if segment.get("quality_repair_direction")), None)
@@ -695,6 +719,18 @@ class ProductionAutomationManager:
                 if prompt_target is not None:
                     try:
                         self._prepare_prompt(production_id, prompt_target)
+                        if prompt_target.get("id") in regenerate_prompt_ids:
+                            current_automation = self.get_production(production_id).get(
+                                "automation", {})
+                            remaining = [
+                                segment_id for segment_id in current_automation.get(
+                                    "regenerate_prompt_ids", [])
+                                if segment_id != prompt_target.get("id")
+                            ]
+                            self._update(
+                                production_id, regenerate_prompt_ids=remaining,
+                                stage_detail=f"Replacement prompt ready for clip {prompt_target.get('index')}",
+                            )
                     except Exception as exc:
                         if is_global_failure(str(exc)):
                             raise
@@ -793,7 +829,8 @@ class ProductionAutomationManager:
                              completed=len(segments), total=len(segments),
                              current_segment_id=None, current_index=0,
                              run_id=None, request_id=None, attempt=0,
-                              stage_detail=detail, last_error="",
+                             regenerate_all=False, regenerate_prompt_ids=[],
+                             stage_detail=detail, last_error="",
                              finished_at=time.time())
                 return
         except ProductionPauseRequested:

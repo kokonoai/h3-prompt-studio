@@ -201,6 +201,25 @@ describe("episode batch production",()=>{
     expect(snapshot?.percent).toBeGreaterThan(3);
   });
 
+  it("shows replacement progress without counting old takes during full regeneration",()=>{
+    const automation:any={
+      status:"running",stage:"prompts",current_index:2,completed:0,total:2,
+      merge:false,review:false,regenerate_all:true,regenerate_prompt_ids:["clip-2"],
+    };
+    const segments:any[]=[
+      {id:"clip-1",status:"ready",video_prompt:"new one",stale_reasons:[]},
+      {id:"clip-2",status:"ready",video_prompt:"old two",stale_reasons:[]},
+    ];
+    const outputs:any={segment_count:2,ready_count:2,segments:[
+      {segment_id:"clip-1",selected:{id:"new-1",status:"succeeded",video_url:"/new-one"},candidates:[{status:"succeeded",video_url:"/old-one"}]},
+      {segment_id:"clip-2",selected:{id:"old-2",status:"succeeded",video_url:"/old-two"},candidates:[{status:"succeeded",video_url:"/old-two"}]},
+    ]};
+
+    expect(productionAutomationSnapshot(automation,segments,outputs)).toMatchObject({
+      promptReady:1,rendered:1,accepted:1,percent:50,
+    });
+  });
+
   it("keeps manual post-render QC outside the active generation percentage",()=>{
     const automation:any={status:"running",stage:"videos",current_index:2,completed:0,total:2,merge:false,review:false};
     const segments:any[]=[
