@@ -1855,7 +1855,7 @@ The fine fiber trembles once.
 
 The fold rises and settles.
 
-**旁白**　“The most beautiful kind of love isn’t about finding someone perfect.”
+**旁白**　*The most beautiful kind of love isn’t about finding someone perfect.*
 
 **声音**　Soft paper rustle.
 """
@@ -1894,6 +1894,53 @@ The fold rises and settles.
     assert "It took me a while to understand…" in compiled["prompt"]
     assert "No scripted speech is assigned to this clip." not in compiled["prompt"]
     assert "Stable recurring voice identity key: production narrator Narrator" in compiled["prompt"]
+
+
+@pytest.mark.parametrize("cue,expected", [
+    ("**旁白**　“Quoted narration.”", "Quoted narration."),
+    ("**旁白**　*Italic narration.*", "Italic narration."),
+    ("**旁白**　Plain narration.", "Plain narration."),
+    ("**Voice-over**  *English italic voice-over.*", "English italic voice-over."),
+])
+def test_colonless_explicit_voiceover_accepts_quoted_italic_and_plain_text(cue, expected):
+    assert script_dialogue(cue, "Narrator") == [{
+        "speaker": "Narrator", "text": expected, "voiceover": True,
+    }]
+
+
+def test_saved_silent_storyboard_is_replanned_after_voiceover_parser_upgrade(tmp_path):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    screenplay = """### 01｜00:00–00:05 · Sunset
+
+The golden circle holds still.
+
+**旁白**　*The setting sun is caught among the boughs,*
+
+### 02｜00:05–00:09 · Clouds
+
+Clouds veil the light.
+
+**旁白**　*its last light veiled in clouds of gold.*
+"""
+    production = manager.create({
+        "source_project": source, "brief": screenplay,
+        "episode_minutes": .5, "language": "en",
+    })
+    planned = fallback_segments(
+        screenplay, target_seconds=9, language="en",
+        voiceover_speaker=default_voiceover_speaker(production))
+    production = manager.apply_plan(production["id"], planned, "fallback")
+    assert [line["text"] for segment in production["segments"]
+            for line in segment["dialogue"]] == [
+        "The setting sun is caught among the boughs,",
+        "its last light veiled in clouds of gold.",
+    ]
+
+    production["segments"][0]["dialogue"] = []
+    outdated = manager.save(production)
+
+    assert outdated["planner_warning"].startswith(
+        "Authored dialogue or narration is missing")
 
 
 def test_numeric_authored_shot_ranges_override_decimal_minute_target(tmp_path):

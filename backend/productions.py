@@ -851,9 +851,10 @@ def _speaker_marker(value):
         r"(?:\*\*|__|[*_])?\s*(?P<inline>.*)$", value, re.I)
     if not marker:
         # Common prose storyboards use a bold cue followed by an ideographic
-        # space instead of a colon: ``**旁白**　“Exact line.”``.  Keep this
-        # colon-less form deliberately restricted to explicit narration cues;
-        # ordinary bold section labels must not become invented speakers.
+        # space instead of a colon: ``**旁白**　“Exact line.”`` or
+        # ``**旁白**　*Exact line.*``.  Keep this colon-less form deliberately
+        # restricted to explicit narration cues; the cue itself is sufficient
+        # evidence, so quoted, italic and plain narration are all preserved.
         inline_voiceover = re.match(
             r"^(?:>\s*)?(?:[-+]\s*)?(?P<token>\*\*|__)"
             r"(?P<label>[^\r\n]{1,120}?)(?P=token)[ \t\u3000]+"
@@ -862,7 +863,7 @@ def _speaker_marker(value):
             label = inline_voiceover.group("label").strip()
             inline = _strip_script_markdown(inline_voiceover.group("inline"))
             is_voiceover, _owner = _voiceover_cue_speaker(label)
-            if is_voiceover and inline and inline[0] in _DIALOGUE_OPENERS:
+            if is_voiceover and inline:
                 return label, inline_voiceover.group("inline").strip()
     if not marker:
         return None
@@ -1072,6 +1073,33 @@ def locked_timed_dialogue(production, story=None):
                        "requires_translation": requires_translation,
                        "dialogue_parse_failed": _dialogue_signal_count(group["text"]) > len(parsed)})
     return groups
+
+
+def storyboard_authored_dialogue_outdated(production):
+    """Detect saved storyboards created before current dialogue parsing rules.
+
+    Storyboard clips may merge adjacent authored shots, so compare the ordered
+    episode-wide line roster rather than clip boundaries. Exact-language lines
+    must retain their text; translated lines retain count and voiceover role.
+    """
+    if not production.get("segments"):
+        return False
+    expected = []
+    for group in locked_timed_dialogue(production):
+        translated = bool(group.get("requires_translation"))
+        expected.extend((line, translated) for line in group.get("source_dialogue", []))
+    if not expected:
+        return False
+    actual = [line for segment in production.get("segments", [])
+              for line in segment.get("dialogue", [])]
+    if len(actual) != len(expected):
+        return True
+    for (source, translated), saved in zip(expected, actual):
+        if bool(source.get("voiceover", False)) != bool(saved.get("voiceover", False)):
+            return True
+        if not translated and source.get("text", "").strip() != saved.get("text", "").strip():
+            return True
+    return False
 
 
 _SOURCE_SCENE_HEADING = re.compile(
@@ -5085,6 +5113,13 @@ class ProductionManager:
         # source bindings once; partial or contradictory bindings remain
         # visible as errors instead of being silently repaired.
         audit_storyboard_contract(result, backfill_legacy=True)
+        if storyboard_authored_dialogue_outdated(result):
+            warning = str(result.get("planner_warning") or "").strip()
+            if (not warning or
+                    warning.startswith("Continuity guard corrected temporal cast conflicts:")):
+                result["planner_warning"] = (
+                    "Authored dialogue or narration is missing from the saved storyboard. "
+                    "Regenerate the storyboard so every source line is preserved before rendering.")
         current_context_hash = production_context_hash(result)
         upstream_changed = False
         for segment in result["segments"]:
