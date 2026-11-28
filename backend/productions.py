@@ -336,6 +336,7 @@ COMPACT STRUCTURED OUTPUT
 - Keep the JSON production-usable but concise so local models can finish it. Use a short title; one or two sentences for story; one sentence for setting; one to three sentences for action; one sentence for ending; one short clause for duration_reason; and one or two sentences for image_prompt.
 - Never repeat the character bible, voice cards, visual-style bible, card descriptions or these instructions inside a segment. Refer to cards only by their exact names in card_selection.
 - Authored dialogue is the exception: preserve every required line verbatim (or faithfully translated when requested), even when that makes a segment longer.
+- Treat screenplay speech tags and bracketed language labels as formatting. Put only the spoken words in structured dialogue, preserving the complete cue across lines. Never copy the tags or the spoken words into visual direction.
 
 ENSEMBLE GENERATION SAFETY
 - Prefer 1-4 visible named identities in one generation clip. When a source block requires more, subdivide at a causal action boundary so each adjacent clip preserves story order and total duration. Do not omit required characters merely to satisfy this preference.
@@ -760,7 +761,7 @@ def _authored_action_cue(text, character_names):
     """Remove quoted speech while retaining authored physical action."""
     names = {name.strip().casefold() for name in character_names if name.strip()}
     rows = []
-    for raw in str(text or "").splitlines():
+    for raw in _without_tagged_dialogue(text).splitlines():
         line = raw.strip()
         if not line or line[0] in "“‘\"'":
             continue
@@ -818,6 +819,14 @@ def authored_internal_timing(production, segment):
 
 
 _DIALOGUE_OPENERS = "“‘\"'「『"
+_TAGGED_DIALOGUE_OPEN = re.compile(r"^<d>", re.I)
+_TAGGED_DIALOGUE_CLOSE = re.compile(r"</d>\s*$", re.I)
+_TAGGED_DIALOGUE_LANGUAGE = re.compile(
+    r"^\[(?:Arabic|Chinese|English|French|German|Italian|Japanese|Korean|"
+    r"Portuguese|Russian|Spanish|Mandarin|Simplified Chinese|Traditional Chinese)\]\s*", re.I)
+_TAGGED_SPEECH_OWNER = re.compile(
+    r"^(?P<speaker>.+?)\s+says"
+    r"(?P<voiceover>\s+in\s+(?:an?\s+)?(?:off[- ]screen\s+)?voice[- ]?over)?$", re.I)
 
 
 def _strip_script_markdown(value):
@@ -842,6 +851,57 @@ def _clean_dialogue_value(value):
     if len(value) >= 2 and value[0] in pairs and value[-1] == pairs[value[0]]:
         value = value[1:-1].strip()
     return value
+
+
+def _tagged_dialogue_spans(rows, voiceover_speaker=None):
+    """Read explicit, balanced screenplay dialogue tags, including across lines."""
+    index = 0
+    while index < len(rows):
+        start = index
+        index += 1
+        first, _, tail = rows[start].partition("\n")
+        if "<d>" not in first.casefold():
+            continue
+        marker = _speaker_marker(first)
+        if not marker or editorial_speaker_label(marker[0]):
+            continue
+        label, inline = marker
+        if not _TAGGED_DIALOGUE_OPEN.match(inline):
+            continue
+        text = inline[3:] + ("\n" + tail if tail else "")
+        end = index
+        while (len(text) <= 2000 and not _TAGGED_DIALOGUE_CLOSE.search(text)
+               and end < len(rows) and not re.search(r"<d>", rows[end], re.I)):
+            text += "\n" + rows[end]
+            end += 1
+        closing = _TAGGED_DIALOGUE_CLOSE.search(text)
+        if not closing or re.search(r"</?d>", text[:closing.start()], re.I):
+            continue
+        text = _TAGGED_DIALOGUE_LANGUAGE.sub("", text[:closing.start()].strip())
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        declared = _TAGGED_SPEECH_OWNER.fullmatch(label)
+        if declared:
+            owner = declared["speaker"].strip()
+            is_voiceover = bool(declared["voiceover"])
+        else:
+            is_voiceover, owner = _voiceover_cue_speaker(label, voiceover_speaker)
+            owner = (owner or label) if is_voiceover else label
+        if text and owner:
+            row = {"speaker": owner, "text": text}
+            if is_voiceover:
+                row["voiceover"] = True
+            yield start, end, row
+            index = end
+
+
+def _without_tagged_dialogue(text):
+    text = str(text or "")
+    if "<d>" not in text.casefold():
+        return text
+    rows = text.splitlines()
+    spoken = {index for start, end, _ in _tagged_dialogue_spans(rows)
+              for index in range(start, end)}
+    return "\n".join(line for index, line in enumerate(rows) if index not in spoken).strip()
 
 
 def _speaker_marker(value):
@@ -961,8 +1021,13 @@ def default_voiceover_speaker(production):
 def _dialogue_signal_count(text):
     """Count strong cue+quote signals independently from the main parser."""
     rows = [raw.strip() for raw in str(text or "").splitlines() if raw.strip()]
-    count, voiceover_pending = 0, False
+    tagged = list(_tagged_dialogue_spans(rows))
+    covered = {index for start, end, _ in tagged for index in range(start, end)}
+    count, voiceover_pending = len(tagged), False
     for index, raw in enumerate(rows):
+        if index in covered:
+            voiceover_pending = False
+            continue
         marker = _speaker_marker(raw)
         if not marker:
             if voiceover_pending and raw.lstrip().startswith(">"):
@@ -997,7 +1062,17 @@ def _dialogue_signal_count(text):
 def script_dialogue(text, voiceover_speaker=None):
     """Extract quoted dialogue from plain text and common Markdown scripts."""
     result, pending, pending_voiceover = [], None, False
-    for raw in str(text or "").splitlines():
+    rows = str(text or "").splitlines()
+    tagged = {start: (end, cue) for start, end, cue in _tagged_dialogue_spans(rows, voiceover_speaker)}
+    skip_until = 0
+    for index, raw in enumerate(rows):
+        if index < skip_until:
+            continue
+        if index in tagged:
+            skip_until, cue = tagged[index]
+            result.append(cue)
+            pending, pending_voiceover = None, False
+            continue
         line = raw.strip()
         if not line:
             continue
@@ -1156,7 +1231,15 @@ def source_manifest_for_text(text, chunk_index=1, voiceover_speaker=None):
     scenes, paragraphs, dialogue, events = [], [], [], []
     scene_number, current_scene = 1, f"{prefix}-S001"
     scenes.append({"id": current_scene, "title": "Scene 1"})
-    for block in _source_blocks(text):
+    blocks = _source_blocks(text)
+    tagged = {}
+    continuation = {}
+    for start, end, cue in _tagged_dialogue_spans(blocks, voiceover_speaker):
+        tagged[start] = cue
+        for index in range(start + 1, end):
+            continuation[index] = start
+    tagged_dialogue_ids = {}
+    for index, block in enumerate(blocks):
         clean = _strip_script_markdown(block).strip()
         heading = bool(
             _SOURCE_SCENE_HEADING.search(clean) or _SOURCE_TIMECODE_ONLY.fullmatch(clean) or
@@ -1169,19 +1252,34 @@ def source_manifest_for_text(text, chunk_index=1, voiceover_speaker=None):
             else:
                 scenes[0]["title"] = clean[:240]
         paragraph_id = f"{prefix}-P{len(paragraphs) + 1:03d}"
-        parsed = script_dialogue(block, voiceover_speaker)
+        parsed = ([tagged[index]] if index in tagged else [] if index in continuation
+                  else script_dialogue(block, voiceover_speaker))
+        # Retain the previously assigned paragraph/event IDs for continuation
+        # rows so an existing storyboard keeps its source bindings.
+        covered_by = tagged_dialogue_ids.get(continuation.get(index))
+        if covered_by:
+            source_text = f"Continuation of {covered_by}; already covered by its spoken dialogue."
+        elif index in tagged:
+            cue = tagged[index]
+            role = " (voiceover)" if cue.get("voiceover") else ""
+            source_text = f"{cue['speaker']}{role}:\n{cue['text']}"[:2000]
+        else:
+            source_text = block[:2000]
         paragraphs.append({"id": paragraph_id, "scene_id": current_scene,
                            "kind": "heading" if heading else "dialogue" if parsed else "action",
-                           "text": block[:2000]})
+                           "text": source_text})
         for line in parsed:
             dialogue.append({"id": f"{prefix}-D{len(dialogue) + 1:03d}",
                              "scene_id": current_scene, "paragraph_id": paragraph_id,
                              "speaker": line["speaker"], "text": line["text"],
                              "voiceover": bool(line.get("voiceover", False))})
+            if index in tagged:
+                tagged_dialogue_ids[index] = dialogue[-1]["id"]
+                dialogue[-1]["tagged_source"] = True
         if not heading and not parsed:
             events.append({"id": f"{prefix}-E{len(events) + 1:03d}",
                            "scene_id": current_scene, "paragraph_id": paragraph_id,
-                           "text": block[:2000]})
+                           "text": source_text})
     return {"chunk": int(chunk_index), "source_hash": _hash(str(text or "")),
             "scenes": scenes, "paragraphs": paragraphs, "dialogue": dialogue, "events": events}
 
@@ -4103,6 +4201,39 @@ def _flatten_manifest(manifest, kind):
     return [row for chunk in manifest.get("chunks", []) for row in chunk.get(kind, [])]
 
 
+def _restore_unrendered_tagged_dialogue(production, manifest):
+    """Restore legacy truncated utterances only when their source ID agrees."""
+    sources = {row["id"]: row for row in _flatten_manifest(manifest, "dialogue")
+               if row.get("tagged_source")}
+    if not sources:
+        return
+    language = production["language"]
+    for segment in production["segments"]:
+        if any(segment.get(key) for key in ("video_prompt", "last_video_run_id", "selected_video_run_id")):
+            continue
+        lines = segment["dialogue"]
+        refs = segment["source_refs"]["dialogue_ids"]
+        if len(lines) != len(refs):
+            continue
+        old_hash = segment_hash(segment)
+        for line, ref in zip(lines, refs):
+            source = sources.get(ref)
+            if (not source or not _TAGGED_DIALOGUE_OPEN.match(line["text"])
+                    or line["voiceover"] != source["voiceover"]
+                    or not _dialogue_already_matches_language(source["text"], language)
+                    or len(source["text"]) > 1000):
+                continue
+            previous = _TAGGED_DIALOGUE_CLOSE.sub("", line["text"][3:]).strip()
+            previous = _TAGGED_DIALOGUE_LANGUAGE.sub("", previous).strip()
+            if previous and previous in (source["text"], source["text"].splitlines()[0].strip()):
+                line.update(speaker=source["speaker"], text=source["text"],
+                            language=PRODUCTION_LANGUAGES[language])
+        # This import repair affects only the as-yet unbuilt prompt. Keep its
+        # storyboard revision hash current so unrelated adopted takes stay ready.
+        if segment["source_hash"] == old_hash:
+            segment["source_hash"] = segment_hash(segment)
+
+
 def _distribute_source_refs(manifest, segments):
     """Backfill legacy/fallback clips in source order without inventing coverage."""
     if not segments:
@@ -4405,9 +4536,10 @@ def validate_planned_timed_batch_source_contract(groups, start_index, planned,
     return result
 
 
-def audit_storyboard_contract(production, *, backfill_legacy=True):
+def audit_storyboard_contract(production, *, backfill_legacy=True, manifest=None):
     """Derive coverage and adjacent-continuity reports for every saved clip."""
-    manifest = production_source_manifest(production)
+    if manifest is None:
+        manifest = production_source_manifest(production)
     segments = production.get("segments", [])
     if backfill_legacy and segments and not any(
             any(segment.get("source_refs", {}).get(key, []) for key in SOURCE_REF_KEYS)
@@ -5191,7 +5323,9 @@ class ProductionManager:
         # order on every load/save. Legacy projects receive deterministic
         # source bindings once; partial or contradictory bindings remain
         # visible as errors instead of being silently repaired.
-        audit_storyboard_contract(result, backfill_legacy=True)
+        manifest = production_source_manifest(result)
+        _restore_unrendered_tagged_dialogue(result, manifest)
+        audit_storyboard_contract(result, backfill_legacy=True, manifest=manifest)
         if storyboard_authored_dialogue_outdated(result):
             warning = str(result.get("planner_warning") or "").strip()
             if (not warning or
@@ -6301,7 +6435,8 @@ class ProductionManager:
             self.repair_video_mode_settings(production, base)
         relevant_cards = self._relevant_cards(production, segment)
         def clip_text(value):
-            return canonicalise_character_mentions(value, production, relevant_cards["characters"])
+            return canonicalise_character_mentions(
+                _without_tagged_dialogue(value), production, relevant_cards["characters"])
 
         # Render exact selected-card names into the detached clip project. The
         # source episode and card library retain their authored language.
@@ -7779,9 +7914,30 @@ class ProductionManager:
         return bool(inherited and inherited in current)
 
 
-def planning_chunks(story, limit=4500):
+def planning_chunks(story, limit=4500, *, keep_tagged_dialogue=False):
     """Keep each structured answer small enough for local-model token limits."""
     units = [x for x in re.split(r"(?<=\n)|(?<=[。！？!?；;])", story) if x.strip()]
+    if keep_tagged_dialogue:
+        # Keep all words in one planner request if the speech would otherwise
+        # cross a chunk boundary. Preserve existing splitting for other prose.
+        packed, pending = [], []
+        for unit in units:
+            folded = unit.casefold()
+            if "<d>" in folded:
+                packed.extend(pending)
+                pending = []
+                if "</d>" not in folded:
+                    pending.append(unit)
+                    continue
+            if pending:
+                pending.append(unit)
+                if "</d>" in folded:
+                    tagged_unit = "".join(pending)
+                    packed.extend([tagged_unit] if len(tagged_unit) <= limit else pending)
+                    pending = []
+            else:
+                packed.append(unit)
+        units = packed + pending
     chunks, current = [], ""
     for unit in units:
         if current and len(current) + len(unit) > limit:
@@ -7808,7 +7964,7 @@ def storyboard_planning_chunks(story):
     five segment objects per call while preserving source order and line
     breaks through ``planning_chunks``.
     """
-    return planning_chunks(story, limit=2000)
+    return planning_chunks(story, limit=2000, keep_tagged_dialogue=True)
 
 
 def split_storyboard_source_chunk(story, chunk_index, source_manifest=None):

@@ -30,6 +30,7 @@ from backend.productions import (CARD_KINDS, REFERENCE_STRATEGY_VERSION, Product
                                  reconcile_transition_contract,
                                  render_visual_style,
                                  scoped_character_bible, script_dialogue, segment_hash, shot_preflight_for_segment,
+                                 source_manifest_for_text,
                                  split_storyboard_source_chunk, split_truncated_card_chunk,
                                  storyboard_part_timing,
                                  storyboard_timed_batches, timed_batch_source_manifest,
@@ -1965,6 +1966,75 @@ def test_colonless_bold_character_cue_preserves_quoted_dialogue_only():
         {"speaker": "YUKI", "text": "What are you doing?"},
     ]
     assert script_dialogue("**Sound** A short airy whoosh.") == []
+
+
+def test_tagged_screenplay_preserves_multiline_speech_and_source_ids():
+    cue = "Narrator (S1) says in an off-screen voiceover: <d>[English] Look closely:\nlight still moves.</d>"
+    expected = {"speaker": "Narrator (S1)", "text": "Look closely:\nlight still moves.", "voiceover": True}
+    assert script_dialogue(cue) == [expected]
+    manifest = source_manifest_for_text(f"A sleepy hillside.\n{cue}\nThe sky darkens.")
+    assert [(line["id"], line["text"]) for line in manifest["dialogue"]] == [
+        ("C01-D001", expected["text"]),
+    ]
+    assert [row["id"] for row in manifest["paragraphs"]] == [f"C01-P00{i}" for i in range(1, 5)]
+    assert [event["paragraph_id"] for event in manifest["events"]] == ["C01-P001", "C01-P003", "C01-P004"]
+    assert "light still moves" not in manifest["events"][1]["text"]
+
+    story = "A" * 1930 + ".\n" + cue + "\nThe sky darkens."
+    pieces = storyboard_planning_chunks(story)
+    assert len(pieces) == 2
+    assert script_dialogue(pieces[1]) == [expected]
+
+
+def test_saved_tagged_narration_recovers_in_place_without_invalidating_other_takes(tmp_path):
+    manager, source, projects, _assets, _store_asset = _rig(tmp_path)
+    cue = "Narrator (S1) says in an off-screen voiceover: <d>[English] Look closely:\nlight still moves.</d>"
+    production = manager.create({"source_project": source, "brief": cue + "\nThe sky darkens.", "language": "en"})
+    for index, (title, story) in enumerate((('Hillside', 'A hillside beneath a dark sky.\n' + cue),
+                                            ('Sky', 'The sky darkens.'))):
+        row = normalise_segment({
+            "title": title, "story": story, "action": story, "duration": 8,
+            "cast_timeline": {}, "transition_mode": "hard_cut", "continue_previous": False,
+            "source_contract_version": 1, "source_refs": {
+                "scene_ids": ["C01-S001"], "paragraph_ids": ["C01-P001", "C01-P002"] if index == 0 else ["C01-P003"],
+                "dialogue_ids": ["C01-D001"] if index == 0 else [],
+                "event_ids": ["C01-E001"] if index == 0 else ["C01-E002"],
+            },
+        }, index)
+        production["segments"].append(row)
+    production["segments"][0]["dialogue"] = [{
+        "speaker": "Narrator (S1)", "language": "English", "voiceover": True,
+        "text": "Look closely:\nlight still moves.",
+    }]
+    production = manager.save(production)
+    for row in production["segments"]:
+        manager.materialise(production["id"], row["id"])
+    production = manager.get(production["id"])
+    affected, complete = production["segments"]
+    run_id = _id()
+    complete.update(video_prompt="Established prompt", last_video_run_id=run_id)
+    production = manager.save(production)
+
+    # Simulate disk data from the parser which locked only the first tagged line.
+    affected, complete = production["segments"]
+    affected["dialogue"][0].update(speaker="(S1) says in an off-screen voiceover",
+                                   text="<d>[English] Look closely:")
+    affected["source_hash"] = segment_hash(affected)
+    manager._path(production["id"]).write_text(json.dumps(production), encoding="utf-8")
+
+    restored = manager.get(production["id"])
+    assert restored["coverage_report"]["status"] == "ok"
+    assert restored["segments"][0]["source_refs"] == affected["source_refs"]
+    assert restored["segments"][1]["status"] == "ready"
+    assert restored["segments"][1]["last_video_run_id"] == run_id
+    project = manager.materialise(restored["id"], affected["id"])["project"]
+    line, = project["shots"][0]["dialogue"]
+    assert line["text"] == "Look closely:\nlight still moves."
+    assert line["voiceover"] is True
+    assert "light still moves." not in project["shots"][0]["action"]
+    compiled = compile_project(project)
+    assert compiled["valid"], compiled["issues"]
+    assert "Spoken-utterance count is exactly 1 utterance total" in compiled["prompt"]
 
 
 def test_saved_silent_storyboard_is_replanned_after_voiceover_parser_upgrade(tmp_path):
