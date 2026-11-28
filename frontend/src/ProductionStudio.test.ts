@@ -122,6 +122,13 @@ describe("episode batch production",()=>{
     expect(productionOutputPreviewTake({selected:accepted,candidates:[rejected,accepted]} as any)).toBe(accepted);
   });
 
+  it("previews a finished older take while a replacement is pending",()=>{
+    const active={id:"run-active",status:"running"};
+    const history={id:"run-older",status:"succeeded",video_url:"/older.mp4"};
+    expect(productionOutputPreviewTake({selected:null,candidates:[active,history]} as any)).toBe(history);
+    expect(productionOutputPreviewTake({selected:null,candidates:[active]} as any)).toBeNull();
+  });
+
   it("skips only a prompt that is current, prepared, and non-stale",()=>{
     const current:any={video_prompt:"A complete prompt",status:"ready",project_id:"project-1",stale_reasons:[]};
     expect(segmentNeedsVideoPrompt(current)).toBe(false);

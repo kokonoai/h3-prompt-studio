@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Clapperboard, Clock3, Download, Film, FolderOpen, ImagePlus, LoaderCircle, Pause, Play, Plus, RefreshCw, Save, Search, Settings2, Sparkles, Square, Trash2, Upload, Video, X } from "lucide-react";
 import { api, apiPatch, ApiTimeoutError, downloadText } from "./api";
+import { parseEpisodeDuration, parseEpisodeDurationParts, splitEpisodeDuration, type EpisodeDurationParts } from "./episodeDuration";
 import { localText, useUiLanguage, type UiLanguage } from "./i18n";
 import type { Project } from "./model";
 import SeriesWorkspace from "./SeriesWorkspace";
@@ -116,10 +117,11 @@ export const qualityReviewTargets=(outputs:ProductionOutputs|null|undefined)=>
       !(status==="failed"&&take.quality_review?.accepted);
     return needsReview?[{segment_id:row.segment_id,run_id:take!.id,index:row.index,title:row.title}]:[];
   })||[];
-export const productionOutputPreviewTake=(row:ProductionOutputRow)=>
-  row.selected||row.candidates.find(job=>
-    job.status==="succeeded"&&!!job.video_url&&
-    job.quality_review?.status==="failed"&&!job.quality_review.accepted)||null;
+export const productionOutputPreviewTake=(row:ProductionOutputRow)=>{
+  const playable=row.candidates.filter(job=>job.status==="succeeded"&&!!job.video_url);
+  return row.selected||playable.find(job=>
+    job.quality_review?.status==="failed"&&!job.quality_review.accepted)||playable[0]||null;
+};
 
 const automationText=(language:UiLanguage,zh:string,en:string,ja:string,tw=zh)=>
   localText(language,{"zh-CN":zh,"zh-TW":tw,en,ja});
@@ -1208,6 +1210,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const [productionPage,setProductionPage]=useState<ProductionPage>("projects");
   const [production,setProduction]=useState<Production|null>(null);
   const [draft,setDraft]=useState(()=>blank(project));
+  const [episodeDurationEdit, setEpisodeDurationEdit] = useState<EpisodeDurationParts | null>(null);
+  const episodeDurationId = useId();
   const [busy,setBusy]=useState("");
   const busyRef=useRef(false);
   const pauseRequestedRef=useRef(false);
@@ -1246,7 +1250,60 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   const outputsNeedPolling=automationActive||(outputs?.active_jobs||0)>0||
     outputs?.quality_batch?.status==="running"||merging;
   const totalSeconds=useMemo(()=>production?.segments.reduce((n,s)=>n+s.duration,0)||0,[production?.segments]);
-  const currentEpisodeTiming=useMemo(()=>episodeTiming(production?.episode_minutes||draft.episode_minutes),[production?.episode_minutes,draft.episode_minutes]);
+  const storedEpisodeMinutes = production?.episode_minutes ?? draft.episode_minutes;
+  const episodeDurationParts = episodeDurationEdit ?? splitEpisodeDuration(Math.round(storedEpisodeMinutes * 60));
+  const editedEpisodeSeconds = episodeDurationEdit && parseEpisodeDurationParts(episodeDurationEdit);
+  const episodeDurationInvalid = episodeDurationEdit !== null && editedEpisodeSeconds === null;
+  const episodeDurationError = t(
+    "请填写整数，秒数为 0–59，总时长为 30 秒到 180 分钟。",
+    "Use whole numbers, with 0–59 in the seconds field and a total from 30 seconds to 180 minutes.",
+    "整数を入力してください。秒は0〜59、合計は30秒〜180分です。",
+    "請填寫整數，秒數為 0–59，總時長為 30 秒到 180 分鐘。",
+  );
+  const currentEpisodeTiming = episodeTiming(editedEpisodeSeconds === null ? storedEpisodeMinutes : editedEpisodeSeconds / 60);
+  const pasteEpisodeDuration = (event: React.ClipboardEvent<HTMLInputElement>) => {
+    const pasted = event.clipboardData.getData("text").normalize("NFKC").trim();
+    if (/^\d*$/.test(pasted)) return;
+    const seconds = parseEpisodeDuration(pasted);
+    if (seconds === null) return;
+    event.preventDefault();
+    setEpisodeDurationEdit(splitEpisodeDuration(seconds));
+  };
+  const renderEpisodeDurationField = (showAuthoredTiming = false) => (
+    <fieldset className="production-episode-duration" data-invalid={episodeDurationInvalid}>
+      <legend>{t("单集目标时长", "Target duration per episode", "1話の目標時間", "單集目標時長")}</legend>
+      <div className="production-episode-duration-parts">
+        {([
+          ["minutes", t("分", "min", "分", "分"), t("分钟", "Minutes", "分数", "分鐘")],
+          ["seconds", t("秒", "sec", "秒", "秒"), t("秒数", "Seconds", "秒数", "秒數")],
+        ] as const).map(([part, unit, label]) => (
+          <label key={part}>
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="off"
+              value={episodeDurationParts[part]}
+              onChange={event => {
+                const value = event.currentTarget.value;
+                setEpisodeDurationEdit(current => ({ ...(current ?? episodeDurationParts), [part]: value }));
+              }}
+              onPaste={pasteEpisodeDuration}
+              aria-label={label}
+              aria-describedby={`${episodeDurationId}-hint`}
+              aria-invalid={episodeDurationInvalid}
+            />
+            <span>{unit}</span>
+          </label>
+        ))}
+      </div>
+      <small id={`${episodeDurationId}-hint`}>
+        {episodeDurationInvalid ? episodeDurationError : showAuthoredTiming ? t(
+          "原稿有明确时码时，优先按原稿规划。", "Explicit screenplay timecodes take priority.",
+          "脚本にタイムコードがある場合はそちらを優先します。", "原稿有明確時碼時，優先按原稿規劃。",
+        ) : null}
+      </small>
+    </fieldset>
+  );
   const currentEpisodeForPlan=production?.episodes.find(episode=>episode.index===production.current_episode)||production?.episodes[0];
   const ready=production?.segments.filter(s=>s.status==="ready").length||0;
   const stale=production?.segments.filter(s=>s.status==="stale").length||0;
@@ -1359,7 +1416,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   };
   const chooseImageModel=(value:string)=>{setImageModel(value);localStorage.setItem("h3.production.imageModel",value);};
   useEffect(()=>{void refreshList();void refreshCollections();void refreshImageModels().catch(()=>{});void refreshVideoWorkflows();},[]);
-  useEffect(()=>{if(!production)setDraft(blank(project));},[project.id]);
+  useEffect(()=>{if(!production){setDraft(blank(project));setEpisodeDurationEdit(null);}},[project.id]);
   useEffect(()=>{pauseRequestedRef.current=production?.task_state==="paused";},[production?.id,production?.task_state]);
 
   const timeoutMessage=()=>t(
@@ -1502,8 +1559,13 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
   };
   const focusCardLibrary=()=>requestAnimationFrame(()=>requestAnimationFrame(()=>
     document.getElementById("production-card-library")?.scrollIntoView({behavior:"smooth",block:"start"})));
+  const episodeMinutesForSave = (storedMinutes: number) => {
+    if (episodeDurationInvalid) throw new Error(episodeDurationError);
+    return editedEpisodeSeconds === null ? storedMinutes : editedEpisodeSeconds / 60;
+  };
   const create=async(focusCards=false)=>{
-    const value=await api("/productions",{...draft,source_project:project});
+    const value=await api("/productions",{...draft,episode_minutes:episodeMinutesForSave(draft.episode_minutes),source_project:project});
+    setEpisodeDurationEdit(null);
     setProduction(value);setDraft(value);setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);await refreshList();
     setNotice(focusCards?t("制作项目已建立。请先完善资产卡，再进行智能拆分。","Production created. Complete the asset cards, then plan with AI.","制作プロジェクトを作成しました。素材カードを整えてからAIで分割してください。","製作專案已建立。請先完善資產卡，再進行智慧拆分。"):t("制作项目已建立。现在可以智能拆分。","Production created. It is ready for AI planning.","制作プロジェクトを作成しました。AIで分割できます。","製作專案已建立。現在可以智慧拆分。"));
     setProductionPage(focusCards?"assets":"script");
@@ -1520,9 +1582,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       character_bible:value.character_bible,continuity_notes:value.continuity_notes,
       series_voice_style:value.series_voice_style,
       visual_style_preset:value.visual_style_preset,visual_style_custom:value.visual_style_custom,narrative_style:value.narrative_style,narrative_style_custom:value.narrative_style_custom,narrative_notes:value.narrative_notes,
-      episode_count:value.episode_count,episode_minutes:value.episode_minutes,current_episode:value.current_episode,episodes:value.episodes,
+      episode_count:value.episode_count,episode_minutes:episodeMinutesForSave(value.episode_minutes),current_episode:value.current_episode,episodes:value.episodes,
       card_collection_id:value.card_collection_id,card_collection_name:value.card_collection_name,
       cards:value.cards,overview_asset_ids:value.overview_asset_ids,segments:value.segments});
+    setEpisodeDurationEdit(current => current === episodeDurationEdit ? null : current);
     setProduction(next);setDraft(next);await refreshList();return next as Production;
   };
   const plan=(useAI:boolean)=>run(useAI?t("分析剧情并动态拆段","Analyse story and plan dynamic clips","物語を分析して動的に分割","分析劇情並動態拆段"):t("按本地规则动态拆段","Plan dynamic clips with local rules","ローカル規則で動的に分割","按本地規則動態拆段"),async()=>{
@@ -1555,15 +1618,15 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     setNotice(t("第 "+episode.index+" 集已按剧情拆成 "+next.segments.length+" 段，每段 5–15 秒；生成时长 "+generated+"/"+target+" 秒。","Episode "+episode.index+" is now "+next.segments.length+" story-driven clips of 5–15s; generated duration "+generated+"/"+target+"s.","第"+episode.index+"話を物語に沿って5〜15秒の"+next.segments.length+"クリップに分割しました。生成尺 "+generated+"/"+target+"秒。","第 "+episode.index+" 集已按劇情拆成 "+next.segments.length+" 段，每段 5–15 秒；生成時長 "+generated+"/"+target+" 秒。"));
   });
   const load=async(id:string,page:ProductionPage="script")=>{
-    if(!id){setProduction(null);setDraft(blank(project));setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setProductionPage("script");return;}
+    if(!id){startNewProduction();return;}
     setBusy(t("正在加载项目…","Loading project…","プロジェクトを読み込み中…","正在載入專案…"));
     setError("");setNotice("");setOutputs(null);
     try{
-      const value=await api("/productions/"+id);setProduction(value);setDraft(value);setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setProductionPage(page);
+      const value=await api("/productions/"+id);setEpisodeDurationEdit(null);setProduction(value);setDraft(value);setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setProductionPage(page);
     }catch(e){setError((e as Error).message);}
     finally{setBusy("");}
   };
-  const startNewProduction=()=>{setProduction(null);setDraft(blank(project));setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setError("");setNotice("");setProductionPage("script");};
+  const startNewProduction=()=>{setEpisodeDurationEdit(null);setProduction(null);setDraft(blank(project));setKeyframeSuggestions([]);setAutoKeyframeSuggestions([]);setError("");setNotice("");setProductionPage("script");};
   const importCurrentStudioContent=()=>setDraft(current=>({
     ...current,
     title:project.title==="Untitled film"?"":project.title,
@@ -2024,7 +2087,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     if(!production)return;
     if(!window.confirm(t("确定从“剧集 / 片段”列表删除“"+production.title+"”吗？当前卡库会自动保存为独立命名卡组；H3 分镜工程和视频也会保留。","Remove “"+production.title+"” from the Episodes / Clips list? Its current cards will be saved automatically as an independent named card set; H3 clip projects and videos are also kept.","「"+production.title+"」をエピソード／クリップ一覧から削除しますか？現在のカード庫は独立した名前付きカードセットとして自動保存され、H3クリップと映像も保持されます。","確定從「劇集／片段」列表刪除「"+production.title+"」嗎？目前卡庫會自動儲存為獨立命名卡組；H3 分鏡專案和影片也會保留。")))return;
     const deleted=await api("/productions/"+production.id,undefined,undefined,"DELETE") as {card_collection_name?:string|null};
-    setProduction(null);setOutputs(null);setDraft(blank(project));await refreshList();await refreshCollections();
+    setEpisodeDurationEdit(null);setProduction(null);setOutputs(null);setDraft(blank(project));await refreshList();await refreshCollections();
     setNotice(t("片段已移除；卡库已保留为“"+(deleted.card_collection_name||production.card_collection_name)+"”，关联 H3 工程和视频结果也仍保留。","Part removed. Its cards remain as “"+(deleted.card_collection_name||production.card_collection_name)+"”; linked H3 projects and video results were also preserved.","パートを外しました。カードは「"+(deleted.card_collection_name||production.card_collection_name)+"」として残り、関連H3プロジェクトと映像も保持されています。","片段已移除；卡庫已保留為「"+(deleted.card_collection_name||production.card_collection_name)+"」，關聯 H3 專案和影片結果也仍保留。"));
   });
   const importVideoWorkflow=(file:File)=>run(t("导入 ComfyUI API 工作流","Import ComfyUI API workflow","ComfyUI APIワークフローを読込","匯入 ComfyUI API 工作流"),async()=>{
@@ -2258,6 +2321,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
     const regenerateAll=!!options.regenerateAll;
     const full=!!options.full||regenerateAll;
     if(busyRef.current||!production||(!full&&!production.segments.length))return;
+    if(episodeDurationInvalid){setProductionPage("script");setError(episodeDurationError);return;}
     if(full&&!production.brief.trim()){setError(t("请先填写并保存故事原文 / 剧本。","Add and save the source story or screenplay first.","先に原作ストーリー／脚本を入力して保存してください。","請先填寫並儲存故事原文／劇本。"));return;}
     const confirmation=regenerateAll?t(
       "将按当前保存的剧本、分镜、角色卡和设置，重新生成本集全部提示词与全部视频，并自动合并新版成片。旧提示词、旧视频和旧成片都会保留；已手工编辑的分镜不会无故重规划。继续吗？",
@@ -2568,7 +2632,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
       <div className="production-grid"><label>{t("剧集 / 片段标题","Episode / part title","エピソード／パート名","劇集／片段標題")}<input autoFocus value={draft.title} onChange={e=>setDraft({...draft,title:e.target.value})} placeholder={t("例如：星图寻宝队 · 第 1 集（上）","Example: Star Map Seekers · Episode 1A","例：星図探検隊・第1話（前編）","例如：星圖尋寶隊 · 第 1 集（上）")}/><small>{t("灰色文字只是案例，不会作为标题保存。请输入便于在剧本管理中查找的名称。","Grey text is only an example and is never saved. Enter a name that will be easy to find in Script management.","灰色の文字は例であり、タイトルとして保存されません。脚本管理で見つけやすい名前を入力してください。","灰色文字只是案例，不會作為標題儲存。請輸入方便在劇本管理中查找的名稱。")}</small></label>
         <label>{t("项目输出语言","Project output language","プロジェクト出力言語","專案輸出語言")}<select value={draft.language} onChange={e=>setDraft({...draft,language:e.target.value as Production["language"]})}>{LANGUAGE_OPTIONS.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select></label></div>
       <div className="production-grid production-series-fields"><label>{t("剧集数","Episodes","話数","劇集數")}<input type="number" min={1} max={100} value={draft.episode_count} onChange={e=>setDraft({...draft,episode_count:Math.max(1,Math.min(100,Number(e.target.value)||1))})}/></label>
-        <label>{t("单集目标时长（分钟）","Target minutes per episode","1話の目標時間（分）","單集目標時長（分鐘）")}<input type="number" min={0.5} max={180} step={0.1} value={draft.episode_minutes} onChange={e=>{const minutes=e.currentTarget.valueAsNumber;if(Number.isFinite(minutes))setDraft({...draft,episode_minutes:Math.max(0.5,Math.min(180,minutes))})}}/><small>{t("按十进制分钟计算：当前约 "+episodeTiming(draft.episode_minutes).targetSeconds+" 秒。1 分 12 秒请输入 1.2，不是 1.12。","Decimal minutes: currently about "+episodeTiming(draft.episode_minutes).targetSeconds+" seconds. Enter 1.2 for 1m 12s, not 1.12.","10進法の分数です。現在は約"+episodeTiming(draft.episode_minutes).targetSeconds+"秒。1分12秒は1.12ではなく1.2です。","以十進位分鐘計算：目前約 "+episodeTiming(draft.episode_minutes).targetSeconds+" 秒。1 分 12 秒請輸入 1.2，不是 1.12。")}</small></label>
+        {renderEpisodeDurationField()}
         <label>{t("视频画幅","Video aspect ratio","映像アスペクト比","影片畫幅")}<select value={draft.video_aspect_ratio} onChange={e=>setDraft({...draft,video_aspect_ratio:e.target.value})}>{PRODUCTION_ASPECT_RATIOS.map(value=><option key={value} value={value}>{value}</option>)}</select><small>{t("创建后与项目设置保持一致；之后在设置页修改也会统一应用到本项目。","Saved to the same project setting used after creation; later changes in Settings apply consistently to this production.","作成後のプロジェクト設定と同じ値を使用し、以後の設定変更もこの作品へ統一して適用します。","建立後與專案設定保持一致；之後在設定頁修改也會統一套用到本專案。")}</small></label></div>
       <label>{t("本剧集 / 片段内容","Episode / part content","エピソード／パート内容","本劇集／片段內容")}<textarea rows={10} maxLength={MAX_PRODUCTION_BRIEF_CHARACTERS} value={draft.brief} onChange={e=>setDraft({...draft,brief:e.target.value})} placeholder={t("示例（仅作输入提示）：\n场景：雨夜的旧车站\n出场：林夏、周宁\n剧情：林夏发现储物柜里的旧录音机……\n对白：林夏：“这不是我父亲的声音。”\n\n也可以直接粘贴小说原文、剧本或分镜稿；输入语言不限。","Example (input guide only):\nSetting: an old station on a rainy night\nCast: Lina, Noah\nStory: Lina finds an old recorder inside a locker…\nDialogue — Lina: “That is not my father's voice.”\n\nYou may also paste prose, a screenplay or a storyboard in any language.","例（入力ガイドのみ）：\n場所：雨の夜の古い駅\n登場人物：リナ、ノア\n物語：リナはロッカーの中で古い録音機を見つける……\n台詞・リナ：「これは父の声じゃない。」\n\n小説本文、脚本、絵コンテをそのまま貼り付けても構いません。入力言語は自由です。","範例（僅作輸入提示）：\n場景：雨夜的舊車站\n出場：林夏、周寧\n劇情：林夏發現置物櫃裡的舊錄音機……\n對白：林夏：「這不是我父親的聲音。」\n\n也可以直接貼上小說原文、劇本或分鏡稿；輸入語言不限。")}/><small>{draft.brief.length.toLocaleString()} / {MAX_PRODUCTION_BRIEF_CHARACTERS.toLocaleString()} {t("字；长内容会按集、按段分批规划，原文不会被截断。","characters. Long material is planned in bounded episode and storyboard batches without truncating the source.","文字。長い内容は話・パート単位で分割処理され、原文は切り捨てられません。","字；長內容會按集、按段分批規劃，原文不會被截斷。")}</small></label>
       <label>{t("视频提示词规则","Video prompt rules","映像プロンプト規則","影片提示詞規則")}<select value={draft.prompt_version==="storyboard_narrative"?"continuity_director":draft.prompt_version} onChange={e=>setDraft({...draft,prompt_version:e.target.value as Production["prompt_version"]})}><option value="classic">{t("原版 H3 · 已加强防重复与风格锁定","Classic H3 · improved cast and style locks","従来版H3・重複と画風を改善","原版 H3 · 已加強防重複與風格鎖定")}</option><option value="continuity_director">{t("导演连续性 · 叙事导演稿","Director continuity · narrative storyboard","監督連続性・絵コンテ叙述","導演連續性 · 敘事導演稿")}</option></select><small>{t("导演版按参考图职责、镜头、对白和稳定性约束组织；原版也已加强角色名单和防重复规则。","Director mode groups picture roles, scene, dialogue and stability rules. Classic mode also has stronger cast and duplicate safeguards.","監督版は参照画像・場面・台詞・安定性を整理。従来版も出演者一覧と重複防止を強化しました。","導演版按參考圖職責、鏡頭、對白和穩定性約束組織；原版也已加強角色名單和防重複規則。")}</small></label>
@@ -2590,7 +2654,7 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
         <div className="production-grid"><label>{t("片名","Title","作品名","片名")}<input value={production.title} onChange={e=>updateField("title",e.target.value)}/></label>
           <label>{t("项目输出语言","Project output language","プロジェクト出力言語","專案輸出語言")}<select value={production.language} onChange={e=>updateField("language",e.target.value)}>{LANGUAGE_OPTIONS.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select><small>{t("原剧本可用任意语言；本地 LLM 会把分镜、对白和提示词统一输出为这里选择的语言。","The source may use any language. The local LLM writes storyboards, dialogue and prompts in the selected language.","入力言語は自由です。ローカルLLMは絵コンテ・台詞・プロンプトを選択した言語で出力します。","原劇本可用任意語言；本地 LLM 會把分鏡、對白和提示詞統一輸出為這裡選擇的語言。")}</small></label></div>
         <div className="production-grid production-series-fields production-project-fields"><label>{t("剧集数","Episodes","話数","劇集數")}<input type="number" min={1} max={100} value={production.episode_count} onChange={e=>updateField("episode_count",Math.max(1,Math.min(100,Number(e.target.value)||1)))}/></label>
-          <label>{t("单集目标时长（分钟）","Target minutes per episode","1話の目標時間（分）","單集目標時長（分鐘）")}<input type="number" min={0.5} max={180} step={0.1} value={production.episode_minutes} onChange={e=>{const minutes=e.currentTarget.valueAsNumber;if(Number.isFinite(minutes))updateField("episode_minutes",Math.max(0.5,Math.min(180,minutes)))}}/><small>{t("按十进制分钟计算：当前约 "+episodeTiming(production.episode_minutes).targetSeconds+" 秒。原稿有明确时码时会优先保留原稿时长；1 分 12 秒请输入 1.2。","Decimal minutes: currently about "+episodeTiming(production.episode_minutes).targetSeconds+" seconds. Explicit screenplay timecodes take priority; enter 1.2 for 1m 12s.","10進法の分数です。現在は約"+episodeTiming(production.episode_minutes).targetSeconds+"秒。脚本の明示タイムコードを優先し、1分12秒は1.2と入力します。","以十進位分鐘計算：目前約 "+episodeTiming(production.episode_minutes).targetSeconds+" 秒。原稿有明確時碼時會優先保留原稿時長；1 分 12 秒請輸入 1.2。")}</small></label>
+          {renderEpisodeDurationField(true)}
           <label>{t("当前制作集","Current episode","現在の話","目前製作集")}<select value={production.current_episode} onChange={e=>updateField("current_episode",Number(e.target.value))}>{Array.from({length:production.episode_count},(_,i)=><option key={i+1} value={i+1}>{t("第 "+(i+1)+" 集","Episode "+(i+1),"第"+(i+1)+"話","第 "+(i+1)+" 集")}</option>)}</select></label>
           <label>{t("视频画幅","Video aspect ratio","映像アスペクト比","影片畫幅")}<select value={production.video_aspect_ratio||"16:9"} onChange={e=>updateField("video_aspect_ratio",e.target.value)}>{PRODUCTION_ASPECT_RATIOS.map(value=><option key={value} value={value}>{value}</option>)}</select><small>{t("与设置页使用同一个项目值；修改后保存即可统一应用到后续新建或重建的视频。","Uses the same project value as Settings. Save after changing it to apply the ratio to videos created or rebuilt from now on.","設定ページと同じ作品値です。変更後に保存すると、今後の新規・再生成映像へ統一適用されます。","與設定頁使用同一個專案值；修改後儲存即可統一套用到後續新建或重建的影片。")}</small></label></div>
         <label>{t("故事原文 / 剧本","Source story / screenplay","原作ストーリー / 脚本","故事原文 / 劇本")}<textarea rows={7} maxLength={MAX_PRODUCTION_BRIEF_CHARACTERS} value={production.brief} onChange={e=>updateField("brief",e.target.value)}/><small>{production.brief.length.toLocaleString()} / {MAX_PRODUCTION_BRIEF_CHARACTERS.toLocaleString()} {t("字；长内容会保留完整原文，并按集、按段分批交给本地 AI。","characters. Long source text is preserved and sent to the local AI in bounded episode and storyboard batches.","文字。長い原文も保持され、話・パート単位でローカルAIに送られます。","字；長內容會保留完整原文，並按集、按段分批交給本地 AI。")}</small></label>
@@ -2835,6 +2899,10 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
             const qualityTake=readyTakes.find(job=>job.quality_review?.status==="failed"&&!job.quality_review?.accepted)||selected;
             const previewTake=productionOutputPreviewTake(row);
             const previewIsRejected=!!previewTake&&!selected&&previewTake.quality_review?.status==="failed"&&!previewTake.quality_review.accepted;
+            const previewBadge=selected||!previewTake ? "" : previewIsRejected
+              ? t("仅供质检 · 未采用","QC preview · not adopted","品質確認用・未採用","僅供質檢 · 未採用")
+              : t("历史版本 · 未采用","Previous take · not adopted","履歴テイク・未採用","歷史版本 · 未採用");
+            const previewLabel=selected ? t("采用版本","Adopted take","採用テイク","採用版本") : previewBadge;
             const quality=qualityTake?.quality_review;
             const qualitySelectable=!!qualityTake&&(!quality?.status||["legacy","unreviewed","pending","manual_review","failed"].includes(quality.status))&&!(quality?.status==="failed"&&quality.accepted);
             const qualitySelected=qualitySelectable&&selectedQualityRunSet.has(qualityTake!.id);
@@ -2860,8 +2928,8 @@ export default function ProductionStudio({project,onOpenProject,onStudio}:{
             </section>}
             <article className={(selected?"production-output-row ready":"production-output-row")+(previewIsRejected?" review-only":"")+(qualitySelected?" quality-selected":"")+(rebuildSelected?" rebuild-selected":"")}>
             <div className="production-output-index"><span>{String(row.index).padStart(2,"0")}</span><label className="production-output-rebuild-check" title={t("选择此分镜；同一选择可用于批量重做或 AI 质检","Select this clip for either batch rerender or AI QC","このクリップを選択し、一括再生成またはAI検査に使用","選擇此分鏡；同一選擇可用於批量重做或 AI 質檢")}><input type="checkbox" checked={rebuildSelected} disabled={!!busy||automationActive||outputs.active_jobs>0} onChange={()=>toggleOutputSegmentSelection(row.segment_id)}/><i>{rebuildSelected?t("已选","Selected","選択済み","已選"):t("选择","Select","選択","選擇")}</i></label></div>
-            <div className="production-output-media">{previewTake?<><video controls playsInline preload="metadata" src={previewTake.scene_video_url||previewTake.video_url||""}/>{previewIsRejected&&<span className="production-review-only-badge">{t("仅供质检 · 未采用","QC preview · not adopted","品質確認用・未採用","僅供質檢 · 未採用")}</span>}</>:<div className="production-video-placeholder"><Video size={24}/><span>{row.project_id?t("尚无完成的视频","No completed video yet","完成した映像はまだありません","尚無完成的影片"):t("先创建 H3 工程","Create the H3 project first","先にH3プロジェクトを作成","先建立 H3 專案")}</span></div>}</div>
-            <div className="production-output-info"><strong>{row.title}</strong><span>{selected?t("采用版本","Adopted take","採用テイク","採用版本")+" · "+(selected.seed!=null?"Seed "+selected.seed:t("已完成","Ready","完成","已完成"))+" · "+formatSeconds(selected.elapsed_seconds):previewIsRejected?t("质检版本，仅供查看，尚未采用","QC take for review; not adopted","品質確認用テイク・未採用","質檢版本，僅供查看，尚未採用")+" · "+(previewTake?.seed!=null?"Seed "+previewTake.seed:t("已完成","Ready","完成","已完成"))+" · "+formatSeconds(previewTake?.elapsed_seconds):t("等待本段生成完成","Waiting for this clip","このクリップの生成待ち","等待本段生成完成")}</span>
+            <div className="production-output-media">{previewTake?<><video controls playsInline preload="metadata" src={previewTake.scene_video_url||previewTake.video_url||""}/>{previewBadge&&<span className="production-review-only-badge">{previewBadge}</span>}</>:<div className="production-video-placeholder"><Video size={24}/><span>{row.project_id?t("尚无完成的视频","No completed video yet","完成した映像はまだありません","尚無完成的影片"):t("先创建 H3 工程","Create the H3 project first","先にH3プロジェクトを作成","先建立 H3 專案")}</span></div>}</div>
+            <div className="production-output-info"><strong>{row.title}</strong><span>{previewTake?`${previewLabel} · ${previewTake.seed!=null?"Seed "+previewTake.seed:t("已完成","Ready","完成","已完成")} · ${formatSeconds(previewTake.elapsed_seconds)}`:t("等待本段生成完成","Waiting for this clip","このクリップの生成待ち","等待本段生成完成")}</span>
               {quality&&quality.required&&<section className={"production-quality-review "+quality.status+(quality.accepted?" accepted-override":"")}><div className="production-quality-head"><strong>{quality.status==="failed"?(quality.accepted?t("人工判定合格 · 原质检问题保留","Accepted by human · original QC findings retained","手動合格・元の検査結果を保持","人工判定合格 · 原質檢問題保留"):t("质检未通过 · 未采用","Review failed · not adopted","品質検査不合格・未採用","質檢未通過 · 未採用")):quality.status==="pending"||quality.status==="reviewing"?t("等待视频质检","Waiting for quality review","品質検査待ち","等待影片質檢"):quality.status==="manual_review"?t("基础检查完成 · 请人工复核","Basic checks complete · review manually","基本検査完了・手動確認","基礎檢查完成 · 請人工複核"):quality.status==="warning"?t("质检通过 · 有复核建议","Review passed · notes","品質検査合格・確認事項あり","質檢通過 · 有複核建議"):t("质检通过","Quality review passed","品質検査合格","質檢通過")}</strong><div className="production-quality-head-meta"><span>{qualityTake?.seed!=null?"Seed "+qualityTake.seed:""}</span>{qualitySelectable&&<label className="production-quality-select"><input type="checkbox" checked={rebuildSelected} onChange={()=>toggleOutputSegmentSelection(row.segment_id)}/><i>{rebuildSelected?t("已选择","Selected","選択済み","已選擇"):t("选择片段","Select clip","クリップを選択","選擇片段")}</i></label>}</div></div><p>{quality.summary}</p>{quality.accepted&&quality.overridden_at&&<p className="production-quality-override-note">{t("你已查看证据并人工放行；原始告警仍保留用于追溯。","You reviewed the evidence and manually released this take; the original findings remain for audit.","証拠を確認して手動承認しました。元の警告は追跡用に保持されます。","你已查看證據並人工放行；原始告警仍保留供追溯。")}</p>}{!!quality.issues?.length&&<div className="production-quality-issues">{quality.issues.slice(0,6).map((issue,index)=><p className={issue.severity} key={issue.code+index}><b>{issue.code.replaceAll("_"," ")}</b><span>{issue.message}</span>{issue.confidence!=null&&<em>{Math.round(issue.confidence*100)}%</em>}</p>)}</div>}{quality.repair_direction&&<div className="production-quality-repair"><b>{t("建议修复要求","Suggested repair","修正案","建議修復要求")}</b><span>{quality.repair_direction}</span></div>}<div className="production-quality-actions"><button disabled={!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void reviewTake(row,qualityTake)}><RefreshCw size={14}/>{t("重新质检","Review again","再検査","重新質檢")}</button>{quality.status==="failed"&&!quality.accepted&&<button disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void acceptQualityOverride(row,qualityTake)}><Check size={14}/>{t("人工判定合格","Accept after review","手動で合格","人工判定合格")}</button>}{quality.status==="failed"&&quality.repair_direction&&!quality.accepted&&<button className="primary" disabled={production.task_state==="paused"||!!busy||automationActive||outputs.active_jobs>0} onClick={()=>qualityTake&&void approveQualityRepair(row,qualityTake)}><RefreshCw size={14}/>{t("批准修复并重做","Approve repair and rerender","修正と再生成を承認","批准修復並重做")}</button>}</div></section>}
               {qualityTake&&["legacy","unreviewed"].includes(quality?.status||"")&&<section className="production-quality-review manual_review"><div className="production-quality-head"><strong>{t("初版可用 · 不满意时再质检","Initial cut ready · review only if needed","初版利用可・必要時のみ検査","初版可用 · 不滿意時再質檢")}</strong><label className="production-quality-select"><input type="checkbox" checked={rebuildSelected} onChange={()=>toggleOutputSegmentSelection(row.segment_id)}/><i>{rebuildSelected?t("已选择","Selected","選択済み","已選擇"):t("选择片段","Select clip","クリップを選択","選擇片段")}</i></label></div><p>{t("该版本已经进入初版合片。若观看后发现角色、画面、道具或连续性问题，可在这里启动 AI 质检；系统不会自行质检或重做。","This take is already included in the initial cut. If you notice cast, image, prop or continuity problems, start AI QC here; Studio will not review or rerender it on its own.","このテイクは初版に使用済みです。人物・画面・小道具・連続性に問題があれば、ここでAI検査を開始してください。自動検査や再生成は行いません。","此版本已進入初版合片。若觀看後發現角色、畫面、道具或連續性問題，可在此啟動 AI 質檢；系統不會自行質檢或重做。")}</p><div className="production-quality-actions"><button className="primary" disabled={!!busy||automationActive||outputs.active_jobs>0} onClick={()=>void reviewTake(row,qualityTake)}><Check size={14}/>{t("AI 质检本段","AI review this take","このテイクをAI検査","AI 質檢本段")}</button></div></section>}
               <div className="production-output-dialogue"><b>{t("本段对白 · 对照视频听","Clip dialogue · check against the video","このクリップの台詞・映像と照合","本段對白 · 對照影片聽")}</b>{segment?.dialogue?.length?segment.dialogue.map((line,index)=><p key={index}><strong>{line.speaker||t("未署名","Unknown speaker","話者未設定","未署名")}{line.voiceover?" · "+t("画外音","off-screen","画面外","畫外音"):""}</strong><span>{line.text}</span></p>):<small>{t("本段无对白；检查动作、音效和画面连续性。","No dialogue in this clip; check action, sound and visual continuity.","このクリップに台詞はありません。動作・音・映像の連続性を確認してください。","本段無對白；檢查動作、音效和畫面連續性。")}</small>}</div>

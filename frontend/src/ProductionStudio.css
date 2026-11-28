@@ -10,6 +10,15 @@
 
 .production-cards .card-strategy{margin:-6px 0 20px;padding:13px 16px;border:1px solid #3a5c4b;border-radius:12px;background:#112a20;color:#bce5ce;line-height:1.65}
 .card-collection-bar{display:grid;grid-template-columns:minmax(220px,1fr) auto minmax(240px,1fr) auto;align-items:end;gap:10px;margin:0 0 20px;padding:14px;border:1px solid #385647;border-radius:14px;background:#101d17}.card-collection-bar button{height:44px}.production-series-fields{grid-template-columns:repeat(3,minmax(0,1fr))}.production-studio label small{font-weight:500;color:#88a697;line-height:1.5}
+.production-episode-duration{min-inline-size:0;margin:0;padding:0;border:0;color:#b9d4c5;font-size:13px}
+.production-episode-duration legend{padding:0;margin-bottom:8px;font-weight:700}
+.production-episode-duration-parts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;max-width:15rem}
+.production-studio .production-episode-duration-parts label{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center}
+.production-studio .production-episode-duration-parts input{min-width:0;text-align:center;font-variant-numeric:tabular-nums}
+.production-episode-duration small{display:block;margin-top:8px;color:#88a697;line-height:1.5}
+.production-episode-duration small:empty{display:none}
+.production-studio .production-episode-duration[data-invalid="true"] input{border-color:#e2a091}
+.production-episode-duration[data-invalid="true"] small{color:#ffd2c8}
 .production-setup .setup-flow{margin:18px 0 0;padding:12px 15px;border-left:3px solid #a9efd0;border-radius:0 10px 10px 0;background:#14281e;color:#a9c5b5;line-height:1.6}.production-setup .setup-flow strong{color:#d7f4e4}
 .production-setup .setup-action-note{flex:1;min-width:260px;color:#8fa99b;font-size:12px;line-height:1.5}.production-setup label>small{color:#819c8e;font-weight:500;line-height:1.45}.production-setup textarea::placeholder{color:#6f897b;white-space:pre-line}
 .production-card-tabs{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:20px}.production-card-tabs button{white-space:nowrap}.production-card-tabs button.active{background:#a9efd0;color:#10251b;border-color:#a9efd0}.production-card-tabs button span{display:inline-grid;place-items:center;min-width:21px;height:21px;padding:0 5px;border-radius:999px;background:#ffffff20;font-size:11px}

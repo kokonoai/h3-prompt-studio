@@ -2435,6 +2435,11 @@ def character_presence_roles(production, segment):
     return roles
 
 
+def _visual_reference_character_ids(roles, reflected_ids):
+    return {card_id for card_id, role in roles.items()
+            if role in ("physical", "display", "imagined")} | set(reflected_ids)
+
+
 _DEVICE_CUE = re.compile(
     r"\b(?:phone|smartphone|mobile|laptop|notebook computer|computer|monitor|texting|text message|video call|video message)\b|"
     r"\b(?:sends?|sending|sent|opens?|opening|reads?|reading)\s+(?:a\s+|the\s+)?message\b|"
@@ -3047,15 +3052,17 @@ def segment_identity_repair_reasons(production, segment):
     has_render = bool(segment.get("selected_video_run_id") or segment.get("last_video_run_id"))
     has_character_overview = bool(production.get("overview_asset_ids", {}).get("characters"))
     if has_render and not has_character_overview:
+        visual_ids = _visual_reference_character_ids(
+            roles, reflected_character_ids(production, segment, alias_sets))
         selected = {
             str(name).strip().casefold()
             for name in segment.get("card_selection", {}).get("characters", [])
             if str(name).strip()
         }
         missing_images = [
-            card.get("name", "") for card in characters.values()
-            if not card.get("asset_ids") and any(alias in selected for alias in
-                                                  alias_sets.get(card.get("id"), set()))
+            card.get("name", "") for card_id, card in characters.items()
+            if card_id in visual_ids and not card.get("asset_ids")
+            and bool(selected & alias_sets.get(card_id, set()))
         ]
         if missing_images:
             reasons.append(
@@ -6855,8 +6862,7 @@ class ProductionManager:
                              any(alias in speakers for alias in alias_sets.get(card["id"], set())))}
         presence_roles = character_presence_roles(production, segment)
         reflected_ids = set(reflected_character_ids(production, segment, alias_sets))
-        visually_required = {card_id for card_id, role in presence_roles.items()
-                             if role in ("physical", "display", "imagined")} | reflected_ids
+        visually_required = _visual_reference_character_ids(presence_roles, reflected_ids)
         if segment.get("card_selection_source") == "local_ai":
             selection = segment.get("card_selection", {})
             result = {}
@@ -7027,9 +7033,9 @@ class ProductionManager:
         relevant = self._relevant_cards(production, segment)
         presence_roles = character_presence_roles(production, segment)
         reflected_ids = set(reflected_character_ids(production, segment))
+        visual_ids = _visual_reference_character_ids(presence_roles, reflected_ids)
         visual_characters = [card for card in relevant["characters"]
-                             if (presence_roles.get(card["id"]) in ("physical", "display", "imagined")
-                                 or card["id"] in reflected_ids)]
+                             if card["id"] in visual_ids]
         missing_visual_identity_names = []
         character_overview = production["overview_asset_ids"].get("characters")
         if not character_overview:

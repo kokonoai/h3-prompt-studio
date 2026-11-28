@@ -2752,6 +2752,43 @@ def test_materialise_keeps_silent_selected_cast_visible_and_voiceover_offscreen(
     assert [names[ident] for ident in scene["offscreen_subject_ids"]] == ["C"]
 
 
+@pytest.mark.parametrize("narrator_in_frame", [False, True])
+def test_saved_take_requires_reference_only_if_narrator_appears(tmp_path, narrator_in_frame):
+    manager, source, _projects, _assets, _store_asset = _rig(tmp_path)
+    production = manager.create({"source_project": source, "brief": "Light flickers over water."})
+    narrator = "NARRATOR"
+    production["cards"]["characters"] = [_card(narrator)]
+    manager.save(production)
+    visible = [narrator] if narrator_in_frame else []
+    timeline = {"visible_start": visible, "visible_end": visible,
+                "offscreen": [] if narrator_in_frame else [narrator]}
+    clip = _planned_clip("The river", [narrator], timeline)
+    clip["action"] = "NARRATOR is visible beside the river." if narrator_in_frame else "Light flickers over water."
+    clip["dialogue"] = [{"speaker": narrator, "text": "Let it flow.",
+                         "language": "English", "voiceover": True}]
+    production = manager.apply_plan(production["id"], [clip], "local_ai")
+    segment_id = production["segments"][0]["id"]
+    project = manager.materialise(production["id"], segment_id)["project"]
+    expected_missing = [narrator] if narrator_in_frame else []
+    assert project["production_link"]["reference_strategy"]["missing_visual_identity_names"] == expected_missing
+
+    run_id = _id()
+    production = manager.set_video_run(production["id"], segment_id, run_id)
+    segment = production["segments"][0]
+    assert segment["last_video_run_id"] == run_id
+    if narrator_in_frame:
+        assert segment["status"] == "stale"
+        assert any("缺少独立参考图" in reason and narrator in reason for reason in segment["stale_reasons"])
+    else:
+        # Existing projects may still hold the stale flag written by the older guard.
+        segment["status"] = "stale"
+        segment["stale_reasons"] = ["本段已生成视频中的可见角色缺少独立参考图或角色总图（NARRATOR）；补图后只重做本段"]
+        restored = manager.validate(production)["segments"][0]
+        assert restored["status"] == "ready"
+        assert restored["stale_reasons"] == []
+        assert restored["last_video_run_id"] == run_id
+
+
 def test_voice_id_speaker_resolves_to_owner_without_creating_visible_duplicate(tmp_path):
     manager, source, _projects, _assets, store_asset = _rig(tmp_path)
     ree = _card("Ree", [_image(store_asset, "Ree", "purple")["id"]])
